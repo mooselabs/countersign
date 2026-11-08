@@ -1,0 +1,15 @@
+[package]
+name = "countersign-approve"
+description = "Approver adapters (FIDO2, polkit, command) for countersign"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,260 @@
+# /etc/countersign/config.toml
+#
+# Example configuration for cnd, the countersign daemon.
+#
+# This file is policy. It must be owned by root and not writable by anyone
+# else (mode 0644, or 0640 root:countersign if it holds adapter credentials).
+# cnd refuses to start if it is writable by a non-root user, because whoever
+# can edit it decides how approval works.
+#
+# Reload after editing:  sudo systemctl reload countersign
+# Check the result:      /usr/bin/cn doctor
+#
+# Durations: "90s", "30m", "1h", "1h30m", "8h".
+# See docs/design.md, docs/approvers.md and docs/cli.md.
+
+# ---------------------------------------------------------------------------
+# Who may connect to /run/countersign/cnd.sock
+# ---------------------------------------------------------------------------
+[access]
+# Peer uids allowed on the socket, checked with SO_PEERCRED. A peer must also
+# be a member of the countersign-users group that owns the socket (mode 0660).
+users = ["patrick"]
+# root clients are refused unless set; a session walk never crosses a uid change.
+allow_root_clients = false
+
+# ---------------------------------------------------------------------------
+# Store unseal
+# ---------------------------------------------------------------------------
+[unlock]
+# Key slots that may unseal the master key; any one is enough.
+#   "systemd-creds"  sealed with systemd-creds (TPM2 when present, else the
+#                    host key); unsealed at start with no interaction. Default.
+#   "fido2"          wrapped with the YubiKey's hmac-secret; cnd starts sealed
+#                    and every request returns store_sealed until a human
+#                    runs `/usr/bin/cn unlock`.
+#   "recovery"       Argon2id of a recovery phrase printed once at `cnd init`.
+# With systemd-creds only, a backup that also holds
+# /var/lib/systemd/credential.secret (host-key sealing) can open the store.
+slots = ["systemd-creds"]
+# slots = ["fido2"]                    # unlock with a touch after each boot
+
+# Who talks to the key for `cn unlock`:
+#   "client"  cn does, and passes the hmac-secret output to cnd (default).
+#   "daemon"  cnd does, so the output never enters your uid. Needs the udev
+#             rule and PrivateDevices=no in the unit (docs/design.md).
+fido2_side = "client"
+
+# ---------------------------------------------------------------------------
+# Sessions: how cnd finds the agent process a grant belongs to
+# ---------------------------------------------------------------------------
+[sessions]
+# A process started with `cn session exec -- <agent>` is always an anchor;
+# that is the recommended way to start agents. The matchers below are a
+# fallback for agents started without it. cnd has no CAP_SYS_PTRACE, so it
+# matches only on /proc/<pid>/comm and /proc/<pid>/cmdline, which the process
+# itself controls: matching identifies a session, it does not authenticate one.
+# The nearest anchor to the calling process wins.
+matchers = [
+  { comm = "claude" },
+  { cmdline_regex = '(^|/)codex(\s|$)' },
+  { comm = "grok" },
+]
+
+# Environment variables recorded as labels on the session, to link audit
+# records to agent transcripts. Untrusted: shown as such and never used for a
+# decision. Names are examples; check what your agent actually sets.
+label_env = ["CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID"]
+
+# ---------------------------------------------------------------------------
+# Grants
+# ---------------------------------------------------------------------------
+[grants]
+# TTL of a `use` grant when the request does not give --ttl. Counted from
+# approval.
+default_ttl = "1h"
+# Longest `use` grant. Requests above it are refused (limit_exceeded), not
+# silently shortened.
+max_ttl = "8h"
+# Longest `reveal` grant. A reveal grant is also consumed after max_reveal_uses.
+# TTL cannot recall a value once it has been printed into a transcript.
+max_reveal_ttl = "10m"
+max_reveal_uses = 1
+# Set false to refuse --mode reveal entirely.
+allow_reveal = true
+# How long a request may wait for approval before it lapses.
+pending_expiry = "5m"
+# Requests naming a secret whose `projects` do not match the session's cwd:
+#   "flag"  allowed, and the approval display says "other project" (default)
+#   "deny"  refused with limit_exceeded
+# Project scope is organizational, not a security boundary: cwd is reported
+# by the client.
+cross_project = "flag"
+
+# ---------------------------------------------------------------------------
+# Approval chains, per request kind
+# ---------------------------------------------------------------------------
+# A chain is an approver name, or { all_of = [...] } / { any_of = [...] }
+# over chains, nested at most three levels. Semantics in docs/approvers.md:
+#   all_of  every member, in order, one at a time; the first deny denies.
+#   any_of  first decisive answer wins; a deny from any member denies;
+#           unavailable members are skipped. An any_of is only as strong as
+#           its weakest member.
+[approval]
+# Frequent: one YubiKey touch on the GNOME polkit dialog (pam_u2f).
+use    = "polkit"
+# Rare and permanent: the polkit dialog shows the true request, and the FIDO2
+# assertion adds a signature over the request digest to the audit log.
+reveal = { all_of = ["polkit", "desk-key"] }
+mutate = { all_of = ["polkit", "desk-key"] }
+export = { all_of = ["polkit", "desk-key"] }
+
+# For ssh sessions or a machine with no graphical session. This makes the
+# terminal display of `! cn approve` sufficient for every use request.
+# use = { any_of = ["polkit", "desk-key"] }
+
+# Whether `cn list` and `cn show` need a use-level approval once per session.
+list_requires_approval = false
+
+# ---------------------------------------------------------------------------
+# Approver instances. Chains above refer to these names.
+# ---------------------------------------------------------------------------
+
+[approvers.polkit]
+type = "polkit"
+# Action ids installed in /usr/share/polkit-1/actions/computer.mooselabs.countersign.policy.
+action_use    = "computer.mooselabs.countersign.approve"
+action_reveal = "computer.mooselabs.countersign.reveal"
+action_mutate = "computer.mooselabs.countersign.mutate"   # also used for export
+# The subject passed to polkitd is always the uid's logind graphical session
+# (unix-session), resolved by cnd; it is not configurable. Never a
+# unix-process subject: the agent could register its own authentication agent
+# for its process.
+# Refuse to use polkit unless the graphical session is Wayland (on X11 the
+# agent's uid can synthesize input into the dialog).
+require_wayland = true
+# A dismissed dialog: "deny" (default) or "ignore" (lets another any_of
+# member answer).
+on_dismiss = "deny"
+timeout = "2m"
+# cn doctor checks that /etc/pam.d/polkit-1 contains pam_u2f with a
+# root-owned authfile when this is true.
+expect_pam_u2f = true
+
+[approvers.desk-key]
+type = "fido2"
+# Credential records installed by root with `cn approver enroll`:
+#   /etc/countersign/approvers.d/desk-key.approver.toml
+credential = "desk-key"
+rp_id = "countersign"
+# "discouraged" (presence only), "preferred", or "required" (PIN or
+# fingerprint). A PIN needs a real terminal; `!` commands have none, and a PIN
+# typed there would land in the transcript.
+user_verification = "discouraged"
+# "client": `cn approve` talks to the key (default).
+# "daemon": cnd talks to the key; needs the udev rule. Does not fix the
+#           terminal-display problem, see docs/approvers.md.
+side = "client"
+# Attestation required at enrollment. "required" rejects software
+# authenticators; "none" accepts any credential.
+attestation = "required"
+attestation_roots = ["/usr/share/countersign/attestation/yubico-fido-root-ca.pem"]
+# aaguids = ["cb69481e-8ff7-4039-93ec-0a2729a154a8"]   # optional allowlist
+timeout = "60s"
+
+# A command approver, e.g. a phone push. Weakest adapter: its strength is
+# whatever the script does. Executable and its parent directories must be
+# root-owned and not group/world-writable. Protocol: request JSON on stdin;
+# exit 0 approve, 1 deny, 2 unavailable, anything else error (fails closed).
+# [approvers.phone]
+# type = "command"
+# argv = ["/usr/libexec/countersign/approvers/ntfy-signed", "--config", "/etc/countersign/phone.toml"]
+# env = []                     # variables passed through; environment is otherwise empty
+# timeout = "90s"
+
+# ---------------------------------------------------------------------------
+# Listing
+# ---------------------------------------------------------------------------
+[list]
+# Default scope of `cn list`: "project" (secrets matching the session's cwd,
+# plus unscoped ones) or "all".
+default_scope = "project"
+# Show usage prose in `cn list` (the full text is always in `cn show`).
+show_usage = true
+
+# ---------------------------------------------------------------------------
+# cn hide
+# ---------------------------------------------------------------------------
+[hide]
+# Pattern set: secrets granted to the calling session, plus secrets marked
+# high_entropy. A low-entropy secret that is not granted is never matched, so
+# hide cannot be used to confirm guesses of a short password.
+include = ["granted", "high_entropy"]
+# Every value is matched raw and as base64 (standard and URL-safe, padded and
+# unpadded, and embedded), percent-encoding, JSON escaping and hex; matches
+# become [countersign:NAME]. Neither is configurable (docs/design.md section 8).
+# Values shorter than this are never patterns (false positives; guessable).
+min_value_len = 8
+# Per session.
+max_streams_per_minute = 30
+max_bytes_per_minute = "256MiB"
+
+# ---------------------------------------------------------------------------
+# Rate limits (per session unless noted)
+# ---------------------------------------------------------------------------
+[limits]
+max_pending_requests = 3
+requests_per_hour = 30
+# After a deny, refuse new requests for the same secrets in that session.
+deny_cooldown = "2m"
+# Failed approval verifications before the session's pending requests are
+# cancelled and new ones refused for deny_cooldown.
+approval_failures_per_10m = 5
+list_calls_per_minute = 60
+# Names per request (fixed at 16 in v1; lower it here).
+max_names_per_request = 16
+
+# ---------------------------------------------------------------------------
+# Audit log
+# ---------------------------------------------------------------------------
+[audit]
+# Append-only, hash-chained JSONL segments owned by the countersign user.
+# Format and verification: docs/audit.md.
+dir = "/var/lib/countersign/audit"
+# Signed checkpoint of the chain head, whichever comes first.
+checkpoint_interval = "1h"
+checkpoint_every_records = 1000
+# `list` and `show` calls are coalesced into one record per session per window.
+list_coalesce = "10m"
+# Agent-supplied text (reason, labels) is passed through the redaction engine
+# before it is written, in case an agent pasted a value into it.
+redact_agent_text = true
+# Delete whole closed segments older than this, only if a checkpoint covers
+# them. Default: keep everything.
+# retention = "400d"
+# Hand each new checkpoint line to this command on stdin, for off-box copies.
+# checkpoint_command = ["/usr/local/bin/cn-push-checkpoint"]
+
+# Extra copies. Each sink receives every record; a sink failure is logged but
+# does not block the primary log. Checkpoints held outside
+# /var/lib/countersign are what make truncation detectable.
+[[audit.sink]]
+type = "journald"
+# "full" = every record; "checkpoints" = checkpoints and approvals only.
+level = "full"
+
+# A second copy on another filesystem or a mounted backup target.
+# [[audit.sink]]
+# type = "file"
+# path = "/srv/audit/countersign.jsonl"
+
+# ---------------------------------------------------------------------------
+# Unattended sessions (phase 2; parsed and ignored with a warning in v1)
+# ---------------------------------------------------------------------------
+# [[standing]]
+# id = "factory-ci-read"
+# anchor = { systemd_unit = "agent-worker@*.service" }
+# secrets = ["github-token-ro"]
+# mode = "use"
+# issue_ttl = "15m"
+# expires = "2026-12-31"

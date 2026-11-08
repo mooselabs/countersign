@@ -1,0 +1,17 @@
+[package]
+name = "countersign-proto"
+description = "Wire protocol between the countersign CLI (cn) and daemon (cnd)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

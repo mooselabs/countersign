@@ -1,0 +1,16 @@
+[package]
+name = "countersign-hide"
+description = "Streaming secret redaction engine for countersign"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+aho-corasick.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "countersign-core"
+description = "Store, sessions, grants, policy and audit for the countersign daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+countersign-proto.workspace = true
+countersign-hide.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

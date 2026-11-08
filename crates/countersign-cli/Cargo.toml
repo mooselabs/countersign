@@ -1,0 +1,20 @@
+[package]
+name = "countersign-cli"
+description = "cn: the countersign command-line client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "cn"
+path = "src/main.rs"
+
+[dependencies]
+countersign-proto.workspace = true
+countersign-hide.workspace = true
+
+[lints]
+workspace = true

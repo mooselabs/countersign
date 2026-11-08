@@ -1,0 +1,22 @@
+[package]
+name = "countersign-daemon"
+description = "cnd: the countersign daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "cnd"
+path = "src/main.rs"
+
+[dependencies]
+countersign-proto.workspace = true
+countersign-core.workspace = true
+countersign-approve.workspace = true
+countersign-hide.workspace = true
+
+[lints]
+workspace = true

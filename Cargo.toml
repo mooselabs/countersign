@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/mooselabs/countersign"
+authors = ["Patrick McEvoy <patrick.mcevoy@moose.run>"]
+
+[workspace.dependencies]
+aho-corasick = "1.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+countersign-proto = { path = "crates/countersign-proto" }
+countersign-core = { path = "crates/countersign-core" }
+countersign-approve = { path = "crates/countersign-approve" }
+countersign-hide = { path = "crates/countersign-hide" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+print_stdout = "warn"
