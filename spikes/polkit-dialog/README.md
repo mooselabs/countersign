@@ -156,13 +156,19 @@ on exit. Raw output: `results-u2f-20261108T190302Z.txt`.
   service. A touch-only stack for countersign means touch-only for all
   polkit prompts, which the owner has to choose deliberately.
 
-## Found alongside: cached sudo is shared with the agent
+## Found alongside: the agent's uid is already root
 
-After the owner ran `sudo` in a separate terminal tab, `sudo -n true` from
-the agent's shell (same uid, different terminal) succeeded: the sudo
-credential cache was not tied to the terminal. For as long as the cache
-lasts, any agent of that uid can run commands as root, which defeats every
-countersign tier. The threat model treats root as out of scope; this makes
-"the agent is not root" depend on sudo configuration. Recommend
-`Defaults timestamp_type=tty` (or `timestamp_timeout=0`) in
-`/etc/sudoers.d/`, and have `cn doctor` check for it.
+After the owner ran `sudo` in another terminal, `sudo -n true` from the
+agent's shell succeeded. That first looked like a shared sudo timestamp, but
+`sudo -n -l` shows the cause: `(ALL : ALL) NOPASSWD: ALL` for the owner's
+user, plus membership of the `docker` group (root equivalent through the
+Docker socket). Any agent running as that user can become root at any time,
+with or without a recent `sudo`.
+
+Every countersign guarantee assumes the agent cannot become root (the threat
+model puts root out of scope). On a machine like this one, the daemon's
+separate uid, the store's permissions and the audit log protect nothing
+against a malicious agent. Roadmap Phase 2 adds a privilege audit to
+`cn doctor` and `cn sudo` as the replacement for `NOPASSWD: ALL`
+([roadmap](../../docs/roadmap.md)). A sudo timestamp bound to the terminal
+(`Defaults timestamp_type=tty`) matters only once NOPASSWD is gone.
