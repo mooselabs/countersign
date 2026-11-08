@@ -55,26 +55,30 @@ workspace and its scripts use `cn run`.
 ## Open questions that block Phase 1
 
 Collected from the other documents. Each needs an owner decision or a test
-result before the code it names is written. Questions settled elsewhere (the
-polkit subject, X11, grant persistence, expiry of running children, the key
+result before the code it names is written. Questions settled elsewhere (X11,
+grant persistence, expiry of running children, the key
 slot model) are no longer listed.
 
-1. **polkit as a trusted display.** Does polkitd expand `$(key)` in the
-   action's message from the details `cnd` passes, does GNOME Shell show the
-   expanded text, and can `cnd` (uid `countersign`, with the
-   `org.freedesktop.policykit.owner` annotation) check another uid's
-   `unix-session` subject with user interaction? If the dialog cannot show the
-   request, it proves presence but not intent, and the default chains change.
-   Blocks the `polkit` adapter. ([design](design.md#12-open-questions) 1,
-   [approvers](approvers.md#open-questions) 1 and 2)
+1. **polkit subject until polkit-org/polkit#699 is fixed.** The spike
+   ([spikes/polkit-dialog](../spikes/polkit-dialog/README.md)) showed GNOME
+   renders the request code, digest and summary that `cnd` passes as the
+   action owner, that an agent cannot pass dialog text, and that `auth_self`
+   does not cache. But a `unix-session` subject aborts polkitd 127/128, and a
+   `unix-process` subject can be taken over by a same-uid agent registering
+   its own authentication agent. Decide: ship Phase 1 on the process subject
+   (trusted display against careless agents only, documented), and/or
+   upstream a fix for #699 and switch to the session subject by polkit
+   version. Also confirm the spike's T4 (authorized after the human was told
+   to cancel) before polkit counts as an approver.
 2. **Kernel floor.** Require Linux 6.5+ for `SO_PEERPIDFD`, or keep the
    `pidfd_open` fallback and its narrow pid-reuse window? Blocks the `cnd`
    peer-credential code. ([design](design.md#12-open-questions) 2,
    [threat model](threat-model.md) T8)
 3. **FIDO2 library.** `libfido2` conflicts with a statically linked `cn`;
-   the pure-Rust options have smaller user bases. Blocks the `fido2` client
+   the pure-Rust options have smaller user bases, and `ctap-hid-fido2` cannot
+   link statically on musl ([fnox evaluation](fnox-evaluation.md)). Blocks the `fido2` client
    side of `cn approve`. ([approvers](approvers.md#library-choice-open))
-4. **Overlap with fnox.** It already does store, injection, output masking,
-   leases and a sandbox proxy. Build our own store and backends, or build
-   countersign's approval, session and audit layer on top of it? Blocks the
-   store. ([prior art](prior-art.md#open-questions-raised-by-this-survey))
+4. ~~**Overlap with fnox.**~~ Settled: countersign keeps its own store; fnox
+   trusts the agent's uid by design and cannot host a separate-uid broker. In
+   Phase 3 `cnd` may call `fnox env --json` as its own user to reach
+   third-party vaults. ([fnox evaluation](fnox-evaluation.md))

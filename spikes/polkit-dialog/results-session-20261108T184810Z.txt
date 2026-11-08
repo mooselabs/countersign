@@ -1,0 +1,31 @@
+countersign polkit spike, 2026-11-08T18:48:10Z
+polkit 128, gnome-shell 51.1, session 3 (wayland)
+
+T1 owner passes details, no interaction (expect: (false, true, ...) = challenge, no dialog)
+  caller uid 65534, subject unix-session 3, flags 0
+  result: Error: GDBus.Error:org.freedesktop.DBus.Error.NoReply: Remote peer disconnected
+  NOTE: polkitd pid changed 3425304 -> 0 (it restarted or crashed)
+
+T2 owner passes details, interaction (expect: dialog with K7M-Q2X / 3QF8-ZK2M; result true)
+  caller uid 65534, subject unix-session 3, flags 1
+  result: Error: GDBus.Error:org.freedesktop.DBus.Error.NoReply: Remote peer disconnected
+
+T3 owner checks again straight after success, no interaction (expect: challenge again, no caching)
+  caller uid 65534, subject unix-session 3, flags 0
+  result: Error: GDBus.Error:org.freedesktop.DBus.Error.NoReply: Remote peer disconnected
+
+T4 owner passes details, interaction, human cancels (expect: false)
+  caller uid 65534, subject unix-session 3, flags 1
+  result: Error: GDBus.Error:org.freedesktop.DBus.Error.NoReply: Remote peer disconnected
+
+T5 the developer's uid (stands in for the agent) passes details (expect: NotAuthorized, only trusted callers)
+  caller uid 1000, subject unix-session 3, flags 0
+  result: Error: GDBus.Error:org.freedesktop.PolicyKit1.Error.NotAuthorized: Only trusted callers (e.g. uid 0 or an action owner) can use CheckAuthorization() and pass details
+  NOTE: polkitd pid changed 0 -> 3445712 (it restarted or crashed)
+
+T6 owner, no details, no interaction (the shape that crashed polkitd from an unprivileged caller)
+  caller uid 65534, subject unix-session 3, flags 0
+  result: Error: GDBus.Error:org.freedesktop.DBus.Error.NoReply: Remote peer disconnected
+  NOTE: polkitd pid changed 3445712 -> 0 (it restarted or crashed)
+
+Done. In chat, report: the exact dialog text from T2, and anything else the dialog showed (icon, user, details expander).

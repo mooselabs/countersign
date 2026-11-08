@@ -1,0 +1,32 @@
+countersign polkit spike (process subject), 2026-11-08T18:52:35Z
+polkit 128, gnome-shell 51.1, session 3 (wayland)
+
+T0 baseline: the developer's uid, no details, no interaction (expect: (false, true, auth_self))
+  caller uid 1000, subject process, flags 0
+  result: ((false, true, {'polkit.result': 'auth_self'}),)
+
+T1 owner passes details, no interaction (expect: (false, true, ...) = challenge, no dialog)
+  caller uid 65534, subject process, flags 0
+  result: ((false, true, {'digest': '3QF8-ZK2M', 'polkit.result': 'auth_self', 'request': 'K7M-Q2X', 'summary': 'use clickhouse-password for 30m (spike)'}),)
+
+T2 owner passes details, interaction (expect: dialog with K7M-Q2X / 3QF8-ZK2M; result true)
+  caller uid 65534, subject process, flags 1
+  result: ((true, false, {'digest': '3QF8-ZK2M', 'polkit.result': 'auth_self', 'request': 'K7M-Q2X', 'summary': 'use clickhouse-password for 30m (spike)'}),)
+
+T3 owner checks again straight after success, no interaction (expect: challenge again, no caching)
+  caller uid 65534, subject process, flags 0
+  result: ((false, true, {'digest': '3QF8-ZK2M', 'polkit.result': 'auth_self', 'request': 'K7M-Q2X', 'summary': 'use clickhouse-password for 30m (spike)'}),)
+
+T4 owner passes details, interaction, human cancels (expect: false)
+  caller uid 65534, subject process, flags 1
+  result: ((true, false, {'digest': '3QF8-ZK2M', 'polkit.result': 'auth_self', 'request': 'K7M-Q2X', 'summary': 'use clickhouse-password for 30m (spike)'}),)
+
+T5 the developer's uid (stands in for the agent) passes details (expect: NotAuthorized, only trusted callers)
+  caller uid 1000, subject process, flags 0
+  result: Error: GDBus.Error:org.freedesktop.PolicyKit1.Error.NotAuthorized: Only trusted callers (e.g. uid 0 or an action owner) can use CheckAuthorization() and pass details
+
+T6 owner, no details, no interaction (the shape that crashed polkitd from an unprivileged caller)
+  caller uid 65534, subject process, flags 0
+  result: ((false, true, {'polkit.result': 'auth_self'}),)
+
+Done. In chat, report: the exact dialog text from T2, and anything else the dialog showed (icon, user, details expander).

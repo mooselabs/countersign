@@ -84,6 +84,7 @@ Containing that needs the agent in a sandbox or under a separate user.
 | [audit.md](docs/audit.md) | Audit log format, hash chain, verification |
 | [cli.md](docs/cli.md) | `cn` command reference |
 | [agent-integration.md](docs/agent-integration.md) | Instructions for agents, hooks, migrating from `.secret-*` files |
+| [fnox-evaluation.md](docs/fnox-evaluation.md) | Why countersign does not fork or build on fnox |
 | [prior-art.md](docs/prior-art.md) | Related tools and how countersign differs |
 | [decisions.md](docs/decisions.md) | Decisions agreed so far |
 | [roadmap.md](docs/roadmap.md) | What gets built in which order |

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Spike only. Installed and removed by spike.sh. "nobody" stands in for the
+     countersign daemon user, so the test can run without creating a user. -->
+<policyconfig>
+  <vendor>countersign spike</vendor>
+  <action id="computer.mooselabs.countersign.spike.approve">
+    <description>Approve a countersign request (spike)</description>
+    <message>countersign: approve request $(request), digest $(digest): $(summary)</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.owner">unix-user:nobody</annotate>
+  </action>
+</policyconfig>
