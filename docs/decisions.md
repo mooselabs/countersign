@@ -17,6 +17,7 @@ a new entry that says which one it replaces.
 | 10 | 2026-11-08 | License Apache-2.0 with DCO sign-off, no CLA. | Enterprise-friendly (the eventual commercial audience often bans AGPL), carries a patent grant, and still allows a separate closed commercial layer. |
 | 11 | 2026-11-08 | Rust; Linux first (systemd, polkit, SO_PEERCRED, /proc); macOS later. | The owner's machines are Linux; the session-binding mechanisms are platform-specific. |
 | 12 | 2026-11-08 | Repository `github.com/mooselabs/countersign`. | Owner's choice. |
+| 13 | 2026-11-08 | What the polkit dialog asks for is the user's choice at setup: touch only (the owner's preference), touch and password, or password only. It is an install-time setting, because polkit has one PAM stack for every prompt on the machine. Replaces P4. | Different users weigh speed against a second factor differently; the spike showed touch-only works ([spike](../spikes/polkit-dialog/README.md)). |
 
 ## Proposed, awaiting the owner
 
@@ -28,4 +29,4 @@ agrees, or change if not.
 | P1 | Default approver chain: `use` = polkit backed by `pam_u2f` (GNOME dialog + YubiKey touch); `reveal`, store mutations and export = all of polkit and FIDO2. No `any_of` in defaults. | `cnd` cannot reach the user's session bus, so it cannot draw its own notification; FIDO2 alone leaves the agent-alterable terminal as the only display. `any_of` is only as strong as its weakest member. See [approvers.md](approvers.md). |
 | P2 | Enrolled FIDO2 credentials live in root-owned `/etc/countersign/approvers.d/`; only signature counters under `/var/lib/countersign/`. | An agent must not be able to enrol its own approver. |
 | P3 | `cnd` checks polkit against the user's logind session (`unix-session`), never the requesting process. | With a process subject the agent can register its own authentication agent and draw the prompt. |
-| P4 | `pam_u2f` as `sufficient` (password fallback when the key is absent) or as required. Open. | Required is stronger but changes every polkit prompt on the machine. |
+| ~~P4~~ | Settled by decision 13. | |

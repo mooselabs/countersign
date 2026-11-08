@@ -34,6 +34,25 @@ workspace and its scripts use `cn run`.
 
 ## Phase 2: unattended and stricter
 
+- **Privilege audit in `cn doctor`.** countersign's guarantees assume the
+  agent cannot become root. On the owner's machine (2026-11-08) it can:
+  `(ALL : ALL) NOPASSWD: ALL` in sudoers and membership of `docker` (root
+  equivalent). `cn doctor` reports every path from the agent's uid to root:
+  NOPASSWD rules, a sudo timestamp not bound to the terminal, the `docker`,
+  `libvirt` and `disk` groups, polkit rules or actions that return `yes`,
+  writable files that root executes. Each finding says what to change.
+- **`cn sudo`: approved root commands.** The replacement for `NOPASSWD: ALL`.
+  The agent asks to run one exact command as root
+  (`cn sudo -- systemctl restart caddy`); the human sees the exact argv in the
+  countersign dialog and touches the key; a small root helper, reachable only
+  from `cnd`, runs it with a clean environment and streams the output back;
+  the audit log records it against the agent session. Standing rules let
+  named harmless commands through without a touch (the owner's existing
+  `NOPASSWD: /usr/bin/tailscale switch *` is one). Design questions: the
+  root helper's interface (argv only, no shell), output scrubbing with
+  `cn hide`, and whether a grant may cover a command pattern or only an
+  exact argv.
+
 - Standing grants for unattended hosts (an agent factory), anchored to a
   systemd unit, approved once.
 - Optional hard limits per secret: allowed executables, allowed hosts.

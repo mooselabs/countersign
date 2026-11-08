@@ -161,7 +161,9 @@ if [ "$mode" = u2f ]; then
         check "U2 owner passes details, human cancels without touching (expect: false, dismissed)" 65534 "$details" 1
     fi
     if want U3; then
-        echo ">>> U3: a third dialog will open. Do NOT touch the key and do NOT press anything; wait for it to time out (up to 2 minutes)."
+        echo ">>> U3: a dialog should open and the key should blink. Do NOT touch the key or press anything."
+        echo "    Watch for: does the dialog appear at all? Is it on screen the whole time the key blinks?"
+        echo "    What happens when the key stops blinking (about 30s): error text, dialog closes, or nothing?"
         check "U3 owner passes details, human does nothing (expect: false after pam_u2f or the call times out)" 65534 "$details" 1
     fi
     log "agent helper log since $started:"
