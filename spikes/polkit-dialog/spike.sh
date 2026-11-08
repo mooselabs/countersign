@@ -116,7 +116,7 @@ if [ "$mode" = u2f ]; then
     # Enrol the key for this spike only, in a root-owned file the agent cannot
     # edit, with an origin no other service uses.
     install -d -m 0755 "$u2f_dir" && made_u2f_dir=1
-    echo ">>> ENROL: touch your YubiKey now (it should start blinking)."
+    echo ">>> ENROL: enter your YubiKey PIN if asked, then touch the key when it blinks."
     pamu2fcfg -u "$user_name" -o pam://countersign-spike -i pam://countersign-spike \
         >"$u2f_dir/u2f_mappings" 2>"$u2f_dir/enrol.err" || { log "enrolment failed: $(cat "$u2f_dir/enrol.err")"; exit 1; }
     chmod 0644 "$u2f_dir/u2f_mappings"

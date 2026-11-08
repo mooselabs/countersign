@@ -125,8 +125,8 @@ on exit. Raw output: `results-u2f-20261108T190302Z.txt`.
 
 | Check | Human | Result |
 | --- | --- | --- |
-| Enrolment (`pamu2fcfg`, as root in a terminal) | PIN, then touch | enrolled; the key has a FIDO2 PIN, so enrolment needs a TTY |
-| U1 dialog, touch the key | touched | `(true, false, ...)`: authorized |
+| Enrolment (`pamu2fcfg`, as root in a terminal) | PIN, then touch | enrolled; the key has a FIDO2 PIN, so enrolment needs a TTY. The PIN prompt came first, after the package install, so the script's "touch now" cue was premature (fixed) |
+| U1 dialog, touch the key | touched | `(true, false, ...)`: authorized. The dialog showed the request text and pam_u2f's cue "touch the device", with no password field |
 | U2 dialog, press Cancel | cancelled | `(false, false, {'polkit.dismissed': 'true'})` |
 | U3 dialog, do nothing | waited | **no dialog appeared; the key blinked**; ended `dismissed` after the key's presence timeout (`pam_authenticate failed: Authentication failure` in the helper log) |
 
