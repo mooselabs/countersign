@@ -128,7 +128,8 @@ on exit. Raw output: `results-u2f-20261108T190302Z.txt`.
 | Enrolment (`pamu2fcfg`, as root in a terminal) | PIN, then touch | enrolled; the key has a FIDO2 PIN, so enrolment needs a TTY. The PIN prompt came first, after the package install, so the script's "touch now" cue was premature (fixed) |
 | U1 dialog, touch the key | touched | `(true, false, ...)`: authorized. The dialog showed the request text and pam_u2f's cue "touch the device", with no password field |
 | U2 dialog, press Cancel | cancelled | `(false, false, {'polkit.dismissed': 'true'})` |
-| U3 dialog, do nothing | waited | **no dialog appeared; the key blinked**; ended `dismissed` after the key's presence timeout (`pam_authenticate failed: Authentication failure` in the helper log) |
+| U3 dialog, do nothing (first run, straight after U2) | waited | owner saw no dialog while the key blinked; ended `dismissed` |
+| U3 alone (rerun, `results-u2f-20261108T192900Z.txt`) | waited about 75s | dialog shown the whole time. Each time the key's presence timeout (about 30s) failed PAM, the dialog flickered and GNOME started a new attempt, so the key blinked again; the dialog stayed open. Ended `dismissed` |
 
 ### What this settles
 
@@ -144,13 +145,18 @@ on exit. Raw output: `results-u2f-20261108T190302Z.txt`.
 
 ### What it exposes
 
-- **The key can ask for a touch with nothing on screen (U3).** The touch
-  approves whatever request is pending, seen or not. A blinking key is not a
-  display. Approval UX must teach "touch only while the countersign dialog is
-  showing", and countersign should consider requiring the dialog to be
-  answered as well (for example a `required` touch plus a click, rather than
-  touch alone). Not yet known: whether the dialog failed to render in U3 or
-  rendered late; rerun `spike.sh u2f U3` to see if it repeats.
+- **No touch means no approval, but not a quick deny.** When the key's
+  presence timeout fails PAM, GNOME retries and the key blinks again; the
+  dialog stays open until the human cancels or the agent gives up. `cnd` must
+  enforce its own request expiry: pass a `cancellation_id` to
+  `CheckAuthorization` and call `CancelCheckAuthorization` when the request
+  expires.
+- **The first U3 run did not reproduce.** There, straight after a Cancel, the
+  owner saw the key blink with no dialog. Run alone, the dialog was on screen
+  throughout. Treat "touch only while the countersign dialog is showing" as
+  the rule anyway: a touch approves whatever request is pending. An earlier
+  attempt at the rerun failed at enrolment (`FIDO_ERR_ACTION_TIMEOUT`, the
+  enrolment touch was missed), which is why enrolment now prints its own cue.
 - **This replaces the PAM stack for every polkit prompt on the machine**
   (`pkexec`, GNOME settings, Bitwarden unlock). polkit has no per-action PAM
   service. A touch-only stack for countersign means touch-only for all

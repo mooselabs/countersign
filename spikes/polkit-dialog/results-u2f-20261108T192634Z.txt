@@ -1,0 +1,5 @@
+countersign polkit spike (u2f subject, checks: U3), 2026-11-08T19:26:34Z
+polkit 128, gnome-shell 51.1, session 3 (wayland)
+
+pam_u2f 1.4.0
+enrolment failed: error: fido_dev_make_cred (58) FIDO_ERR_ACTION_TIMEOUT

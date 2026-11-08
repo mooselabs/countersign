@@ -1,0 +1,23 @@
+countersign polkit spike (u2f subject, checks: U3), 2026-11-08T19:29:00Z
+polkit 128, gnome-shell 51.1, session 3 (wayland)
+
+pam_u2f 1.4.0
+enrolled one credential for patrick
+polkit PAM stack replaced by a YubiKey touch for this run
+
+U3 owner passes details, human does nothing (expect: false after pam_u2f or the call times out)
+  caller uid 65534, subject u2f, flags 1
+  result: ((false, false, {'polkit.dismissed': 'true', 'digest': '3QF8-ZK2M', 'polkit.result': 'auth_self', 'request': 'K7M-Q2X', 'summary': 'use clickhouse-password for 30m (spike)'}),)
+
+agent helper log since 2026-11-08 19:29:00:
+  Starting Authorization Manager Agent Helper (PID 12200/UID 1000)...
+  polkit-agent-helper-1: pam_authenticate failed: Authentication failure
+  Starting Authorization Manager Agent Helper (PID 12200/UID 1000)...
+  polkit-agent-helper@53-206757-12200_971-1000.service: Deactivated successfully.
+  Finished Authorization Manager Agent Helper (PID 12200/UID 1000).
+  polkit-agent-helper-1: pam_authenticate failed: Authentication failure
+  Starting Authorization Manager Agent Helper (PID 12200/UID 1000)...
+  polkit-agent-helper@54-206758-12200_971-1000.service: Deactivated successfully.
+  Finished Authorization Manager Agent Helper (PID 12200/UID 1000).
+
+Done. In chat, report what each dialog showed and what you pressed or touched.
