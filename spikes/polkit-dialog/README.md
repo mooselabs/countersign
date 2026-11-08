@@ -60,7 +60,7 @@ developer (the shell that ran `pkexec`) works, so the final script uses that.
 | T1 owner (`nobody`) passes details | polkitd aborts | challenge, details echoed |
 | T2 owner, interaction, human authenticates | polkitd aborts | dialog shown, authorized |
 | T3 owner checks again straight after | polkitd aborts | challenge again: no caching |
-| T4 owner, interaction, human told to cancel | polkitd aborts | authorized (see below) |
+| T4 owner, interaction, human told to cancel | polkitd aborts | authorized: the human authenticated (see below) |
 | T5 developer uid passes details | refused: only trusted callers | refused: only trusted callers |
 | T6 owner, no details | polkitd aborts | challenge |
 
@@ -102,9 +102,67 @@ The T2 dialog ([screenshot](t2-dialog.png)):
 
 ### Open
 
-- T4 returned authorized although the script asked the human to press
-  Cancel. Waiting on the owner to confirm which button was pressed; if it was
-  Cancel, that is a serious finding to chase before polkit counts as an
-  approver.
-- The `pam_u2f` (YubiKey touch) path is not tested: `pam_u2f` is not
-  installed on this machine.
+- ~~T4 returned authorized although the script asked the human to press
+  Cancel.~~ Settled: the owner had authenticated. A Cancel on a GNOME polkit
+  dialog for an `auth_self` action (Bitwarden's `com.bitwarden.Bitwarden.unlock`,
+  same defaults as the spike action, checked from the developer's uid) returns
+  `(false, false, {'polkit.result': 'auth_self', 'polkit.dismissed': 'true'})`.
+  `cnd` must treat `polkit.dismissed` as a deny.
+- Lesson for the approval UX: `pkexec`'s prompt and the spike's prompt look
+  alike, and the human cancelled the wrong one twice. countersign's dialog
+  must lead with "countersign" and the request code so it cannot be mistaken
+  for another prompt.
+
+## YubiKey touch through polkit (`u2f` mode, 2026-11-08)
+
+`spike.sh u2f` installed `pam_u2f` 1.4.0, enrolled the owner's YubiKey 5C
+Nano into a root-owned mapping file with its own origin
+(`pam://countersign-spike`), added a drop-in letting
+`polkit-agent-helper@.service` open hidraw devices, and replaced the
+`polkit-1` PAM stack with `auth [success=done default=die] pam_u2f.so ... cue`
+(touch only, no password fallback). Everything except the package was removed
+on exit. Raw output: `results-u2f-20261108T190302Z.txt`.
+
+| Check | Human | Result |
+| --- | --- | --- |
+| Enrolment (`pamu2fcfg`, as root in a terminal) | PIN, then touch | enrolled; the key has a FIDO2 PIN, so enrolment needs a TTY |
+| U1 dialog, touch the key | touched | `(true, false, ...)`: authorized |
+| U2 dialog, press Cancel | cancelled | `(false, false, {'polkit.dismissed': 'true'})` |
+| U3 dialog, do nothing | waited | **no dialog appeared; the key blinked**; ended `dismissed` after the key's presence timeout (`pam_authenticate failed: Authentication failure` in the helper log) |
+
+### What this settles
+
+1. **A polkit dialog backed by a YubiKey touch works on polkit 128**, once
+   the helper's sandbox lets it see hidraw devices. polkit-agent-helper(8)
+   says a PAM module needing hardware should ship such a drop-in;
+   openSUSE's `pam_u2f` 1.4.0 does not, so countersign's installer must.
+2. **Touch-only is possible.** `[success=done default=die]` gives approval by
+   touch with no password, and denies when the key is absent.
+3. **Cancel works** with the key path too.
+4. **Enrolment needs a terminal.** With a FIDO2 PIN set, `pamu2fcfg` asks for
+   it, so `cn approver enroll` cannot run as a Claude Code `!` command.
+
+### What it exposes
+
+- **The key can ask for a touch with nothing on screen (U3).** The touch
+  approves whatever request is pending, seen or not. A blinking key is not a
+  display. Approval UX must teach "touch only while the countersign dialog is
+  showing", and countersign should consider requiring the dialog to be
+  answered as well (for example a `required` touch plus a click, rather than
+  touch alone). Not yet known: whether the dialog failed to render in U3 or
+  rendered late; rerun `spike.sh u2f U3` to see if it repeats.
+- **This replaces the PAM stack for every polkit prompt on the machine**
+  (`pkexec`, GNOME settings, Bitwarden unlock). polkit has no per-action PAM
+  service. A touch-only stack for countersign means touch-only for all
+  polkit prompts, which the owner has to choose deliberately.
+
+## Found alongside: cached sudo is shared with the agent
+
+After the owner ran `sudo` in a separate terminal tab, `sudo -n true` from
+the agent's shell (same uid, different terminal) succeeded: the sudo
+credential cache was not tied to the terminal. For as long as the cache
+lasts, any agent of that uid can run commands as root, which defeats every
+countersign tier. The threat model treats root as out of scope; this makes
+"the agent is not root" depend on sudo configuration. Recommend
+`Defaults timestamp_type=tty` (or `timestamp_timeout=0`) in
+`/etc/sudoers.d/`, and have `cn doctor` check for it.

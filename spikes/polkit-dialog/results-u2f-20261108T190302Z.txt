@@ -1,0 +1,35 @@
+countersign polkit spike (u2f subject), 2026-11-08T19:03:02Z
+polkit 128, gnome-shell 51.1, session 3 (wayland)
+
+installing pam_u2f (left installed afterwards; it does nothing unless configured)
+pam_u2f 1.4.0
+enrolled one credential for patrick
+polkit PAM stack replaced by a YubiKey touch for this run
+
+U1 owner passes details, human touches the key (expect: true)
+  caller uid 65534, subject u2f, flags 1
+  result: ((true, false, {'digest': '3QF8-ZK2M', 'polkit.result': 'auth_self', 'request': 'K7M-Q2X', 'summary': 'use clickhouse-password for 30m (spike)'}),)
+
+U2 owner passes details, human cancels without touching (expect: false, dismissed)
+  caller uid 65534, subject u2f, flags 1
+  result: ((false, false, {'polkit.dismissed': 'true', 'digest': '3QF8-ZK2M', 'polkit.result': 'auth_self', 'request': 'K7M-Q2X', 'summary': 'use clickhouse-password for 30m (spike)'}),)
+
+U3 owner passes details, human does nothing (expect: false after pam_u2f or the call times out)
+  caller uid 65534, subject u2f, flags 1
+  result: ((false, false, {'polkit.dismissed': 'true', 'digest': '3QF8-ZK2M', 'polkit.result': 'auth_self', 'request': 'K7M-Q2X', 'summary': 'use clickhouse-password for 30m (spike)'}),)
+
+agent helper log since 2026-11-08 19:03:02:
+  Starting Authorization Manager Agent Helper (PID 12200/UID 1000)...
+  polkit-agent-helper@48-163728-12200_971-1000.service: Deactivated successfully.
+  Finished Authorization Manager Agent Helper (PID 12200/UID 1000).
+  Starting Authorization Manager Agent Helper (PID 12200/UID 1000)...
+  Starting Authorization Manager Agent Helper (PID 12200/UID 1000)...
+  polkit-agent-helper-1: pam_authenticate failed: Authentication failure
+  Starting Authorization Manager Agent Helper (PID 12200/UID 1000)...
+  polkit-agent-helper@50-187022-12200_971-1000.service: Deactivated successfully.
+  Finished Authorization Manager Agent Helper (PID 12200/UID 1000).
+  polkit-agent-helper-1: pam_authenticate failed: Authentication failure
+  polkit-agent-helper@49-163729-12200_971-1000.service: Deactivated successfully.
+  Finished Authorization Manager Agent Helper (PID 12200/UID 1000).
+
+Done. In chat, report what each dialog showed and what you pressed or touched.
