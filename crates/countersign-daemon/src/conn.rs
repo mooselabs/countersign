@@ -392,11 +392,29 @@ impl Conn {
         let mut stream = redactor.stream();
         let (mut bytes_in, mut bytes_out) = (0u64, 0u64);
         let mut out = Vec::new();
+        // Every stream is audited, also one the client abandons: hit counts
+        // are how probing shows up (design.md section 8).
+        let record = |bytes_in, bytes_out, hits: &countersign_hide::Hits| {
+            self.d.lock().record(
+                Some(&sref),
+                &Event::Hide {
+                    bytes_in,
+                    bytes_out,
+                    hits: hits.clone(),
+                    patterns: redactor.patterns() as u64,
+                },
+            );
+        };
         loop {
-            match frames::read(r).await {
+            let frame = frames::read(r).await;
+            match frame {
                 Ok(Some(Frame::Stream(mut data))) => {
                     if let Err(body) = self.hide_budget(&session, data.len() as u64) {
                         zeroize::Zeroize::zeroize(&mut data);
+                        let mut rest = Vec::new();
+                        let hits = stream.finish(&mut rest);
+                        zeroize::Zeroize::zeroize(&mut rest);
+                        record(bytes_in, bytes_out, &hits);
                         let _ = frames::write_message(w, id, &Response::Error(body)).await;
                         return Err(());
                     }
@@ -408,7 +426,12 @@ impl Conn {
                         let sent = frames::write_stream(w, &out).await;
                         zeroize::Zeroize::zeroize(&mut out);
                         out.clear();
-                        sent.map_err(|_| ())?;
+                        if sent.is_err() {
+                            let hits = stream.finish(&mut out);
+                            zeroize::Zeroize::zeroize(&mut out);
+                            record(bytes_in, bytes_out, &hits);
+                            return Err(());
+                        }
                     }
                 }
                 Ok(Some(Frame::Request(end_id, req))) if matches!(*req, Request::HideEnd) => {
@@ -416,16 +439,8 @@ impl Conn {
                     bytes_out += out.len() as u64;
                     let sent = frames::write_stream(w, &out).await;
                     zeroize::Zeroize::zeroize(&mut out);
+                    record(bytes_in, bytes_out, &hits);
                     sent.map_err(|_| ())?;
-                    self.d.lock().record(
-                        Some(&sref),
-                        &Event::Hide {
-                            bytes_in,
-                            bytes_out,
-                            hits: hits.clone(),
-                            patterns: redactor.patterns() as u64,
-                        },
-                    );
                     let summary = Response::HideSummary {
                         bytes_in,
                         bytes_out,
@@ -435,9 +450,14 @@ impl Conn {
                         .await
                         .map_err(|_| ());
                 }
-                // Anything else ends the stream; it was not finished, so
-                // nothing is audited beyond what the client saw.
-                _ => return Err(()),
+                // Anything else ends the stream and the connection. The
+                // carried tail is never sent.
+                _ => {
+                    let hits = stream.finish(&mut out);
+                    zeroize::Zeroize::zeroize(&mut out);
+                    record(bytes_in, bytes_out, &hits);
+                    return Err(());
+                }
             }
         }
     }

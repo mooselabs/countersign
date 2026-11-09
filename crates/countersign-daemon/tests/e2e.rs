@@ -942,3 +942,38 @@ require_wayland = false
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn an_abandoned_hide_stream_is_still_audited() {
+    use countersign_proto::{Envelope, Kind, Request, write_frame, write_message};
+    let cnd = Cnd::start(APPROVE_ALL);
+    add(
+        &cnd,
+        "probe-target",
+        "high-entropy-probe-0123456789",
+        "--high-entropy",
+    );
+    let mut s = std::os::unix::net::UnixStream::connect(cnd.path().join("sock")).unwrap();
+    let hello = Request::Hello {
+        protocols: vec![1],
+        client: "e2e".into(),
+        labels: Default::default(),
+        cwd: None,
+    };
+    write_message(&mut s, &Envelope { id: 1, body: hello }).unwrap();
+    countersign_proto::read_frame(&mut s).unwrap().unwrap();
+    let hide = Request::Hide { secrets: vec![] };
+    write_message(&mut s, &Envelope { id: 2, body: hide }).unwrap();
+    countersign_proto::read_frame(&mut s).unwrap().unwrap();
+    write_frame(
+        &mut s,
+        Kind::Stream,
+        b"guess high-entropy-probe-0123456789\n",
+    )
+    .unwrap();
+    let (_, echoed) = countersign_proto::read_frame(&mut s).unwrap().unwrap();
+    assert_eq!(echoed, b"guess [countersign:probe-target]\n");
+    drop(s);
+    let rec = cnd.wait_for_record(|r| r["event"] == "hide");
+    assert_eq!(rec["hits"]["probe-target"], 1);
+}
