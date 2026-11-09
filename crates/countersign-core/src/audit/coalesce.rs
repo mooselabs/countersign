@@ -58,6 +58,11 @@ impl ListCoalescer {
         }
     }
 
+    /// Changes the window (config reload). Open windows end by the new one.
+    pub fn set_window(&mut self, window: Duration) {
+        self.window = window;
+    }
+
     /// Counts one `list` call. Returns the record to write, if any.
     pub fn on_list(&mut self, session: &str, now: SystemTime) -> Option<ListRecord> {
         let window = self.window;

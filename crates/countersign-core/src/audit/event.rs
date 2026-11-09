@@ -245,10 +245,9 @@ pub enum Event {
     /// A `cn hide` stream ended.
     #[serde(rename = "hide")]
     Hide {
-        /// Bytes read.
+        /// Bytes read. The bytes written are not recorded: with the bytes
+        /// read and the hits they give away the matched values' lengths.
         bytes_in: u64,
-        /// Bytes written.
-        bytes_out: u64,
         /// Hits per secret.
         hits: BTreeMap<String, u64>,
         /// Patterns in the engine.

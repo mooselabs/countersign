@@ -135,6 +135,7 @@ fn new_view(
             prompted: true,
         }],
         decision: None,
+        queued: false,
     }
 }
 
@@ -308,6 +309,7 @@ fn serve(stream: UnixStream, state: &Mutex<State>) {
                                         grant: (view.request.mode != ApprovalKind::Mutate)
                                             .then(|| grant(&view.request.secrets)),
                                         grants_revoked: 0,
+                                        error: None,
                                     });
                                 }
                                 Decide::Deny => {
@@ -318,6 +320,7 @@ fn serve(stream: UnixStream, state: &Mutex<State>) {
                                         reason: Some("dialog dismissed".into()),
                                         grant: None,
                                         grants_revoked: 0,
+                                        error: None,
                                     });
                                 }
                                 Decide::Stay => {}

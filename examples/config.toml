@@ -112,7 +112,8 @@ export = "polkit"
 # permanent kinds becomes:
 # reveal = { all_of = ["polkit", "desk-key"] }
 
-# Whether `cn list` and `cn show` need a use-level approval once per session.
+# Not in this version (parsed; true logs a warning and list needs no approval):
+# whether `cn list` and `cn show` need a use-level approval once per session.
 list_requires_approval = false
 
 # ---------------------------------------------------------------------------
@@ -140,11 +141,11 @@ require_wayland = true
 # A dismissed dialog: "deny" (default) or "ignore" (lets another any_of
 # member answer).
 on_dismiss = "deny"
-timeout = "2m"
-# cn doctor checks that /etc/pam.d/polkit-1 contains pam_u2f with a
-# root-owned authfile when this is true. Default false; true when installed
-# with --factor touch or touch+password.
-expect_pam_u2f = false
+# A dialog stays open until the request lapses ([grants] pending_expiry,
+# counted from when the request was made, also while it waits its turn
+# behind other dialogs). Set timeout to close dialogs sooner; the request
+# then lapses at whichever comes first.
+# timeout = "2m"
 
 # Phase 2 adapters, refused by this version:
 #   type = "fido2"    a YubiKey assertion over the request digest (cn approve)
@@ -157,7 +158,8 @@ expect_pam_u2f = false
 # Default scope of `cn list`: "project" (secrets matching the session's cwd,
 # plus unscoped ones) or "all".
 default_scope = "project"
-# Show usage prose in `cn list` (the full text is always in `cn show`).
+# Not in this version (parsed; false logs a warning): `cn list` shows usage
+# prose only with --long, and `cn show` always shows it.
 show_usage = true
 
 # ---------------------------------------------------------------------------
@@ -176,21 +178,43 @@ min_value_len = 8
 # Per session.
 max_streams_per_minute = 30
 max_bytes_per_minute = "256MiB"
+# Per uid, over all its sessions.
+max_streams_per_minute_per_uid = 120
+max_bytes_per_minute_per_uid = "1GiB"
 
 # ---------------------------------------------------------------------------
-# Rate limits (per session unless noted)
+# Rate limits
 # ---------------------------------------------------------------------------
+# Each per-session limit has a per-uid limit beside it, so an agent cannot
+# escape a limit by starting new sessions. The per-uid defaults leave room
+# for several agent sessions working at once.
 [limits]
 max_pending_requests = 3
+max_pending_requests_per_uid = 10
 requests_per_hour = 30
-# After a deny, refuse new requests for the same secrets in that session.
+requests_per_hour_per_uid = 120
+# Dialogs open at once for one uid. Further requests wait their turn; their
+# expiry still counts from when they were made.
+max_prompts_per_uid = 2
+# After a deny, refuse new requests for the same secrets from that uid, in
+# every session.
 deny_cooldown = "2m"
-# Failed approval verifications before the session's pending requests are
-# cancelled and new ones refused for deny_cooldown.
-approval_failures_per_10m = 5
+# Not in this version (no Phase 1 approver can fail verification; setting it
+# logs a warning): failed approval verifications before the session's pending
+# requests are cancelled and new ones refused for deny_cooldown.
+# approval_failures_per_10m = 5
 list_calls_per_minute = 60
+list_calls_per_minute_per_uid = 240
 # Names per request (fixed at 16 in v1; lower it here).
 max_names_per_request = 16
+# Secrets per `cn import`; import a larger set in parts.
+max_names_per_import = 20
+# Open connections and live sessions per uid.
+max_connections_per_uid = 128
+max_sessions_per_uid = 128
+# A connection that sends nothing this long is closed, unless a `cn run`
+# child or a `cn hide` stream is using it.
+idle_timeout = "10m"
 
 # ---------------------------------------------------------------------------
 # Audit log
@@ -205,8 +229,9 @@ checkpoint_interval = "1h"
 checkpoint_every_records = 1000
 # `list` and `show` calls are coalesced into one record per session per window.
 list_coalesce = "10m"
-# Agent-supplied text (reason, labels) is passed through the redaction engine
-# before it is written, in case an agent pasted a value into it.
+# Agent-supplied text (request reasons, session labels) and `cn deny --reason`
+# text pass through the session's redaction set before they are shown or
+# written, in case a value was pasted into them.
 redact_agent_text = true
 # Not in Phase 1 (parsed with a warning):
 # Delete whole closed segments older than this, only if a checkpoint covers
@@ -215,9 +240,11 @@ redact_agent_text = true
 # Hand each new checkpoint line to this command on stdin, for off-box copies.
 # checkpoint_command = ["/usr/local/bin/cn-push-checkpoint"]
 
-# Extra copies (optional). Each sink receives every record; a sink failure is
-# logged but does not block the primary log. Checkpoints held outside
-# /var/lib/countersign are what make truncation detectable.
+# Not in this version (parsed; a sink logs a warning and only the audit
+# files are written). Extra copies (optional). Each sink receives every
+# record; a sink failure is logged but does not block the primary log.
+# Checkpoints held outside /var/lib/countersign are what make truncation
+# detectable.
 # [[audit.sink]]
 # type = "journald"
 # # "full" = every record; "checkpoints" = checkpoints and approvals only.

@@ -113,7 +113,9 @@ fn request_view(state: RequestState) -> RequestView {
             reason: None,
             grant: Some(grant()),
             grants_revoked: 0,
+            error: None,
         }),
+        queued: false,
     }
 }
 

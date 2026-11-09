@@ -70,7 +70,6 @@ fn fill(f: &mut Fixture, n: usize) {
             },
             _ => Event::Hide {
                 bytes_in: 10,
-                bytes_out: 10,
                 hits: BTreeMap::from([("db".into(), 2)]),
                 patterns: 4,
             },
@@ -142,6 +141,7 @@ fn a_written_chain_verifies() {
         &VerifyOptions {
             pubkey: Some(pubkey(&f)),
             exported_checkpoints: None,
+            expect_first_seq: None,
         },
     )
     .unwrap();
@@ -254,6 +254,7 @@ fn any_single_byte_change_is_found_on_its_line() {
     let opts = VerifyOptions {
         pubkey: Some(key),
         exported_checkpoints: None,
+        expect_first_seq: None,
     };
     assert!(verify_segments_with(&bytes, &opts).is_ok());
     let mut rnd = [0u8; 4 * 300];
@@ -279,6 +280,7 @@ fn checkpoints_are_signed_and_checked() {
     let opts = VerifyOptions {
         pubkey: Some(pubkey(&f)),
         exported_checkpoints: None,
+        expect_first_seq: None,
     };
     let r = verify_segments_with(&bytes, &opts).unwrap();
     assert_eq!((r.checkpoints, r.signatures_verified), (2, 2));
@@ -289,6 +291,7 @@ fn checkpoints_are_signed_and_checked() {
     let wrong = VerifyOptions {
         pubkey: Some(*SigningKey::from_bytes(&[1; 32]).verifying_key().as_bytes()),
         exported_checkpoints: None,
+        expect_first_seq: None,
     };
     let e = verify_segments_with(&bytes, &wrong).unwrap_err();
     assert_eq!((e.seq, e.kind), (Some(11), BreakKind::Signature));
@@ -330,6 +333,7 @@ fn exported_checkpoints_catch_rewrites_and_truncation() {
     let opts = VerifyOptions {
         pubkey: None,
         exported_checkpoints: Some(&exported),
+        expect_first_seq: None,
     };
     assert_eq!(
         verify_segments_with(&bytes, &opts)
@@ -400,6 +404,7 @@ fn segments_rotate_by_size_and_month_and_the_chain_runs_across() {
         &VerifyOptions {
             pubkey: Some(pubkey(&f)),
             exported_checkpoints: None,
+            expect_first_seq: None,
         },
     )
     .unwrap();
@@ -538,4 +543,155 @@ fn store_changes_become_store_events() {
         serde_json::json!({"event": "store.set", "secret": "db", "request_id": "r_1",
             "fields_changed": ["value", "rotated"], "value_changed": true, "generation": 43})
     );
+}
+
+fn reopen(f: &Fixture) -> AuditLog {
+    let mut log = AuditLog::open(
+        f.log.dir(),
+        Options::new("machine-1", "5e1c9a07"),
+        f.clock.clone(),
+    )
+    .unwrap();
+    log.set_signer(&SEED).unwrap();
+    log
+}
+
+#[test]
+fn a_failed_write_leaves_no_fragment() {
+    let mut f = fixture(|_| {});
+    fill(&mut f, 3);
+    let before = all(&f);
+    FAIL_WRITE_AFTER.with(|c| c.set(Some(17)));
+    let err = f
+        .log
+        .append(Some(&session("s_a")), &request("FAIL-01", "db"))
+        .unwrap_err();
+    assert!(matches!(err, AuditError::Io { .. }), "{err:?}");
+    // Nothing of it is on disk, and the chain continues as if it never was.
+    assert_eq!(all(&f), before);
+    assert_eq!(f.log.head().0, 3);
+    f.log
+        .append(Some(&session("s_a")), &request("OK-0001", "db"))
+        .unwrap();
+    let r = verify_segments(&all(&f)).unwrap();
+    assert_eq!(r.last_seq, 4);
+    // And the log still opens.
+    assert_eq!(reopen(&f).head().0, 4);
+}
+
+#[test]
+fn a_batch_is_written_whole_or_not_at_all() {
+    let mut f = fixture(|_| {});
+    fill(&mut f, 2);
+    let events = [
+        Event::DaemonStop { reason: "a".into() },
+        Event::DaemonStop { reason: "b".into() },
+        Event::DaemonStop { reason: "c".into() },
+    ];
+    let before = all(&f);
+    // Fail inside the second line.
+    let first_len = lines_of(&before)[0].len();
+    FAIL_WRITE_AFTER.with(|c| c.set(Some(first_len + 30)));
+    assert!(f.log.append_all(None, &events).is_err());
+    assert_eq!(all(&f), before);
+    let w = f.log.append_all(None, &events).unwrap();
+    assert_eq!(w.iter().map(|w| w.seq).collect::<Vec<_>>(), [3, 4, 5]);
+    verify_segments(&all(&f)).unwrap();
+}
+
+#[test]
+fn a_crash_during_rotation_is_recovered() {
+    // The crash left a new, empty segment, or one with a torn segment.open.
+    for leftover in [&b""[..], &br#"{"boot":"5e1c9a07","event":"segment.o"#[..]] {
+        let mut f = fixture(|o| o.max_segment_bytes = 2000);
+        fill(&mut f, 12);
+        let dir = f.log.dir().to_owned();
+        let segs = list_segments(&dir).unwrap();
+        assert!(segs.len() > 1);
+        let next = dir.join(segment_name(segs.last().unwrap() + 1));
+        std::fs::write(&next, leftover).unwrap();
+        let mut log = reopen(&f);
+        assert!(!next.exists());
+        let head = f.log.head().0;
+        assert_eq!(log.head().0, head);
+        log.append(None, &Event::DaemonStop { reason: "x".into() })
+            .unwrap();
+        let r = verify_segments(&log.segments_from(1).unwrap()).unwrap();
+        assert_eq!(r.last_seq, head + 1);
+    }
+}
+
+#[test]
+fn a_failed_segment_open_is_written_by_the_next_append() {
+    let mut f = fixture(|_| {});
+    fill(&mut f, 3);
+    f.log.checkpoint().unwrap();
+    // The next append rotates; no checkpoint is owed, so its first write is
+    // the segment.open.
+    f.log.opts.max_segment_bytes = 1;
+    let ev = Event::DaemonStop {
+        reason: "after".into(),
+    };
+    FAIL_WRITE_AFTER.with(|c| c.set(Some(5)));
+    assert!(f.log.append(None, &ev).is_err());
+    assert_eq!(list_segments(f.log.dir()).unwrap().len(), 2);
+    f.log.opts.max_segment_bytes = MAX_SEGMENT_BYTES;
+    f.log.append(None, &ev).unwrap();
+    let r = verify_segments(&all(&f)).unwrap();
+    assert_eq!(r.segment_opens, 1);
+    assert_eq!(reopen(&f).head().0, r.last_seq);
+}
+
+#[test]
+fn verify_can_require_the_start_of_the_log() {
+    let mut f = fixture(|_| {});
+    fill(&mut f, 6);
+    let whole = all(&f);
+    let opts = VerifyOptions {
+        expect_first_seq: Some(1),
+        ..VerifyOptions::default()
+    };
+    assert!(verify_segments_with(&whole, &opts).unwrap().from_genesis);
+    // Leading records deleted: the rest still chains, but does not start at 1.
+    let tail = f.log.segments_from(3).unwrap();
+    assert!(verify_segments(&tail).is_ok());
+    let e = verify_segments_with(&tail, &opts).unwrap_err();
+    assert_eq!(e.kind, BreakKind::Start { expected: 1 });
+    let e = verify_segments_with(b"", &opts).unwrap_err();
+    assert_eq!(e.kind, BreakKind::Start { expected: 1 });
+}
+
+#[test]
+fn reads_page_through_the_log_from_any_seq() {
+    let mut f = fixture(|o| o.max_segment_bytes = 20_000);
+    fill(&mut f, 400);
+    assert!(list_segments(f.log.dir()).unwrap().len() > 3);
+    let reader = f.log.reader();
+    let whole = all(&f);
+    for from in [1, 2, 57, 200, 399] {
+        let mut got = Vec::new();
+        let mut next = Some(from);
+        while let Some(n) = next {
+            let (bytes, more) = reader.segments_from(n, 3000).unwrap();
+            assert!(!bytes.is_empty());
+            got.extend_from_slice(&bytes);
+            next = more;
+        }
+        let want = f.log.segments_from(from).unwrap();
+        assert_eq!(got, want, "from {from}");
+        assert_eq!(verify_segments(&got).unwrap().first_seq, from);
+    }
+    assert_eq!(f.log.segments_from(1).unwrap(), whole);
+    // A reader stops at what was written when it was made.
+    let upto = reader.upto_seq();
+    f.log
+        .append(
+            None,
+            &Event::DaemonStop {
+                reason: "later".into(),
+            },
+        )
+        .unwrap();
+    let (bytes, _) = reader.segments_from(1, usize::MAX).unwrap();
+    assert_eq!(verify_segments(&bytes).unwrap().last_seq, upto);
 }

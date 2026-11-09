@@ -246,9 +246,10 @@ impl PolkitApprover {
             Ok(d) if !d.is_zero() => d,
             _ => return Err(ApproverError::Timeout),
         };
-        // One dialog stays open at most `timeout`, even if the request
-        // lives longer.
-        let remaining = remaining.min(self.config.timeout);
+        // The dialog stays until the request lapses (its `expires_at`,
+        // from `pending_expiry`). A configured `timeout` only shortens that;
+        // when it fires first the request lapses with it.
+        let remaining = self.config.timeout.map_or(remaining, |t| remaining.min(t));
         if cancel.is_cancelled() {
             return Err(ApproverError::Cancelled);
         }

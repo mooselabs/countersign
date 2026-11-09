@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 use countersign_approve::polkit::{Bus, PolkitApprover};
 use countersign_approve::{
     ApprovalRequest, ApproverError, CancellationToken, DaemonApprover, DisplayInput, DisplayView,
-    Outcome, SessionRef,
+    Found, Outcome, SessionRef,
 };
 use countersign_core::config::{OnDismiss, PolkitConfig, PolkitSubject as SubjectMode};
 use countersign_proto::{APPROVE_DOMAIN, Anchor, ApprovalKind, CanonicalRequest};
@@ -291,6 +291,7 @@ fn session() -> SessionRef {
 
 fn use_request(expires_in: Duration) -> ApprovalRequest {
     let display = DisplayView::new(&DisplayInput {
+        found: Found::Registered,
         anchor_comm: "claude".into(),
         anchor_pid: 41210,
         label: None,
@@ -392,7 +393,10 @@ async fn details_map_is_exact() {
         ("digest", req.digest_short()),
         ("secrets", "clickhouse-password, github-token"),
         ("ttl", "30m"),
-        ("session", "agent claude (pid 41210) in ~/projects/x"),
+        (
+            "session",
+            "agent claude (pid 41210, registered by cn session exec); agent-reported: cwd ~/projects/x",
+        ),
         ("reason", "row counts for the cost report"),
         ("operation", "none"),
     ]
@@ -404,7 +408,10 @@ async fn details_map_is_exact() {
         ("digest", mutate.digest_short()),
         ("secrets", "none"),
         ("ttl", "none"),
-        ("session", "agent claude (pid 41210)"),
+        (
+            "session",
+            "agent claude (pid 41210, registered by cn session exec)",
+        ),
         ("reason", "none"),
         (
             "operation",
@@ -897,4 +904,46 @@ async fn require_wayland_reads_the_display_session_from_logind() {
             assert!(fx.with(|s| s.calls.is_empty()));
         }
     }
+}
+
+/// With no `timeout` set the dialog stays until the request lapses; a
+/// configured `timeout` only shortens it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_dialog_lasts_until_the_request_lapses() {
+    let Some(fx) = Fixture::start(Reply::Hang).await else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let err = fx
+        .default_approver()
+        .present(
+            &use_request(Duration::from_millis(1500)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err, ApproverError::Timeout);
+    assert!(
+        started.elapsed() >= Duration::from_millis(1400),
+        "{:?}",
+        started.elapsed()
+    );
+
+    let short = PolkitApprover::new(
+        "polkit",
+        PolkitConfig {
+            require_wayland: false,
+            timeout: Some(Duration::from_millis(200)),
+            ..PolkitConfig::default()
+        },
+        Bus::Address(fx.bus.address.clone()),
+    );
+    let started = std::time::Instant::now();
+    let err = short
+        .present(&use_request(MINUTE), CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(err, ApproverError::Timeout);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    fx.with(|s| assert_eq!(s.cancels.len(), 2));
 }

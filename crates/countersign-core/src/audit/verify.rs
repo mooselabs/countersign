@@ -24,6 +24,10 @@ pub struct VerifyOptions<'a> {
     pub pubkey: Option<[u8; 32]>,
     /// Exported checkpoint lines (JSONL) to compare with the chain.
     pub exported_checkpoints: Option<&'a [u8]>,
+    /// The `seq` the input must start at. `cn audit verify` sets 1 (or its
+    /// `--from`), so a log whose leading segments were deleted fails
+    /// instead of verifying from wherever it now starts.
+    pub expect_first_seq: Option<u64>,
 }
 
 /// The last checkpoint seen.
@@ -92,6 +96,12 @@ pub enum BreakKind {
     /// An exported checkpoint covers records the chain no longer has: the
     /// log was truncated.
     Truncated,
+    /// The input does not start at the expected `seq`: leading records are
+    /// missing (or there are none).
+    Start {
+        /// The `seq` it should start at.
+        expected: u64,
+    },
 }
 
 /// A chain that did not verify. `line` counts from 1 in the input, or in
@@ -122,6 +132,9 @@ impl fmt::Display for VerifyError {
             BreakKind::Exported => "exported checkpoint does not match the chain".into(),
             BreakKind::Truncated => {
                 "exported checkpoint covers records the log no longer has (truncated)".into()
+            }
+            BreakKind::Start { expected } => {
+                format!("the log does not start at seq {expected}: earlier records are missing")
             }
         };
         match self.seq {
@@ -195,6 +208,9 @@ pub fn verify_segments_with(
             return Err(fail(Some(seq), BreakKind::Hash));
         }
         if r.records == 0 {
+            if let Some(expected) = opts.expect_first_seq.filter(|want| *want != seq) {
+                return Err(fail(Some(seq), BreakKind::Start { expected }));
+            }
             r.first_seq = seq;
             r.from_genesis = seq == 1;
             if seq == 0 || (seq == 1 && prev != GENESIS_PREV) {
@@ -253,6 +269,13 @@ pub fn verify_segments_with(
         r.last_seq = seq;
         r.head_hash = hash.to_owned();
         hashes.push(hash.to_owned());
+    }
+    if let (0, Some(expected)) = (r.records, opts.expect_first_seq) {
+        return Err(VerifyError {
+            line: 0,
+            seq: None,
+            kind: BreakKind::Start { expected },
+        });
     }
     if let Some(exported) = opts.exported_checkpoints {
         check_exported(&mut r, &hashes, exported)?;

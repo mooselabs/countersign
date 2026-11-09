@@ -34,7 +34,9 @@ thread_local! {
 
 #[cfg(test)]
 fn failpoint(step: Step) -> io::Result<()> {
+    // One shot: the failure fires once, so recovery code can run after it.
     if FAIL_AT.with(|f| f.get()) == Some(step) {
+        FAIL_AT.with(|f| f.set(None));
         return Err(io::Error::other(format!("injected failure at {step:?}")));
     }
     Ok(())

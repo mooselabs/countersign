@@ -19,8 +19,12 @@ use serde::Serialize;
 pub const REASON_LIMIT: usize = 300;
 /// Longest cwd shown; longer paths lose their middle.
 pub const CWD_LIMIT: usize = 120;
-/// Longest operation text shown (mutate and export).
-pub const OPERATION_LIMIT: usize = 300;
+/// Longest operation text shown (mutate and export). `cnd` limits each
+/// agent-chosen part of it first ([`clean_quoted`]), so one long field
+/// cannot push the others out.
+pub const OPERATION_LIMIT: usize = 600;
+/// Longest matcher text shown in the session line.
+pub const MATCHER_LIMIT: usize = 48;
 /// Longest single secret name shown.
 pub const SECRET_NAME_LIMIT: usize = 64;
 /// Secret names listed before "and N more".
@@ -153,6 +157,18 @@ fn truncate_end(s: String, limit: usize) -> String {
     out.truncate(out.trim_end().len());
     out.push(ELLIPSIS);
     out
+}
+
+/// [`clean`], cut to `limit` characters, in double quotes. A cut text says
+/// how long it was, so a human sees that something is missing.
+pub fn clean_quoted(input: &str, limit: usize) -> String {
+    let s = clean(input);
+    let n = s.chars().count();
+    if n <= limit {
+        format!("\"{s}\"")
+    } else {
+        format!("\"{}\" (cut from {n} characters)", truncate_end(s, limit))
+    }
 }
 
 /// Formats a TTL the way `cn` accepts it: "30m", "1h", "1h30m", "45s".
@@ -291,11 +307,29 @@ fn is_combining(c: char) -> bool {
     )
 }
 
+/// How `cnd` found the session a request came from. Read from the kernel
+/// and `cnd`'s own tables, never from the client.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Found {
+    /// An agent session whose anchor `cn session exec` registered.
+    #[default]
+    Registered,
+    /// An agent session whose anchor a configured matcher accepted, e.g.
+    /// `comm = "claude"`.
+    Matched(String),
+    /// No agent anchor above the caller: a terminal (`h_`) session anchored
+    /// at the caller's parent, normally a shell.
+    Terminal,
+}
+
 /// What `cnd` knows about a request, before cleaning. Fields an agent chose
 /// are marked.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DisplayInput {
-    /// The anchor's `comm`, e.g. "claude".
+    /// How the session was found.
+    pub found: Found,
+    /// The anchor's `comm`, e.g. "claude" (for a terminal session, the
+    /// shell's).
     pub anchor_comm: String,
     /// The anchor's pid.
     pub anchor_pid: u32,
@@ -312,8 +346,9 @@ pub struct DisplayInput {
     /// The agent's reason (agent-supplied).
     pub reason: Option<String>,
     /// For `mutate` and `export`: what changes, written by `cnd`, e.g.
-    /// "ADD secret clickhouse-prod (32 bytes, from stdin)". Names in it may
-    /// come from the agent; it is cleaned like everything else.
+    /// "ADD secret clickhouse-prod (value 16 to 63 bytes, from stdin)".
+    /// Names and quoted fields in it come from the client; it is cleaned
+    /// like everything else.
     pub operation: Option<String>,
 }
 
@@ -387,13 +422,33 @@ impl DisplayView {
         if comm.is_empty() {
             comm = "unknown".into();
         }
-        let mut session = format!("agent {comm} (pid {}", input.anchor_pid);
+        let pid = input.anchor_pid;
+        let (mut session, reporter) = match &input.found {
+            Found::Registered => (
+                format!("agent {comm} (pid {pid}, registered by cn session exec)"),
+                "agent-reported",
+            ),
+            Found::Matched(m) => (
+                format!(
+                    "agent {comm} (pid {pid}, matched {})",
+                    clean_limited(m, MATCHER_LIMIT)
+                ),
+                "agent-reported",
+            ),
+            Found::Terminal => (
+                format!("terminal, no agent session (shell {comm}, pid {pid})"),
+                "client-reported",
+            ),
+        };
+        let mut reported = Vec::new();
         if let Some(label) = &label {
-            session.push_str(&format!(", label {label}"));
+            reported.push(format!("label {label}"));
         }
-        session.push(')');
         if let Some(cwd) = &cwd {
-            session.push_str(&format!(" in {cwd}"));
+            reported.push(format!("cwd {cwd}"));
+        }
+        if !reported.is_empty() {
+            session.push_str(&format!("; {reporter}: {}", reported.join(", ")));
         }
 
         let mut agent_supplied = Vec::new();
@@ -420,8 +475,9 @@ impl DisplayView {
         }
     }
 
-    /// "agent claude (pid 41210, label x) in ~/projects/x". Contains the
-    /// agent-supplied label and cwd.
+    /// Who is asking: "agent claude (pid 41210, registered by cn session
+    /// exec); agent-reported: label x, cwd ~/projects/x". What `cnd` found
+    /// comes first; the client's label and cwd follow, marked as reported.
     pub fn session(&self) -> &str {
         &self.session
     }
@@ -630,6 +686,7 @@ mod tests {
 
     fn input() -> DisplayInput {
         DisplayInput {
+            found: Found::Registered,
             anchor_comm: "claude".into(),
             anchor_pid: 41210,
             label: None,
@@ -645,7 +702,10 @@ mod tests {
     #[test]
     fn view_builds_the_session_line() {
         let v = DisplayView::new(&input());
-        assert_eq!(v.session(), "agent claude (pid 41210) in ~/projects/x");
+        assert_eq!(
+            v.session(),
+            "agent claude (pid 41210, registered by cn session exec); agent-reported: cwd ~/projects/x"
+        );
         assert_eq!(v.cwd(), Some("~/projects/x"));
         assert_eq!(v.ttl(), Some("30m"));
         assert_eq!(v.ttl_seconds(), Some(1800));
@@ -656,8 +716,46 @@ mod tests {
         i.label = Some("orch\nestrator".into());
         i.cwd = None;
         let v = DisplayView::new(&i);
-        assert_eq!(v.session(), "agent claude (pid 41210, label orch estrator)");
+        assert_eq!(
+            v.session(),
+            "agent claude (pid 41210, registered by cn session exec); agent-reported: label orch estrator"
+        );
         assert_eq!(v.agent_supplied(), ["reason", "label"]);
+    }
+
+    #[test]
+    fn the_session_line_says_how_the_session_was_found() {
+        let mut i = input();
+        i.found = Found::Matched("comm = \"claude\"\n".into());
+        assert_eq!(
+            DisplayView::new(&i).session(),
+            "agent claude (pid 41210, matched comm = \"claude\"); agent-reported: cwd ~/projects/x"
+        );
+        i.found = Found::Terminal;
+        i.anchor_comm = "bash".into();
+        i.anchor_pid = 3001;
+        assert_eq!(
+            DisplayView::new(&i).session(),
+            "terminal, no agent session (shell bash, pid 3001); client-reported: cwd ~/projects/x"
+        );
+        // A label cannot pose as what cnd found: it comes after, marked.
+        i.found = Found::Registered;
+        i.cwd = None;
+        i.label = Some("registered by cn session exec)".into());
+        assert!(
+            DisplayView::new(&i)
+                .session()
+                .ends_with("; agent-reported: label registered by cn session exec)")
+        );
+    }
+
+    #[test]
+    fn quoted_fields_say_when_they_were_cut() {
+        assert_eq!(clean_quoted("a\nb", 10), "\"a b\"");
+        assert_eq!(
+            clean_quoted(&"x".repeat(50), 10),
+            format!("\"{}\u{2026}\" (cut from 50 characters)", "x".repeat(9))
+        );
     }
 
     #[test]
@@ -704,7 +802,10 @@ mod tests {
         i.cwd = Some("/tmp/\x1b[31mred\u{2066}".into());
         i.operation = Some("ADD\rsecret".into());
         let v = DisplayView::new(&i);
-        assert_eq!(v.session(), "agent claude (pid 41210) in /tmp/red");
+        assert_eq!(
+            v.session(),
+            "agent claude (pid 41210, registered by cn session exec); agent-reported: cwd /tmp/red"
+        );
         assert_eq!(v.reason(), Some("fine APPROVED BY ADMIN hidden link"));
         assert_eq!(v.secrets()[0], "prod-db x");
         // A name that cleans to nothing is dropped.
@@ -725,7 +826,10 @@ mod tests {
         let v = DisplayView::new(&i);
         assert_eq!(v.reason(), None);
         assert_eq!(v.cwd(), None);
-        assert_eq!(v.session(), "agent unknown (pid 41210)");
+        assert_eq!(
+            v.session(),
+            "agent unknown (pid 41210, registered by cn session exec)"
+        );
         assert!(v.agent_supplied().is_empty());
     }
 
@@ -736,7 +840,7 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({
-                "session": "agent claude (pid 41210) in ~/projects/x",
+                "session": "agent claude (pid 41210, registered by cn session exec); agent-reported: cwd ~/projects/x",
                 "secrets": ["clickhouse-password"],
                 "ttl_seconds": 1800,
                 "ttl": "30m",

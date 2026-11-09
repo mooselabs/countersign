@@ -20,8 +20,8 @@ use countersign_proto::{
 };
 use serde_json::Value;
 
-use crate::conn::{Conn, prune, session_error};
-use crate::daemon::{RunEntry, err, internal};
+use crate::conn::{Conn, session_error};
+use crate::daemon::{RunEntry, err, internal, prune};
 use crate::log::error;
 use crate::requests::store_error;
 use crate::sys;
@@ -65,13 +65,17 @@ impl Conn {
     /// `session_register`: the caller becomes an anchor. `cn session exec`
     /// then `exec`s the agent, which keeps the pid and start time.
     pub fn register(&mut self, label: Option<String>) -> Result<Response, ErrorBody> {
+        let rt = self.d.rt();
         let label = label
             .map(|l| {
                 let clean: String = l
                     .chars()
                     .filter(|c| c.is_ascii_graphic() || *c == ' ')
                     .collect();
-                views::truncate_utf8(clean.trim(), MAX_LABEL)
+                let clean = views::truncate_utf8(clean.trim(), MAX_LABEL);
+                // The session does not exist yet: redact with the values
+                // that need no grant to match.
+                views::redact_label(&self.d.lock(), &rt, "", &clean)
             })
             .filter(|l| !l.is_empty());
         let me = self.d.proc.process(self.pid).map_err(|e| {
@@ -87,7 +91,6 @@ impl Conn {
                 "the calling process changed during registration",
             ));
         }
-        let rt = self.d.rt();
         let found = {
             let mut st = self.d.lock();
             st.anchors.register(me.pid, me.start_time, label);
@@ -102,9 +105,12 @@ impl Conn {
         if !matches!(session.kind, AnchorKind::Registered { .. }) || session.anchor.pid != me.pid {
             return Err(internal("registration did not take"));
         }
-        if !self.d.ensure_session(&session, self.uid, &self.labels) {
-            return Err(err(ErrorCode::SessionDead, "the caller exited"));
+        if let Err(e) = self.d.ensure_session(&session, self.uid, &self.labels) {
+            let mut st = self.d.lock();
+            st.anchors.unregister(me.pid, me.start_time);
+            return Err(e);
         }
+        self.refused = None;
         self.chain = session.chain.clone();
         self.session = Some(session);
         let view = self
@@ -128,7 +134,16 @@ impl Conn {
                 "too many list calls in the last minute",
             ));
         }
-        calls.push_back(now);
+        let user = st.uid_list_rate.entry(self.uid).or_default();
+        prune(user, now);
+        if user.len() >= rt.config.limits.list_calls_per_minute_per_uid as usize {
+            return Err(err(
+                ErrorCode::RateLimited,
+                "too many list calls from this user in the last minute",
+            ));
+        }
+        user.push_back(now);
+        st.list_rate.entry(s.id.clone()).or_default().push_back(now);
         let sref = s.audit_ref(&self.labels);
         st.list_refs.insert(s.id.clone(), sref.clone());
         if let Some(rec) = st.lists.on_list(&s.id, now) {
@@ -434,11 +449,13 @@ impl Conn {
     }
 
     /// `audit_query`: newest matching records, trimmed to fit one frame.
+    /// The log is read from a snapshot, without the state lock, on a
+    /// blocking thread.
     #[expect(
         clippy::too_many_arguments,
         reason = "one argument per audit_query field"
     )]
-    pub fn audit_query(
+    pub async fn audit_query(
         &self,
         session: Option<String>,
         secret: Option<String>,
@@ -461,47 +478,53 @@ impl Conn {
                     .min(MAX_QUERY),
             ),
         };
-        let mut records = self.d.lock().audit.query(&q).map_err(|e| {
-            error!("audit query: {e}");
-            internal("the audit log could not be read")
-        })?;
+        let reader = self.d.lock().audit.reader();
+        let mut records = tokio::task::spawn_blocking(move || reader.query(&q))
+            .await
+            .map_err(|e| {
+                error!("audit query: {e}");
+                internal("the audit log could not be read")
+            })?
+            .map_err(|e| {
+                error!("audit query: {e}");
+                internal("the audit log could not be read")
+            })?;
         let budget = MAX_MESSAGE_LEN - (64 << 10);
         let mut size: usize = records.iter().map(record_size).sum();
-        while size > budget && !records.is_empty() {
-            size -= record_size(&records.remove(0));
+        let mut drop_front = 0;
+        while size > budget && drop_front < records.len() {
+            size -= record_size(&records[drop_front]);
+            drop_front += 1;
         }
+        records.drain(..drop_front);
         Ok(Response::AuditRecords { records })
     }
 
-    /// `audit_segments`: raw lines from `from_seq`, at most one frame's worth.
-    pub fn audit_segments(&self, from_seq: u64) -> Result<Response, ErrorBody> {
-        let st = self.d.lock();
-        let bytes = st.audit.segments_from(from_seq).map_err(|e| {
-            error!("audit segments: {e}");
-            internal("the audit log could not be read")
-        })?;
-        let pubkey = std::fs::read_to_string(st.audit.dir().join(PUBKEY_FILE))
-            .ok()
-            .map(|s| s.trim().to_owned());
-        drop(st);
-        let mut end = 0;
-        let mut next_seq = None;
-        for line in bytes.split_inclusive(|&b| b == b'\n') {
-            if end > 0 && end + line.len() > SEGMENT_BYTES {
-                next_seq = serde_json::from_slice::<Value>(line)
-                    .ok()
-                    .and_then(|v| v["seq"].as_u64());
-                if next_seq.is_none() {
-                    // A line that does not parse goes to the verifier as is.
-                    end += line.len();
-                    continue;
-                }
-                break;
+    /// `audit_segments`: raw lines from `from_seq`, at most one frame's
+    /// worth, read like `audit_query`.
+    pub async fn audit_segments(&self, from_seq: u64) -> Result<Response, ErrorBody> {
+        let reader = self.d.lock().audit.reader();
+        let read = tokio::task::spawn_blocking(move || {
+            let (bytes, next_seq) = reader.segments_from(from_seq, SEGMENT_BYTES)?;
+            let pubkey = std::fs::read_to_string(reader.dir().join(PUBKEY_FILE))
+                .ok()
+                .map(|s| s.trim().to_owned());
+            Ok::<_, countersign_core::audit::AuditError>((bytes, next_seq, pubkey))
+        })
+        .await;
+        let (bytes, next_seq, pubkey) = match read {
+            Ok(Ok(x)) => x,
+            Ok(Err(e)) => {
+                error!("audit segments: {e}");
+                return Err(internal("the audit log could not be read"));
             }
-            end += line.len();
-        }
+            Err(e) => {
+                error!("audit segments: {e}");
+                return Err(internal("the audit log could not be read"));
+            }
+        };
         Ok(Response::AuditSegments {
-            data_b64: base64::engine::general_purpose::STANDARD.encode(&bytes[..end]),
+            data_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
             next_seq,
             checkpoint_pubkey: pubkey,
         })

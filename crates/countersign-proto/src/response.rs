@@ -198,6 +198,12 @@ pub struct Decision {
     /// Grants revoked by an approved store change (`set`, `rm`).
     #[serde(default)]
     pub grants_revoked: u32,
+    /// Why no decision was possible, for a request that ended without one:
+    /// `approver_unavailable` when no approver in the chain could run.
+    /// The state is then `denied`, so a client that does not know this
+    /// field still does not go ahead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<crate::ErrorCode>,
 }
 
 /// A request, as `request_created` and `request_status` carry it. The
@@ -219,6 +225,10 @@ pub struct RequestView {
     /// Set once the request has left `pending`.
     #[serde(default)]
     pub decision: Option<Decision>,
+    /// Pending, and waiting for earlier dialogs of the same user to be
+    /// answered before its own opens. Its expiry still counts from creation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub queued: bool,
 }
 
 /// A value issued for `cn run`.

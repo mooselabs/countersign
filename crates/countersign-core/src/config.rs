@@ -187,8 +187,37 @@ impl Config {
                 "[limits] max_names_per_request must be 1 to {MAX_NAMES_PER_REQUEST}"
             )));
         }
-        if l.max_pending_requests == 0 {
-            return Err(invalid("[limits] max_pending_requests must be at least 1"));
+        for (key, n) in [
+            ("max_pending_requests", l.max_pending_requests),
+            (
+                "max_pending_requests_per_uid",
+                l.max_pending_requests_per_uid,
+            ),
+            ("max_prompts_per_uid", l.max_prompts_per_uid),
+            ("max_names_per_import", l.max_names_per_import),
+            ("max_connections_per_uid", l.max_connections_per_uid),
+            ("max_sessions_per_uid", l.max_sessions_per_uid),
+        ] {
+            if n == 0 {
+                return Err(invalid(format!("[limits] {key} must be at least 1")));
+            }
+        }
+        if l.idle_timeout.is_zero() {
+            return Err(invalid("[limits] idle_timeout must be longer than 0s"));
+        }
+        if l.approval_failures_per_10m.is_some() {
+            self.warnings.push(
+                "[limits] approval_failures_per_10m is not in this version: no approver here \
+                 can fail verification; ignored"
+                    .into(),
+            );
+        }
+        if !self.list.show_usage {
+            self.warnings.push(
+                "[list] show_usage is not in this version: cn list shows usage only with \
+                 --long; ignored"
+                    .into(),
+            );
         }
         if self.audit.checkpoint_every_records == 0 || self.audit.checkpoint_interval.is_zero() {
             return Err(invalid(
@@ -764,12 +793,11 @@ pub struct PolkitConfig {
     /// What a dismissed dialog means.
     #[serde(default)]
     pub on_dismiss: OnDismiss,
-    /// How long one dialog may stay open (the request expiry still applies).
-    #[serde(default = "d_2m", deserialize_with = "de_duration")]
-    pub timeout: Duration,
-    /// Whether `cn doctor` expects `pam_u2f` in the polkit PAM stack.
-    #[serde(default)]
-    pub expect_pam_u2f: bool,
+    /// Longest a dialog may stay open. Unset (the default), a dialog stays
+    /// until the request's `pending_expiry`; set, the request lapses at
+    /// whichever comes first.
+    #[serde(default, deserialize_with = "de_opt_duration")]
+    pub timeout: Option<Duration>,
 }
 
 impl Default for PolkitConfig {
@@ -781,8 +809,7 @@ impl Default for PolkitConfig {
             subject: PolkitSubject::Process,
             require_wayland: true,
             on_dismiss: OnDismiss::Deny,
-            timeout: d_2m(),
-            expect_pam_u2f: false,
+            timeout: None,
         }
     }
 }
@@ -885,6 +912,12 @@ pub struct Hide {
     /// Bytes per session per minute.
     #[serde(default = "mib_256", deserialize_with = "de_size")]
     pub max_bytes_per_minute: u64,
+    /// New hide streams per uid per minute, over all its sessions.
+    #[serde(default = "one_twenty")]
+    pub max_streams_per_minute_per_uid: u32,
+    /// Bytes per uid per minute, over all its sessions.
+    #[serde(default = "gib_1", deserialize_with = "de_size")]
+    pub max_bytes_per_minute_per_uid: u64,
 }
 
 impl Default for Hide {
@@ -894,6 +927,8 @@ impl Default for Hide {
             min_value_len: 8,
             max_streams_per_minute: 30,
             max_bytes_per_minute: mib_256(),
+            max_streams_per_minute_per_uid: one_twenty(),
+            max_bytes_per_minute_per_uid: gib_1(),
         }
     }
 }
@@ -902,39 +937,77 @@ fn default_include() -> Vec<HideInclude> {
     vec![HideInclude::Granted, HideInclude::HighEntropy]
 }
 
-/// `[limits]`, per session.
+/// `[limits]`. Each per-session limit has a per-uid one beside it, so a
+/// client cannot escape a limit by opening new sessions; the per-uid
+/// defaults leave room for several agent sessions working at once.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
     /// Pending requests a session may have at once.
     #[serde(default = "three")]
     pub max_pending_requests: usize,
+    /// Pending requests a uid may have at once, over all its sessions.
+    #[serde(default = "ten")]
+    pub max_pending_requests_per_uid: usize,
     /// Requests a session may create per hour.
     #[serde(default = "thirty")]
     pub requests_per_hour: u32,
-    /// After a deny, new requests for the same secrets are refused this long.
+    /// Requests a uid may create per hour, over all its sessions.
+    #[serde(default = "one_twenty")]
+    pub requests_per_hour_per_uid: u32,
+    /// Dialogs open at once for one uid. Further requests wait, in order;
+    /// their expiry still counts from creation.
+    #[serde(default = "two")]
+    pub max_prompts_per_uid: usize,
+    /// After a deny, new requests from the same uid for the same secrets
+    /// are refused this long, in every session.
     #[serde(default = "d_2m", deserialize_with = "de_duration")]
     pub deny_cooldown: Duration,
-    /// Failed approval verifications per 10 minutes before a cooldown.
-    #[serde(default = "five")]
-    pub approval_failures_per_10m: u32,
-    /// `list` calls per minute.
+    /// Failed approval verifications per 10 minutes before a cooldown. Not
+    /// in this version: no Phase 1 approver can fail verification.
+    #[serde(default)]
+    pub approval_failures_per_10m: Option<u32>,
+    /// `list` calls per session per minute.
     #[serde(default = "sixty")]
     pub list_calls_per_minute: u32,
+    /// `list` calls per uid per minute.
+    #[serde(default = "two_forty")]
+    pub list_calls_per_minute_per_uid: u32,
     /// Names per request, at most 16.
     #[serde(default = "sixteen")]
     pub max_names_per_request: usize,
+    /// Secrets per `cn import` request.
+    #[serde(default = "twenty")]
+    pub max_names_per_import: usize,
+    /// Open connections per uid.
+    #[serde(default = "one_twenty_eight")]
+    pub max_connections_per_uid: usize,
+    /// Live sessions per uid (each holds a pidfd for its anchor).
+    #[serde(default = "one_twenty_eight")]
+    pub max_sessions_per_uid: usize,
+    /// A connection that sends nothing this long is closed, unless it is
+    /// waiting on a `cn run` child or streaming `cn hide`.
+    #[serde(default = "d_10m", deserialize_with = "de_duration")]
+    pub idle_timeout: Duration,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
             max_pending_requests: 3,
+            max_pending_requests_per_uid: ten(),
             requests_per_hour: 30,
+            requests_per_hour_per_uid: one_twenty(),
+            max_prompts_per_uid: two(),
             deny_cooldown: d_2m(),
-            approval_failures_per_10m: 5,
+            approval_failures_per_10m: None,
             list_calls_per_minute: 60,
+            list_calls_per_minute_per_uid: two_forty(),
             max_names_per_request: MAX_NAMES_PER_REQUEST,
+            max_names_per_import: twenty(),
+            max_connections_per_uid: one_twenty_eight(),
+            max_sessions_per_uid: one_twenty_eight(),
+            idle_timeout: d_10m(),
         }
     }
 }
@@ -1067,9 +1140,6 @@ fn one() -> u32 {
 fn three() -> usize {
     3
 }
-fn five() -> u32 {
-    5
-}
 fn eight() -> usize {
     8
 }
@@ -1081,6 +1151,27 @@ fn thirty() -> u32 {
 }
 fn sixty() -> u32 {
     60
+}
+fn two() -> usize {
+    2
+}
+fn ten() -> usize {
+    10
+}
+fn twenty() -> usize {
+    20
+}
+fn one_twenty() -> u32 {
+    120
+}
+fn one_twenty_eight() -> usize {
+    128
+}
+fn two_forty() -> u32 {
+    240
+}
+fn gib_1() -> u64 {
+    1 << 30
 }
 fn thousand() -> u64 {
     1000
@@ -1103,6 +1194,58 @@ mod tests {
 
     fn err(text: &str) -> String {
         Config::from_toml(text).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn per_uid_limits_have_defaults_and_bounds() {
+        let c = Config::default();
+        let l = &c.limits;
+        assert_eq!(l.max_pending_requests_per_uid, 10);
+        assert_eq!(l.requests_per_hour_per_uid, 120);
+        assert_eq!(l.max_prompts_per_uid, 2);
+        assert_eq!(l.max_names_per_import, 20);
+        assert_eq!(l.max_connections_per_uid, 128);
+        assert_eq!(l.max_sessions_per_uid, 128);
+        assert_eq!(l.idle_timeout, Duration::from_secs(600));
+        assert_eq!(c.hide.max_bytes_per_minute_per_uid, 1 << 30);
+        let c = Config::from_toml(
+            "[limits]\nmax_prompts_per_uid = 1\nidle_timeout = \"1m\"\n\
+             [hide]\nmax_bytes_per_minute_per_uid = \"2GiB\"",
+        )
+        .unwrap();
+        assert_eq!(c.limits.max_prompts_per_uid, 1);
+        assert_eq!(c.limits.idle_timeout, Duration::from_secs(60));
+        assert_eq!(c.hide.max_bytes_per_minute_per_uid, 2 << 30);
+        assert!(err("[limits]\nmax_prompts_per_uid = 0").contains("at least 1"));
+        assert!(err("[limits]\nmax_connections_per_uid = 0").contains("at least 1"));
+    }
+
+    #[test]
+    fn settings_not_in_this_version_warn() {
+        let quiet = Config::default();
+        assert!(
+            !quiet
+                .warnings
+                .iter()
+                .any(|w| w.contains("not in this version"))
+        );
+        let c = Config::from_toml(
+            "[limits]\napproval_failures_per_10m = 5\n[list]\nshow_usage = false",
+        )
+        .unwrap();
+        assert!(
+            c.warnings
+                .iter()
+                .any(|w| w.contains("approval_failures_per_10m"))
+        );
+        assert!(c.warnings.iter().any(|w| w.contains("show_usage")));
+        // expect_pam_u2f is gone.
+        assert!(
+            err("[approvers.polkit]\ntype = \"polkit\"\nexpect_pam_u2f = true")
+                .contains("expect_pam_u2f")
+        );
+        // The polkit timeout is unset unless given.
+        assert_eq!(polkit(&Config::default().approvers["polkit"]).timeout, None);
     }
 
     #[test]
@@ -1191,7 +1334,7 @@ mod tests {
         let b = polkit(&c.approvers["b"]);
         assert_eq!(b.subject, PolkitSubject::Session);
         assert_eq!(b.on_dismiss, OnDismiss::Ignore);
-        assert_eq!(b.timeout, Duration::from_secs(90));
+        assert_eq!(b.timeout, Some(Duration::from_secs(90)));
     }
 
     #[test]

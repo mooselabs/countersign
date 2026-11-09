@@ -10,7 +10,9 @@ use countersign_approve::Registry;
 use countersign_approve::polkit::{Bus, PolkitApprover};
 use countersign_core::audit::{self, AuditLog, Event};
 use countersign_core::config::{ApproverConfig, Config, check_file_owner};
-use countersign_core::store::{MasterKey, RecoveryPhrase, STORE_FILE, Store};
+use countersign_core::store::{
+    KEYSLOTS_FILE, MasterKey, RecoveryPhrase, STORE_FILE, STORE_PREV_FILE, Store,
+};
 use countersign_core::time::{Clock, SystemClock};
 use zeroize::Zeroizing;
 
@@ -208,7 +210,10 @@ pub fn check_own_uid(paths: &Paths, uids: Option<&BTreeSet<u32>>) -> Result<(), 
     Ok(())
 }
 
-/// `cnd init`.
+/// `cnd init`. All or nothing: if any step fails, including printing the
+/// recovery phrase, the files this run created are removed again, so the
+/// installer can run it again and nobody is left with a store whose
+/// phrase they never saw.
 pub fn init(paths: &Paths) -> Result<(), String> {
     check_own_uid(paths, None)?;
     let config = optional_config(paths)?;
@@ -227,9 +232,71 @@ pub fn init(paths: &Paths) -> Result<(), String> {
         ));
     }
     let mk = master_key(paths)?;
+    let undo = InitUndo::new(state, &adir);
+    let r = init_files(&config, state, &mk);
+    if r.is_err() {
+        undo.run();
+    }
+    r
+}
+
+/// What `cnd init` removes when it fails.
+struct InitUndo {
+    state: PathBuf,
+    adir: PathBuf,
+    adir_existed: bool,
+    segments_before: Vec<PathBuf>,
+}
+
+impl InitUndo {
+    fn new(state: &Path, adir: &Path) -> Self {
+        Self {
+            state: state.to_owned(),
+            adir: adir.to_owned(),
+            adir_existed: adir.exists(),
+            segments_before: segment_files(adir),
+        }
+    }
+
+    fn run(self) {
+        let mut gone: Vec<PathBuf> = [STORE_FILE, STORE_PREV_FILE, KEYSLOTS_FILE]
+            .iter()
+            .map(|f| self.state.join(f))
+            .collect();
+        gone.push(self.adir.join(audit::PUBKEY_FILE));
+        gone.extend(
+            segment_files(&self.adir)
+                .into_iter()
+                .filter(|p| !self.segments_before.contains(p)),
+        );
+        for p in gone {
+            match std::fs::remove_file(&p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warning!("cnd init: removing {} failed: {e}", p.display()),
+            }
+        }
+        if !self.adir_existed {
+            let _ = std::fs::remove_dir(&self.adir);
+        }
+    }
+}
+
+/// The audit segment files in `dir`.
+fn segment_files(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn init_files(config: &Config, state: &Path, mk: &MasterKey) -> Result<(), String> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let mut log = open_audit(&config, state, &machine_id(), &boot_id()?, clock)?;
-    let (store, phrase) = Store::init(state, &mk).map_err(|e| e.to_string())?;
+    let mut log = open_audit(config, state, &machine_id(), &boot_id()?, clock)?;
+    let (store, phrase) = Store::init(state, mk).map_err(|e| e.to_string())?;
     let pubkey = log
         .set_signer(&store.checkpoint_seed())
         .map_err(|e| e.to_string())?;
@@ -253,7 +320,7 @@ pub fn init(paths: &Paths) -> Result<(), String> {
     let mut out = std::io::stdout().lock();
     out.write_all(text.as_bytes())
         .and_then(|()| out.flush())
-        .map_err(|e| format!("writing the recovery phrase: {e}"))
+        .map_err(|e| format!("writing the recovery phrase (the store was not kept): {e}"))
 }
 
 /// `cnd recover`.

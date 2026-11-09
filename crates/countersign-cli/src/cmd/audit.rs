@@ -310,9 +310,12 @@ pub fn verify(ctx: &Ctx, args: &VerifyArgs) -> Result<Done, CnError> {
         ),
         None => None,
     };
+    // Without --from the log must start at seq 1: a log whose first
+    // segments were deleted does not verify from wherever it now starts.
     let opts = VerifyOptions {
         pubkey,
         exported_checkpoints: exported.as_deref(),
+        expect_first_seq: Some(args.from.unwrap_or(1)),
     };
     match verify_segments_with(&data, &opts) {
         Ok(r) => {
