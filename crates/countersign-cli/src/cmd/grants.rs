@@ -15,7 +15,7 @@ use crate::client::{Client, unexpected};
 use crate::duration::{self, Secs};
 use crate::env::valid_secret_name;
 use crate::error::CnError;
-use crate::output::{Ctx, Done, clean_line, clock, left, out, table, truncate};
+use crate::output::{Ctx, Done, clean_line, clock, left, out, quoted_line, table, truncate};
 use crate::sys;
 
 /// Checks the names the user typed.
@@ -322,13 +322,8 @@ fn display(view: &RequestView) -> String {
     let mut out = format!("countersign request {}\n", r.code);
     let mut line = |k: &str, v: String| out.push_str(&format!("  {k:<10}{v}\n"));
     line("session", format!("{}  {anchor}", clean_line(&r.session)));
-    line(
-        "cwd",
-        format!(
-            "{}   (reported, untrusted)",
-            clean_line(r.cwd.as_deref().unwrap_or("none"))
-        ),
-    );
+    let cwd = r.cwd.as_deref().map_or_else(|| "none".into(), quoted_line);
+    line("cwd", format!("{cwd}   (reported, untrusted)"));
     line("secrets", clean_line(&r.secrets.join(", ")));
     line("mode", r.mode.to_string());
     if let Some(ttl) = r.ttl_seconds {

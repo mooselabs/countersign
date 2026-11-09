@@ -384,7 +384,7 @@ org.freedesktop.PolicyKit1.Authority.CheckAuthorization(
                        "digest": "3QF8-ZK2M",
                        "secrets": "clickhouse-password",
                        "ttl": "30m",
-                       "session": "agent claude (pid 41210, registered by cn session exec); agent-reported: label \"orchestrator\", cwd ~/projects/moose/liskov-agent-orchestrator",
+                       "session": "agent claude (pid 41210, registered by cn session exec); agent-reported: label \"orchestrator\", cwd \"~/projects/moose/liskov-agent-orchestrator\"",
                        "reason": "row counts for the weekly cost report via ...",
                        "operation": "none"},
     flags           = 0x1,           # AllowUserInteraction
@@ -397,7 +397,7 @@ The dialog then reads:
 ```text
 countersign request K7M-Q2X, digest 3QF8-ZK2M: USE clickhouse-password for 30m.
 agent claude (pid 41210, registered by cn session exec); agent-reported: label
-"orchestrator", cwd ~/projects/moose/liskov-agent-orchestrator.
+"orchestrator", cwd "~/projects/moose/liskov-agent-orchestrator".
 Agent's reason: row counts for the weekly cost report via ...
 ```
 
@@ -429,11 +429,11 @@ Agent's reason: row counts for the weekly cost report via ...
   value is sent as "none", so the dialog never shows a raw `$(key)`.
   `session` first says how `cnd` found the session, from what it read
   itself, then what the client reported, marked as such:
-  - `agent claude (pid 41210, registered by cn session exec); agent-reported: label "x", cwd ~/p`
+  - `agent claude (pid 41210, registered by cn session exec); agent-reported: label "x", cwd "~/p"`
     for an anchor started with `cn session exec`;
-  - `agent claude (pid 41210, matched comm = "claude"); agent-reported: cwd ~/p`
+  - `agent claude (pid 41210, matched comm = "claude"); agent-reported: cwd "~/p"`
     for an anchor found by a `[sessions] matchers` entry;
-  - `terminal, no agent session (shell bash, pid 3001); client-reported: cwd ~/p`
+  - `terminal, no agent session (shell bash, pid 3001); client-reported: cwd "~/p"`
     for a store change made from a terminal outside any session.
 
   The label and cwd are left out when the client sent none. Keys
@@ -453,8 +453,10 @@ Agent's reason: row counts for the weekly cost report via ...
   label 40 inside its quotes, the anchor's `comm` 32, the matcher 48, and the
   secret list 10 names then "and N more". The parts of `session` and
   `secrets` are bounded so the whole stays under 320 and 850 characters.
-  The label is quoted, with `"` and `\` escaped, so it cannot pose as the
-  cwd after it.
+  In `session` the label and the cwd are quoted, with `"` and `\` escaped,
+  so neither can pose as the text after it: the label as the cwd, the cwd
+  as the `Agent's reason:` the message puts next. Their limits count the
+  escapes inside the quotes.
 - **Store changes.** The `operation` of a store change is limited to 600
   characters, and its parts are bounded so that the longest text of every
   kind (`add`, `set`, `edit`, `rm`, `import`) stays under that and is never
@@ -729,7 +731,7 @@ stdin, then closes stdin:
   "expires_at": "2026-11-08T09:25:11Z",
   "canonical_b64": "<JCS bytes, base64>",
   "display": {
-    "session": "agent claude (pid 41210, registered by cn session exec); agent-reported: label \"orchestrator\", cwd ~/projects/moose/liskov-agent-orchestrator",
+    "session": "agent claude (pid 41210, registered by cn session exec); agent-reported: label \"orchestrator\", cwd \"~/projects/moose/liskov-agent-orchestrator\"",
     "secrets": ["clickhouse-password"],
     "mode": "use",
     "ttl_seconds": 1800,

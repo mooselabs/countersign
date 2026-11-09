@@ -256,7 +256,7 @@ shows. It does not raise a dialog that was dismissed or timed out.
 ! /usr/bin/cn approve K7M-Q2X
 countersign request K7M-Q2X
   session   s_7k2mq9d4x1ha  anchor claude pid 41210 (registered by cn session exec)
-  cwd       /home/patrick/projects/moose/liskov-agent-orchestrator   (reported, untrusted)
+  cwd       "/home/patrick/projects/moose/liskov-agent-orchestrator"   (reported, untrusted)
   secrets   clickhouse-password
   mode      use
   ttl       30m
@@ -545,7 +545,7 @@ acurast-rpc-bearer-token (value 16 to 63 bytes, from the clipboard, high
 entropy): description "Bearer token for the Acurast RPC endpoint (mainnet)";
 usage "Only for scripts/acurast_*.py read calls. Never log request
 headers."; projects ["~/projects/moose/*"]. terminal, no agent session (shell
-bash, pid 40102); client-reported: cwd ~/projects/moose.` What `cnd` knows
+bash, pid 40102); client-reported: cwd "~/projects/moose".` What `cnd` knows
 comes first, then the metadata the client sent, quoted with `"` and `\`
 escaped; the description is cut at 60 characters, the usage at 120, and a
 cut says how long the text was. No projects reads `any (all projects)`. The
@@ -716,7 +716,7 @@ $ cn session
 session   s_7k2mq9d4x1ha  (registered by cn session exec, label "orchestrator")
 anchor    pid 41210  comm claude  started 2026-11-08T09:14:03Z
 chain     41377 cn <- 41376 bash <- 41210 claude
-cwd       /home/patrick/projects/moose/liskov-agent-orchestrator  (reported, untrusted)
+cwd       "/home/patrick/projects/moose/liskov-agent-orchestrator"  (reported, untrusted)
 labels    CLAUDE_CODE_SESSION_ID=9f3c... (untrusted)
 grants    1 active
 ```
@@ -973,7 +973,7 @@ from details `cnd` supplied. With the touch factor:
 Authentication Required
   countersign request K7M-Q2X, digest 3QF8-ZK2M: USE clickhouse-password for 30m.
   agent claude (pid 41210, registered by cn session exec); agent-reported: label "orchestrator",
-  cwd ~/projects/moose/liskov-agent-orchestrator.
+  cwd "~/projects/moose/liskov-agent-orchestrator".
   Agent's reason: row counts for the weekly cost report via scripts/clickhouse_rows.py
   touch the device
 ```

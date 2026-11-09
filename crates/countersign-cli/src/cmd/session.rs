@@ -11,17 +11,13 @@ use crate::client::{Client, unexpected};
 use crate::cmd::run::{EXIT_CANNOT_EXECUTE, EXIT_NOT_FOUND};
 use crate::env::stripped_env;
 use crate::error::CnError;
-use crate::output::{Ctx, Done, clean_line};
+use crate::output::{Ctx, Done, clean_line, quoted_line};
 
 /// The text `cn session` prints.
 pub fn describe(s: &SessionView) -> String {
     let how = if s.anchor.registered {
         match &s.label {
-            // Escaped, so the label cannot close its quotes.
-            Some(l) => format!(
-                "registered by cn session exec, label \"{}\"",
-                clean_line(l).replace('\\', "\\\\").replace('"', "\\\"")
-            ),
+            Some(l) => format!("registered by cn session exec, label {}", quoted_line(l)),
             None => "registered by cn session exec".into(),
         }
     } else {
@@ -62,7 +58,10 @@ pub fn describe(s: &SessionView) -> String {
         line("chain", chain);
     }
     if let Some(cwd) = &s.cwd {
-        line("cwd", format!("{}  (reported, untrusted)", clean_line(cwd)));
+        line(
+            "cwd",
+            format!("{}  (reported, untrusted)", quoted_line(cwd)),
+        );
     }
     line("labels", labels);
     line("grants", format!("{} active", s.active_grants));
@@ -117,7 +116,7 @@ mod tests {
     use countersign_proto::{Anchor, Timestamp};
 
     #[test]
-    fn a_label_cannot_close_its_quotes() {
+    fn the_label_and_cwd_cannot_close_their_quotes() {
         let s = SessionView {
             id: "s_1".into(),
             anchor: Anchor {
@@ -130,14 +129,18 @@ mod tests {
             label: Some("x\", matched \\".into()),
             chain: vec![],
             labels: Default::default(),
-            cwd: None,
+            cwd: Some("x\"  (reported, untrusted)".into()),
             alive: true,
             active_grants: 0,
         };
+        let text = describe(&s);
         assert!(
-            describe(&s).contains("registered by cn session exec, label \"x\\\", matched \\\\\""),
-            "{}",
-            describe(&s)
+            text.contains("registered by cn session exec, label \"x\\\", matched \\\\\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("\ncwd       \"x\\\"  (reported, untrusted)\"  (reported, untrusted)\n"),
+            "{text}"
         );
     }
 }

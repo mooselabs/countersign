@@ -59,7 +59,7 @@ type anything in the chat to approve. GNOME shows, for example:
 ```text
 Authentication Required
 countersign request K7M-Q2X, digest 3QF8-ZK2M: USE clickhouse-password for 30m.
-agent claude (pid 41210, registered by cn session exec); agent-reported: cwd ~/projects/x.
+agent claude (pid 41210, registered by cn session exec); agent-reported: cwd "~/projects/x".
 Agent's reason: row counts for the cost report
 ```
 

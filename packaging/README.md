@@ -296,7 +296,10 @@ digest that the terminal printed.
    $ cn session
    ```
 
-4. Inside that shell, request a grant and approve the dialog:
+4. Inside that shell, request a grant and approve the dialog. It must read
+   `... agent bash (pid N, registered by cn session exec); agent-reported:
+   label "smoke", cwd "<this directory>". Agent's reason: smoke test`, with
+   the cwd in quotes:
 
    ```console
    $ cn request smoke-test --reason "smoke test" --ttl 5m --wait 2m

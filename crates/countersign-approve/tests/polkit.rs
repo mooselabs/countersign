@@ -395,7 +395,7 @@ async fn details_map_is_exact() {
         ("ttl", "30m"),
         (
             "session",
-            "agent claude (pid 41210, registered by cn session exec); agent-reported: cwd ~/projects/x",
+            "agent claude (pid 41210, registered by cn session exec); agent-reported: cwd \"~/projects/x\"",
         ),
         ("reason", "row counts for the cost report"),
         ("operation", "none"),

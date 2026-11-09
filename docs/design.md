@@ -487,7 +487,7 @@ printable ASCII characters.
 session   s_7k2mq9d4x1ha  (registered by cn session exec, label "liskov drift")
 anchor    pid 41210  comm claude  started 2026-11-08T09:14:03Z
 chain     41377 cn <- 41376 bash <- 41210 claude
-cwd       /home/patrick/projects/x  (reported, untrusted)
+cwd       "/home/patrick/projects/x"  (reported, untrusted)
 labels    CLAUDE_CODE_SESSION_ID=9f3c… (untrusted)
 grants    2 active
 ```

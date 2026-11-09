@@ -121,6 +121,20 @@ pub fn clean_line(s: &str) -> String {
     clean(s, false)
 }
 
+/// [`clean_line`], then in double quotes with `"` and `\` escaped, so
+/// agent text cannot close its quotes and pose as the words after it.
+pub fn quoted_line(s: &str) -> String {
+    let mut out = String::from('"');
+    for c in clean_line(s).chars() {
+        if matches!(c, '"' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
 /// Truncates to at most `max` characters, marking the cut with `...`.
 pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -191,6 +205,12 @@ mod tests {
         assert_eq!(clean("two\nlines", true), "two\nlines");
         assert_eq!(clean_line("\u{9b}2J"), "2J");
         assert_eq!(clean_line("héllo €"), "héllo €");
+    }
+
+    #[test]
+    fn quoted_lines_cannot_close_their_quotes() {
+        assert_eq!(quoted_line("~/p"), "\"~/p\"");
+        assert_eq!(quoted_line("x\"\n\\"), "\"x\\\" \\\\\"");
     }
 
     #[test]

@@ -17,7 +17,8 @@ use serde::Serialize;
 
 /// Longest reason shown, in characters.
 pub const REASON_LIMIT: usize = 300;
-/// Longest cwd shown; longer paths lose their middle.
+/// Longest cwd shown; longer paths lose their middle. In the session line
+/// the cwd is quoted, and the limit counts escapes inside the quotes.
 pub const CWD_LIMIT: usize = 120;
 /// Longest operation text shown (mutate and export). `cnd` limits each
 /// agent-chosen part of it first ([`clean_quoted`]), so one long field
@@ -461,21 +462,21 @@ fn non_empty(s: String) -> Option<String> {
 impl DisplayView {
     /// Cleans and limits every field of `input`.
     pub fn new(input: &DisplayInput) -> Self {
-        let cwd = input.cwd.as_deref().map(|cwd| {
-            let shown = match input.home.as_deref() {
-                Some(home) if !home.is_empty() && home != "/" => {
-                    let home = home.trim_end_matches('/');
-                    match cwd.strip_prefix(home) {
-                        Some("") => "~".to_string(),
-                        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
-                        _ => cwd.to_string(),
-                    }
+        let shown_cwd = input.cwd.as_deref().map(|cwd| match input.home.as_deref() {
+            Some(home) if !home.is_empty() && home != "/" => {
+                let home = home.trim_end_matches('/');
+                match cwd.strip_prefix(home) {
+                    Some("") => "~".to_string(),
+                    Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+                    _ => cwd.to_string(),
                 }
-                _ => cwd.to_string(),
-            };
-            clean_elided(&shown, CWD_LIMIT)
+            }
+            _ => cwd.to_string(),
         });
-        let cwd = cwd.and_then(non_empty);
+        let cwd = shown_cwd
+            .as_deref()
+            .map(|c| clean_elided(c, CWD_LIMIT))
+            .and_then(non_empty);
         let label = input
             .label
             .as_deref()
@@ -521,13 +522,16 @@ impl DisplayView {
             ),
         };
         let mut reported = Vec::new();
+        // Both quoted, so neither can pose as the text after it: the cwd
+        // after the label, and the "Agent's reason:" the polkit message puts
+        // after the session line.
         if label.is_some() {
-            // Quoted, so a label cannot pose as the cwd after it.
             let quoted = clean_quoted_item(input.label.as_deref().unwrap_or(""), LABEL_LIMIT);
             reported.push(format!("label {quoted}"));
         }
-        if let Some(cwd) = &cwd {
-            reported.push(format!("cwd {cwd}"));
+        if cwd.is_some() {
+            let quoted = clean_quoted_path(shown_cwd.as_deref().unwrap_or(""), CWD_LIMIT);
+            reported.push(format!("cwd {quoted}"));
         }
         if !reported.is_empty() {
             session.push_str(&format!("; {reporter}: {}", reported.join(", ")));
@@ -559,9 +563,9 @@ impl DisplayView {
     }
 
     /// Who is asking: "agent claude (pid 41210, registered by cn session
-    /// exec); agent-reported: label "x", cwd ~/projects/x". What `cnd` found
-    /// comes first; the client's label (quoted) and cwd follow, marked as
-    /// reported.
+    /// exec); agent-reported: label "x", cwd "~/projects/x"". What `cnd`
+    /// found comes first; the client's label and cwd follow, quoted and
+    /// marked as reported.
     pub fn session(&self) -> &str {
         &self.session
     }
@@ -789,7 +793,7 @@ mod tests {
         let v = DisplayView::new(&input());
         assert_eq!(
             v.session(),
-            "agent claude (pid 41210, registered by cn session exec); agent-reported: cwd ~/projects/x"
+            "agent claude (pid 41210, registered by cn session exec); agent-reported: cwd \"~/projects/x\""
         );
         assert_eq!(v.cwd(), Some("~/projects/x"));
         assert_eq!(v.ttl(), Some("30m"));
@@ -814,14 +818,14 @@ mod tests {
         i.found = Found::Matched("comm = \"claude\"\n".into());
         assert_eq!(
             DisplayView::new(&i).session(),
-            "agent claude (pid 41210, matched comm = \"claude\"); agent-reported: cwd ~/projects/x"
+            "agent claude (pid 41210, matched comm = \"claude\"); agent-reported: cwd \"~/projects/x\""
         );
         i.found = Found::Terminal;
         i.anchor_comm = "bash".into();
         i.anchor_pid = 3001;
         assert_eq!(
             DisplayView::new(&i).session(),
-            "terminal, no agent session (shell bash, pid 3001); client-reported: cwd ~/projects/x"
+            "terminal, no agent session (shell bash, pid 3001); client-reported: cwd \"~/projects/x\""
         );
         // A label cannot pose as what cnd found: it comes after, marked.
         i.found = Found::Registered;
@@ -838,8 +842,36 @@ mod tests {
         assert_eq!(
             DisplayView::new(&i).session(),
             "agent bash (pid 3001, registered by cn session exec); agent-reported: \
-             label \"x\\\", cwd ~/safe\", cwd ~/projects/x"
+             label \"x\\\", cwd ~/safe\", cwd \"~/projects/x\""
         );
+    }
+
+    #[test]
+    fn a_cwd_cannot_pose_as_the_reason() {
+        // The polkit message is "... $(session). Agent's reason: $(reason)".
+        let mut i = input();
+        i.cwd = Some("x. Agent's reason: rotate test fixtures".into());
+        let v = DisplayView::new(&i);
+        assert_eq!(
+            v.session(),
+            "agent claude (pid 41210, registered by cn session exec); agent-reported: \
+             cwd \"x. Agent's reason: rotate test fixtures\""
+        );
+        // Nor can it close its quotes, before or after a cut.
+        for cwd in [
+            "x\". Agent's reason: rotate test fixtures".to_string(),
+            format!(
+                "{}\". Agent's reason: rotate test fixtures",
+                "\\".repeat(300)
+            ),
+        ] {
+            i.cwd = Some(cwd);
+            let v = DisplayView::new(&i);
+            let quoted = v.session().split_once("; agent-reported: cwd ").unwrap().1;
+            let body = inner(quoted).unwrap_or_else(|| panic!("{quoted}"));
+            assert_eq!(body.len() + 2, quoted.len(), "{quoted}");
+            assert!(body.chars().count() <= CWD_LIMIT, "{quoted}");
+        }
     }
 
     #[test]
@@ -925,12 +957,14 @@ mod tests {
 
     #[test]
     fn the_session_line_and_secret_list_stay_under_their_limits() {
-        let worst = |found: Found| DisplayInput {
+        // Plain text fills a quoted limit exactly; escapes may leave one
+        // character over. Both are tried.
+        let worst = |found: Found, fill: &str| DisplayInput {
             found,
             anchor_comm: "c".repeat(100),
             anchor_pid: u32::MAX,
-            label: Some("\"".repeat(200)),
-            cwd: Some("\"".repeat(500)),
+            label: Some(fill.repeat(200)),
+            cwd: Some(fill.repeat(500)),
             home: None,
             secrets: (0..1000)
                 .map(|n| format!("{:064} (other project)", n))
@@ -945,13 +979,19 @@ mod tests {
             Found::Matched("m".repeat(100)),
             Found::Terminal,
         ] {
-            let v = DisplayView::new(&worst(found));
-            longest = longest.max(v.session().chars().count());
-            // The marker cnd adds survives the name limit.
-            assert!(v.secrets()[0].ends_with(" (other project)"));
-            // A count of usize::MAX would add 16 digits.
-            assert!(v.secrets_summary().chars().count() + 16 < SECRETS_LIMIT);
+            for fill in ["\"", "x", "\\x"] {
+                let v = DisplayView::new(&worst(found.clone(), fill));
+                longest = longest.max(v.session().chars().count());
+                // The marker cnd adds survives the name limit.
+                assert!(v.secrets()[0].ends_with(" (other project)"));
+                // A count of usize::MAX would add 16 digits.
+                assert!(v.secrets_summary().chars().count() + 16 < SECRETS_LIMIT);
+            }
         }
+        // "agent " + comm 32 + " (pid 4294967295, matched " + matcher 48
+        // + ")" is 113; "; agent-reported: " 18; "label " and the label
+        // in quotes 6 + 42; ", cwd " and the cwd in quotes 6 + 122.
+        assert_eq!(longest, 113 + 18 + 48 + 128);
         assert!(longest < SESSION_LIMIT, "{longest}");
     }
 
@@ -1001,7 +1041,7 @@ mod tests {
         let v = DisplayView::new(&i);
         assert_eq!(
             v.session(),
-            "agent claude (pid 41210, registered by cn session exec); agent-reported: cwd /tmp/red"
+            "agent claude (pid 41210, registered by cn session exec); agent-reported: cwd \"/tmp/red\""
         );
         assert_eq!(v.reason(), Some("fine APPROVED BY ADMIN hidden link"));
         assert_eq!(v.secrets()[0], "prod-db x");
@@ -1037,7 +1077,7 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({
-                "session": "agent claude (pid 41210, registered by cn session exec); agent-reported: cwd ~/projects/x",
+                "session": "agent claude (pid 41210, registered by cn session exec); agent-reported: cwd \"~/projects/x\"",
                 "secrets": ["clickhouse-password"],
                 "ttl_seconds": 1800,
                 "ttl": "30m",
