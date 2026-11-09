@@ -749,7 +749,7 @@ impl Daemon {
                 anchor_pid: a.session.anchor.pid,
                 anchor_start_time: a.session.anchor.start_time,
                 anchor_comm: a.session.anchor.comm.clone(),
-                logind_session: self.proc.login_session(a.session.anchor.pid),
+                logind_session: None,
             },
             p.expires_at,
         );

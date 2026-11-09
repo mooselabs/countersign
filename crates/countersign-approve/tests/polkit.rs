@@ -815,8 +815,86 @@ async fn require_wayland_without_logind_is_unavailable() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, ApproverError::Unavailable(why) if why.contains("require_wayland")),
+        matches!(&err, ApproverError::Unavailable(why) if why.contains("logind")),
         "{err:?}"
     );
     assert!(fx.with(|s| s.calls.is_empty()));
+}
+
+struct FakeManager;
+
+#[zbus::interface(name = "org.freedesktop.login1.Manager")]
+impl FakeManager {
+    async fn get_user(&self, uid: u32) -> zvariant::OwnedObjectPath {
+        zvariant::ObjectPath::try_from(format!("/org/freedesktop/login1/user/_{uid}"))
+            .unwrap()
+            .into()
+    }
+}
+
+struct FakeUser;
+
+#[zbus::interface(name = "org.freedesktop.login1.User")]
+impl FakeUser {
+    #[zbus(property)]
+    async fn display(&self) -> (String, zvariant::OwnedObjectPath) {
+        (
+            "3".into(),
+            zvariant::ObjectPath::try_from("/org/freedesktop/login1/session/_33")
+                .unwrap()
+                .into(),
+        )
+    }
+}
+
+struct FakeSession(&'static str);
+
+#[zbus::interface(name = "org.freedesktop.login1.Session")]
+impl FakeSession {
+    #[zbus(property, name = "Type")]
+    async fn session_type(&self) -> String {
+        self.0.into()
+    }
+}
+
+/// `require_wayland` follows logind's `Display` session of the uid: a
+/// wayland session lets the check through, an x11 one does not.
+#[tokio::test(flavor = "multi_thread")]
+async fn require_wayland_reads_the_display_session_from_logind() {
+    for (ty, allowed) in [("wayland", true), ("x11", false)] {
+        let Some(fx) = Fixture::start(Reply::Result(true, false, &[])).await else {
+            return;
+        };
+        let _logind = zbus::connection::Builder::address(fx.bus.address.as_str())
+            .unwrap()
+            .name("org.freedesktop.login1")
+            .unwrap()
+            .serve_at("/org/freedesktop/login1", FakeManager)
+            .unwrap()
+            .serve_at("/org/freedesktop/login1/user/_1000", FakeUser)
+            .unwrap()
+            .serve_at("/org/freedesktop/login1/session/_33", FakeSession(ty))
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let approver = PolkitApprover::new(
+            "polkit",
+            PolkitConfig::default(),
+            Bus::Address(fx.bus.address.clone()),
+        );
+        let result = approver
+            .present(&use_request(MINUTE), CancellationToken::new())
+            .await;
+        if allowed {
+            assert!(matches!(result, Ok(Outcome::Approved(_))), "{result:?}");
+            assert_eq!(fx.with(|s| s.calls.len()), 1);
+        } else {
+            assert!(
+                matches!(&result, Err(ApproverError::Unavailable(why)) if why.contains("x11")),
+                "{result:?}"
+            );
+            assert!(fx.with(|s| s.calls.is_empty()));
+        }
+    }
 }

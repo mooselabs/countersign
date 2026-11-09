@@ -99,15 +99,6 @@ impl ProcFs {
         self.read(pid, "cmdline")
     }
 
-    /// The process's login session id (`sessionid`, the audit session that
-    /// logind names its sessions by), or `None` outside a login session.
-    pub fn login_session(&self, pid: u32) -> Option<String> {
-        let text = String::from_utf8(self.read(pid, "sessionid").ok()?).ok()?;
-        let id: u32 = text.trim().parse().ok()?;
-        // (u32)-1 is AUDIT_SID_UNSET.
-        (id != u32::MAX).then(|| id.to_string())
-    }
-
     /// The boot id from `sys/kernel/random/boot_id`, trimmed.
     pub fn boot_id(&self) -> Result<String, ProcError> {
         let path = self.root.join("sys/kernel/random/boot_id");

@@ -147,7 +147,13 @@ impl PolkitApprover {
         ])
     }
 
-    fn subject(&self, req: &ApprovalRequest) -> Result<Subject, ApproverError> {
+    /// The subject polkitd is asked about. `display` is the uid's graphical
+    /// session, used by the `session` mode when cnd resolved none.
+    fn subject(
+        &self,
+        req: &ApprovalRequest,
+        display: Option<&str>,
+    ) -> Result<Subject, ApproverError> {
         let s = req.session();
         match self.config.subject {
             PolkitSubject::Process => {
@@ -164,7 +170,7 @@ impl PolkitApprover {
                 })
             }
             PolkitSubject::Session => {
-                let Some(id) = s.logind_session.clone() else {
+                let Some(id) = s.logind_session.clone().or(display.map(str::to_owned)) else {
                     return Err(ApproverError::Unavailable(
                         "no logind graphical session for the developer".into(),
                     ));
@@ -247,8 +253,6 @@ impl PolkitApprover {
             return Err(ApproverError::Cancelled);
         }
         let deadline = tokio::time::Instant::now() + remaining;
-        let subject = self.subject(req)?;
-        let subject_json = subject_json(&subject);
         let action = self.config.action(req.kind()).to_owned();
         let details = Self::details(req);
         let details: HashMap<&str, &str> = details.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -259,14 +263,32 @@ impl PolkitApprover {
             _ = tokio::time::sleep_until(deadline) => return Err(ApproverError::Timeout),
             conn = self.connection() => conn?,
         };
-        if self.config.require_wayland {
-            tokio::select! {
+        // The uid's graphical session: what polkit itself asks the
+        // authentication agent of, for a process outside any login session
+        // (an agent started from a terminal is in the user manager's).
+        let need_display = self.config.require_wayland
+            || (self.config.subject == PolkitSubject::Session
+                && req.session().logind_session.is_none());
+        let display = if need_display {
+            Some(tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(ApproverError::Cancelled),
                 _ = tokio::time::sleep_until(deadline) => return Err(ApproverError::Timeout),
-                checked = require_wayland(&conn, req) => checked?,
+                found = display_session(&conn, req.session().uid) => found?,
+            })
+        } else {
+            None
+        };
+        if self.config.require_wayland {
+            let (id, ty) = display.as_ref().expect("looked up above");
+            if ty != "wayland" {
+                return Err(ApproverError::Unavailable(format!(
+                    "require_wayland: the graphical session {id} is {ty:?}, not wayland"
+                )));
             }
         }
+        let subject = self.subject(req, display.as_ref().map(|(id, _)| id.as_str()))?;
+        let subject_json = subject_json(&subject);
         let proxy = authority(&conn).await.map_err(|e| self.map_error(&e))?;
         let id = cancellation_id(req);
         let mut guard = CancelGuard {
@@ -379,7 +401,17 @@ impl DaemonApprover for PolkitApprover {
     gen_blocking = false
 )]
 trait Logind {
-    fn get_session(&self, session_id: &str) -> zbus::Result<zvariant::OwnedObjectPath>;
+    fn get_user(&self, uid: u32) -> zbus::Result<zvariant::OwnedObjectPath>;
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.login1.User",
+    default_service = "org.freedesktop.login1",
+    gen_blocking = false
+)]
+trait LoginUser {
+    #[zbus(property)]
+    fn display(&self) -> zbus::Result<(String, zvariant::OwnedObjectPath)>;
 }
 
 #[zbus::proxy(
@@ -392,27 +424,35 @@ trait LoginSession {
     fn session_type(&self) -> zbus::Result<String>;
 }
 
-/// `require_wayland`: the anchor's login session must be a Wayland one. On
-/// X11 any client of the display, the agent included, can send input to
-/// the dialog. Without a login session or an answer from logind, polkit is
-/// unavailable rather than trusted.
-async fn require_wayland(
+/// The id and type (`wayland`, `x11`, `tty`...) of the uid's graphical
+/// session: logind's `Display` property of the user. No session, or no
+/// answer from logind, makes polkit unavailable rather than trusted.
+async fn display_session(
     conn: &zbus::Connection,
-    req: &ApprovalRequest,
-) -> Result<(), ApproverError> {
-    let Some(id) = req.session().logind_session.as_deref() else {
-        return Err(ApproverError::Unavailable(
-            "require_wayland: the agent is not in a login session".into(),
-        ));
-    };
-    let unavailable =
-        |e: zbus::Error| ApproverError::Unavailable(format!("require_wayland: logind: {e}"));
-    let path = LogindProxy::new(conn)
+    uid: u32,
+) -> Result<(String, String), ApproverError> {
+    let unavailable = |e: zbus::Error| ApproverError::Unavailable(format!("logind: {e}"));
+    let user = LogindProxy::new(conn)
         .await
         .map_err(unavailable)?
-        .get_session(id)
+        .get_user(uid)
         .await
         .map_err(unavailable)?;
+    let (id, path) = LoginUserProxy::builder(conn)
+        .path(user)
+        .map_err(unavailable)?
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+        .map_err(unavailable)?
+        .display()
+        .await
+        .map_err(unavailable)?;
+    if id.is_empty() {
+        return Err(ApproverError::Unavailable(format!(
+            "uid {uid} has no graphical session"
+        )));
+    }
     let ty = LoginSessionProxy::builder(conn)
         .path(path)
         .map_err(unavailable)?
@@ -423,13 +463,7 @@ async fn require_wayland(
         .session_type()
         .await
         .map_err(unavailable)?;
-    if ty == "wayland" {
-        Ok(())
-    } else {
-        Err(ApproverError::Unavailable(format!(
-            "require_wayland: login session {id} is {ty:?}, not wayland"
-        )))
-    }
+    Ok((id, ty))
 }
 
 async fn authority(conn: &zbus::Connection) -> zbus::Result<AuthorityProxy<'static>> {

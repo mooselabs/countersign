@@ -20,9 +20,9 @@ pub struct SessionRef {
     pub anchor_start_time: u64,
     /// The anchor's `comm`. Shown for display only.
     pub anchor_comm: String,
-    /// The anchor's logind session id (`/proc/PID/sessionid`), if it has one.
-    /// The polkit adapter checks its type for `require_wayland`, and the
-    /// `session` subject mode asks about it.
+    /// A logind session for the `session` subject mode. When `None`, the
+    /// polkit adapter uses the uid's graphical session (logind's `Display`),
+    /// which is also the session `require_wayland` checks.
     pub logind_session: Option<String>,
 }
 
