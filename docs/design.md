@@ -733,22 +733,29 @@ so repeated probing is visible.
 
 | Command | Approval kind | `operation` (signed) | The dialog shows |
 | --- | --- | --- | --- |
-| `cn add NAME` | `mutate` | `add NAME` | `ADD secret NAME (value 16 to 63 bytes, from the clipboard, high entropy): description "..."; usage "..."; projects [~/p]; tags [db]` |
+| `cn add NAME` | `mutate` | `add NAME` | `ADD secret NAME (value 16 to 63 bytes, from the clipboard, high entropy): description "..."; usage "..."; projects ["~/p"]; tags ["db"]` |
 | `cn set NAME` | `mutate` | `set NAME` | `SET a new value for NAME (16 to 63 bytes, from stdin); grants for it are revoked` |
-| `cn edit NAME` | `mutate` | `edit NAME` | `EDIT NAME: usage "old" -> "new"; projects [~/a] -> [~/a, ~/b]` |
-| `cn rm NAME...` | `mutate` | `rm a b` | `REMOVE 2 secrets: a, b` |
-| `cn import` | `mutate` | `import a b c` | `IMPORT 3 secrets: a, b, c` (at most `[limits] max_names_per_import`, 20) |
+| `cn edit NAME` | `mutate` | `edit NAME` | `EDIT NAME: high entropy on (cn hide matches it without a grant); projects ["~/a"] -> any (all projects); usage "old" -> "new"` |
+| `cn rm NAME...` | `mutate` | `rm a b` | `REMOVE 2 secrets: a, b` (eight names, then "and N more") |
+| `cn import` | `mutate` | `import a b c` | `IMPORT 3 secrets: a, b, c` (at most `[limits] max_names_per_import`, 20; eight names shown, then "and N more") |
 | `cn export` | `export` | Phase 2 | |
 
 The value's size is shown only as a class (`under 16 bytes`, `16 to 63
 bytes`, `64 to 1023 bytes`, `1 KiB or more`), and never reaches the audit
 log. `add` shows what `cnd` knows first (size class, source, the high entropy
 flag), then the metadata the client sent. `edit` shows each changed field as
-old -> new; a long usage is shown as its new text with a cut marker, and a
-change to the high entropy flag says what it means for `cn hide`. Each
-agent-supplied part is bounded (60 characters, a new usage 120, 5 projects
-or tags) before the whole operation (600), so the part `cnd` writes is never
-the one cut. The dialog also shows the session the change came from (section
+old -> new, what `cnd` acts on first: a change to the high entropy flag says
+what it means for `cn hide`, and no projects reads `any (all projects)`, so
+emptying the list reads as the widening it is. Then tags, the description and
+the usage; a description or usage longer than 40 characters is shown as its
+new text with a cut marker. Agent text is quoted with `"` and `\` escaped,
+projects and tags one by one, so it cannot close its quotes and pose as a
+change. Each agent-supplied part is bounded (an `add` description 60
+characters, an `add` usage 120, an `edit` description or usage 40, a project
+24 with its middle cut, a tag 12, 2 projects or tags then "and N more", 8
+names for `rm` and `import`) so that the longest text of every kind stays
+under the operation limit (600) and nothing is ever cut from the end; a test
+checks each kind. The dialog also shows the session the change came from (section
 5, human sessions): an agent anchor, or `terminal, no agent session (shell
 bash, pid N)`. A store change carries no reason.
 

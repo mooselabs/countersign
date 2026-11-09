@@ -384,7 +384,7 @@ org.freedesktop.PolicyKit1.Authority.CheckAuthorization(
                        "digest": "3QF8-ZK2M",
                        "secrets": "clickhouse-password",
                        "ttl": "30m",
-                       "session": "agent claude (pid 41210, registered by cn session exec); agent-reported: label orchestrator, cwd ~/projects/moose/liskov-agent-orchestrator",
+                       "session": "agent claude (pid 41210, registered by cn session exec); agent-reported: label \"orchestrator\", cwd ~/projects/moose/liskov-agent-orchestrator",
                        "reason": "row counts for the weekly cost report via ...",
                        "operation": "none"},
     flags           = 0x1,           # AllowUserInteraction
@@ -397,7 +397,7 @@ The dialog then reads:
 ```text
 countersign request K7M-Q2X, digest 3QF8-ZK2M: USE clickhouse-password for 30m.
 agent claude (pid 41210, registered by cn session exec); agent-reported: label
-orchestrator, cwd ~/projects/moose/liskov-agent-orchestrator.
+"orchestrator", cwd ~/projects/moose/liskov-agent-orchestrator.
 Agent's reason: row counts for the weekly cost report via ...
 ```
 
@@ -429,7 +429,7 @@ Agent's reason: row counts for the weekly cost report via ...
   value is sent as "none", so the dialog never shows a raw `$(key)`.
   `session` first says how `cnd` found the session, from what it read
   itself, then what the client reported, marked as such:
-  - `agent claude (pid 41210, registered by cn session exec); agent-reported: label x, cwd ~/p`
+  - `agent claude (pid 41210, registered by cn session exec); agent-reported: label "x", cwd ~/p`
     for an anchor started with `cn session exec`;
   - `agent claude (pid 41210, matched comm = "claude"); agent-reported: cwd ~/p`
     for an anchor found by a `[sessions] matchers` entry;
@@ -447,16 +447,34 @@ Agent's reason: row counts for the weekly cost report via ...
   zero-width characters, tag characters), as are private-use characters,
   noncharacters and variation selectors; line breaks and runs of spaces
   become one space; combining marks are cut to two per base character. Then
-  each field is length-limited, counting characters: reason 300, operation
-  300, each secret name 64, the cwd 120 with the middle elided (the home
-  directory shown as `~`), the label 40, the anchor's `comm` 32, the matcher
-  48, and the secret list 10 names then "and N more". The `operation` of a
-  store change is limited to 600 characters, and the agent-supplied parts in
-  it are bounded first, so the text `cnd` writes is never the part cut: a
-  description or one side of a usage change 60, a new usage 120, and 5
-  projects or tags then "and N more". `edit` shows each changed field as
-  old -> new; `add` shows the value's size class, its source and the high
-  entropy flag first, then the description, usage, projects and tags.
+  each field is length-limited, counting characters: reason 300, each
+  secret name 80 (a name is at most 64; `cnd` may add " (other project)"),
+  the cwd 120 with the middle elided (the home directory shown as `~`), the
+  label 40 inside its quotes, the anchor's `comm` 32, the matcher 48, and the
+  secret list 10 names then "and N more". The parts of `session` and
+  `secrets` are bounded so the whole stays under 320 and 850 characters.
+  The label is quoted, with `"` and `\` escaped, so it cannot pose as the
+  cwd after it.
+- **Store changes.** The `operation` of a store change is limited to 600
+  characters, and its parts are bounded so that the longest text of every
+  kind (`add`, `set`, `edit`, `rm`, `import`) stays under that and is never
+  cut; a test checks each. Agent text in it (description, usage, each
+  project and tag) is quoted with `"` and `\` escaped, so it cannot close
+  its quotes and pose as a change. Its bounds, inside the quotes and
+  counting escapes: an `add` description 60 and usage 120, an `edit`
+  description or usage 40, a project 24 (the middle cut), a tag 12, then 2
+  projects or tags and "and N more"; `rm` and `import` list 8 names then
+  "and N more". A cut description or usage ends in an ellipsis and says how
+  long the text was. `add` shows the value's size class, its source and the
+  high entropy flag first, then the description, usage, projects and tags.
+  `edit` shows each changed field as old -> new, what `cnd` acts on first:
+  the high entropy flag, saying what it means for `cn hide`, then projects,
+  where no projects reads `any (all projects)`; then tags, the description
+  and the usage. A description or usage longer than 40 characters shows as
+  its new text only (`usage becomes "..."`). For example:
+  `EDIT db: high entropy off (cn hide matches it only when granted); projects
+  ["~/work/prod"] -> any (all projects); description "prod" -> "prod
+  primary"`.
 - **Result.** `is_authorized = true` -> `Approved`.
   `details["polkit.dismissed"] = "true"` (the human pressed Cancel) ->
   `Denied`, or `Unavailable` when the approver has `on_dismiss = "ignore"`
@@ -711,7 +729,7 @@ stdin, then closes stdin:
   "expires_at": "2026-11-08T09:25:11Z",
   "canonical_b64": "<JCS bytes, base64>",
   "display": {
-    "session": "agent claude (pid 41210, registered by cn session exec); agent-reported: label orchestrator, cwd ~/projects/moose/liskov-agent-orchestrator",
+    "session": "agent claude (pid 41210, registered by cn session exec); agent-reported: label \"orchestrator\", cwd ~/projects/moose/liskov-agent-orchestrator",
     "secrets": ["clickhouse-password"],
     "mode": "use",
     "ttl_seconds": 1800,

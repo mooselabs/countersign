@@ -66,6 +66,16 @@ impl Conn {
     /// then `exec`s the agent, which keeps the pid and start time.
     pub fn register(&mut self, label: Option<String>) -> Result<Response, ErrorBody> {
         let rt = self.d.rt();
+        // The new session does not exist yet. The caller may already be in
+        // one (an agent running cn session exec), holding grants whose
+        // values it could paste into the label: redact with that session's
+        // hide set, which also holds the values that need no grant.
+        let caller = self
+            .session
+            .as_ref()
+            .map(|s| s.id.clone())
+            .or_else(|| self.caller().ok().map(|s| s.id))
+            .unwrap_or_default();
         let label = label
             .map(|l| {
                 let clean: String = l
@@ -73,9 +83,7 @@ impl Conn {
                     .filter(|c| c.is_ascii_graphic() || *c == ' ')
                     .collect();
                 let clean = views::truncate_utf8(clean.trim(), MAX_LABEL);
-                // The session does not exist yet: redact with the values
-                // that need no grant to match.
-                views::redact_label(&self.d.lock(), &rt, "", &clean)
+                views::redact_label(&self.d.lock(), &rt, &caller, &clean)
             })
             .filter(|l| !l.is_empty());
         let me = self.d.proc.process(self.pid).map_err(|e| {

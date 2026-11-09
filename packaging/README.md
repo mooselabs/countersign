@@ -279,7 +279,7 @@ digest that the terminal printed.
 2. Add a dummy secret. A dialog opens: check that its code and digest match
    the terminal and that it reads `ADD secret smoke-test (value 16 to 63
    bytes, from stdin, high entropy): description "install smoke test";
-   projects any`, then approve it with your factor.
+   projects any (all projects)`, then approve it with your factor.
 
    ```console
    $ printf %s 'smoke-0123456789abcdef' | /usr/bin/cn add smoke-test \

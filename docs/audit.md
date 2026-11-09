@@ -80,7 +80,10 @@ its evidence is `{error}`.
 `digest` is the request digest (design.md, section 6). It is a hash of request
 metadata, never of a value. `reason`, a `cn deny` reason and the session
 labels are the client's text after the session's hide set has redacted it
-(`[audit] redact_agent_text`).
+(`[audit] redact_agent_text`). A `cn deny` reason passes through the hide
+sets of both the request's session and the denier's, and a `cn session exec`
+label through the hide set of the session it was run from, since the text's
+author may hold grants there.
 
 ### Examples
 

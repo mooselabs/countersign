@@ -1488,6 +1488,74 @@ fn labels_and_deny_reasons_are_redacted_and_imports_are_capped() {
 }
 
 #[test]
+fn labels_and_deny_reasons_are_redacted_with_the_callers_grants() {
+    // use is approved at once, reveal stays pending.
+    let cnd = Cnd::start(
+        &(APPROVE_ALL.replace("reveal = \"auto\"", "reveal = \"slow\"")
+            + "\n[approvers.slow]\ntype = \"insecure-auto\"\ndelay = \"1h\"\n"),
+    );
+    // Low entropy: only a session granted it redacts it.
+    const V: &str = "granted-low-entropy-0123456789";
+    add(&cnd, "low", V, "--low-entropy");
+    add(&cnd, "other", "other-value-0123456789", "--high-entropy");
+    cnd.ok(&["request", "low", "--reason", "r", "--wait"]);
+
+    // An agent in this session registers a new one, pasting the value into
+    // its label.
+    let cn = cn_bin();
+    let out = Command::new(&cn)
+        .args(["--socket", "sock", "session", "exec", "--label"])
+        .arg(format!("label {V}"))
+        .args([
+            "--",
+            cn.to_str().unwrap(),
+            "--socket",
+            "sock",
+            "--json",
+            "session",
+        ])
+        .current_dir(cnd.path())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(!text.contains(V), "{text}");
+    assert!(text.contains("label [countersign:low]"), "{text}");
+
+    // A request from another session, denied from this one with the value
+    // in the reason.
+    let script = format!(
+        "{cn} --socket sock --json request other --mode reveal --reason x > req.json; \
+         exec sleep 120",
+        cn = cn.display()
+    );
+    let mut anchor = Command::new(&cn)
+        .args(["--socket", "sock", "session", "exec", "--label", "a"])
+        .args(["--", "sh", "-c", &script])
+        .current_dir(cnd.path())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let code = loop {
+        let text = std::fs::read_to_string(cnd.path().join("req.json")).unwrap_or_default();
+        if let Ok(v) = serde_json::from_str::<Value>(&text) {
+            break v["data"]["code"].as_str().unwrap().to_owned();
+        }
+        assert!(Instant::now() < deadline, "no request; log:\n{}", cnd.log());
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    cnd.ok(&["deny", &code, "--reason", &format!("it was {V}")]);
+    let deny = cnd.wait_for_record(|r| r["event"] == "request.deny");
+    assert_eq!(deny["evidence"]["reason"], "it was [countersign:low]");
+    assert_eq!(deny["evidence"]["from"], "other_session");
+    let _ = anchor.kill();
+    let _ = anchor.wait();
+    let hits = files_containing(&cnd.path().join("state"), V.as_bytes());
+    assert!(hits.is_empty(), "{hits:?}");
+}
+
+#[test]
 fn a_reload_applies_the_audit_settings() {
     let cnd = Cnd::start(APPROVE_ALL);
     let checkpoints = || cnd.events().iter().filter(|e| *e == "checkpoint").count();

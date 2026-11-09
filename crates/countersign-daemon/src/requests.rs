@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
-use countersign_approve::display::{clean_limited, clean_quoted};
+use countersign_approve::display::{clean_quoted, clean_quoted_item, clean_quoted_path};
 use countersign_approve::{
     ApprovalRequest, ApproverError, ChainReport, Decision as ChainDecision, DisplayInput,
     DisplayView, Evidence, Found, Outcome, SessionRef as ApproveSession,
@@ -161,37 +161,69 @@ fn decode(v: &ValueB64) -> Result<SecretValue, ErrorBody> {
         .map_err(|_| err(ErrorCode::BadRequest, "the value is not valid base64"))
 }
 
-fn names_text(names: &[String], limit: usize) -> String {
+/// Secret names a `rm` or `import` dialog lists before "and N more". With
+/// names of at most 64 characters the text stays under
+/// [`countersign_approve::display::OPERATION_LIMIT`] (a test checks).
+const NAMES_SHOWN: usize = 8;
+
+/// `a, b and 3 more`. Names are checked (`a-z 0-9 . _ -`) before a dialog
+/// shows them, so they need no quotes.
+fn names_text(names: &[String]) -> String {
     let mut s = names
         .iter()
-        .take(limit)
+        .take(NAMES_SHOWN)
         .cloned()
         .collect::<Vec<_>>()
         .join(", ");
-    if names.len() > limit {
-        s.push_str(&format!(" and {} more", names.len() - limit));
+    if names.len() > NAMES_SHOWN {
+        s.push_str(&format!(" and {} more", names.len() - NAMES_SHOWN));
     }
     s
 }
 
-/// Longest quoted short field (description, one usage side) in a dialog.
-const FIELD_LIMIT: usize = 60;
-/// Longest new usage text shown when a usage is long.
-const USAGE_LIMIT: usize = 120;
-/// List items (projects, tags) shown before "and N more".
-const ITEMS_SHOWN: usize = 5;
+// The agent-supplied parts of a store-change dialog are bounded so that the
+// whole text, at its longest, stays under OPERATION_LIMIT and is never cut
+// by the display (a test checks every kind). Limits count characters
+// between the quotes, escapes included.
 
-/// `[~/a, ~/b]`, each item cleaned and bounded.
-fn items_text(items: &[String]) -> String {
-    let mut shown: Vec<String> = items
-        .iter()
-        .take(ITEMS_SHOWN)
-        .map(|i| clean_limited(i, FIELD_LIMIT))
-        .collect();
+/// Longest quoted description in an `add` dialog.
+const ADD_DESCRIPTION_LIMIT: usize = 60;
+/// Longest quoted usage in an `add` dialog.
+const ADD_USAGE_LIMIT: usize = 120;
+/// Longest quoted description or usage in an `edit` dialog: each side of
+/// old -> new, or the new text alone when a side is longer.
+const EDIT_FIELD_LIMIT: usize = 40;
+/// Projects and tags listed before "and N more".
+const ITEMS_SHOWN: usize = 2;
+/// Longest quoted project; a longer one loses its middle.
+const PROJECT_LIMIT: usize = 24;
+/// Longest quoted tag.
+const TAG_LIMIT: usize = 12;
+
+/// `["~/a", "~/b", and 3 more]`, each item quoted and bounded.
+fn items_text(items: &[String], quote: impl Fn(&str) -> String) -> String {
+    let mut shown: Vec<String> = items.iter().take(ITEMS_SHOWN).map(|i| quote(i)).collect();
     if items.len() > ITEMS_SHOWN {
         shown.push(format!("and {} more", items.len() - ITEMS_SHOWN));
     }
     format!("[{}]", shown.join(", "))
+}
+
+/// No projects means every project, so it reads "any (all projects)".
+fn projects_text(projects: &[String]) -> String {
+    if projects.is_empty() {
+        "any (all projects)".to_owned()
+    } else {
+        items_text(projects, |p| clean_quoted_path(p, PROJECT_LIMIT))
+    }
+}
+
+fn tags_text(tags: &[String]) -> String {
+    if tags.is_empty() {
+        "none".to_owned()
+    } else {
+        items_text(tags, |t| clean_quoted_item(t, TAG_LIMIT))
+    }
 }
 
 fn entropy_word(on: bool) -> &'static str {
@@ -210,22 +242,18 @@ fn add_text(meta: &SecretMeta, len: usize, source: Option<ValueSource>) -> Strin
         if meta.description.is_empty() {
             "none".to_owned()
         } else {
-            clean_quoted(&meta.description, FIELD_LIMIT)
+            clean_quoted(&meta.description, ADD_DESCRIPTION_LIMIT)
         }
     )];
     if !meta.usage.is_empty() {
-        parts.push(format!("usage {}", clean_quoted(&meta.usage, USAGE_LIMIT)));
+        parts.push(format!(
+            "usage {}",
+            clean_quoted(&meta.usage, ADD_USAGE_LIMIT)
+        ));
     }
-    parts.push(format!(
-        "projects {}",
-        if meta.projects.is_empty() {
-            "any".to_owned()
-        } else {
-            items_text(&meta.projects)
-        }
-    ));
+    parts.push(format!("projects {}", projects_text(&meta.projects)));
     if !meta.tags.is_empty() {
-        parts.push(format!("tags {}", items_text(&meta.tags)));
+        parts.push(format!("tags {}", tags_text(&meta.tags)));
     }
     format!(
         "ADD secret {} (value {}, {}{}): {}",
@@ -241,47 +269,77 @@ fn add_text(meta: &SecretMeta, len: usize, source: Option<ValueSource>) -> Strin
     )
 }
 
-/// The dialog text for `cn edit`: each changed field, old -> new.
+/// The dialog text for `cn set`.
+fn set_text(name: &str, len: usize, source: Option<ValueSource>) -> String {
+    format!(
+        "SET a new value for {name} ({}, {}); grants for it are revoked",
+        length_class(len),
+        source_word(source)
+    )
+}
+
+/// The dialog text for `cn rm`.
+fn rm_text(names: &[String]) -> String {
+    format!(
+        "REMOVE {} secret{}: {}",
+        names.len(),
+        if names.len() == 1 { "" } else { "s" },
+        names_text(names)
+    )
+}
+
+/// The dialog text for `cn import`.
+fn import_text(names: &[String]) -> String {
+    format!("IMPORT {} secrets: {}", names.len(), names_text(names))
+}
+
+/// `description "a" -> "b"`, or `description becomes "..."` when a side
+/// does not fit [`EDIT_FIELD_LIMIT`].
+fn changed_text(what: &str, cur: &str, new: &str) -> String {
+    // Uncut, the quoted text ends with its quote; a cut adds a note after.
+    let fits = |s: &str| clean_quoted(s, EDIT_FIELD_LIMIT).ends_with('"');
+    if fits(cur) && fits(new) {
+        format!(
+            "{what} {} -> {}",
+            clean_quoted(cur, EDIT_FIELD_LIMIT),
+            clean_quoted(new, EDIT_FIELD_LIMIT)
+        )
+    } else {
+        format!("{what} becomes {}", clean_quoted(new, EDIT_FIELD_LIMIT))
+    }
+}
+
+/// The dialog text for `cn edit`: each changed field, old -> new. What
+/// `cnd` acts on comes first (high entropy, then projects), then the
+/// client's text, so a cut, were there one, would never hide it.
 fn edit_text(cur: &SecretMeta, new: &SecretMeta) -> String {
     let mut parts = Vec::new();
-    if cur.description != new.description {
-        parts.push(format!(
-            "description {} -> {}",
-            clean_quoted(&cur.description, FIELD_LIMIT),
-            clean_quoted(&new.description, FIELD_LIMIT)
-        ));
-    }
-    if cur.usage != new.usage {
-        let short = |u: &str| u.chars().count() <= FIELD_LIMIT;
-        if short(&cur.usage) && short(&new.usage) {
-            parts.push(format!(
-                "usage {} -> {}",
-                clean_quoted(&cur.usage, FIELD_LIMIT),
-                clean_quoted(&new.usage, FIELD_LIMIT)
-            ));
-        } else {
-            parts.push(format!(
-                "usage becomes {}",
-                clean_quoted(&new.usage, USAGE_LIMIT)
-            ));
-        }
+    if cur.high_entropy != new.high_entropy {
+        parts.push(format!("high entropy {}", entropy_word(new.high_entropy)));
     }
     if cur.projects != new.projects {
         parts.push(format!(
             "projects {} -> {}",
-            items_text(&cur.projects),
-            items_text(&new.projects)
+            projects_text(&cur.projects),
+            projects_text(&new.projects)
         ));
     }
     if cur.tags != new.tags {
         parts.push(format!(
             "tags {} -> {}",
-            items_text(&cur.tags),
-            items_text(&new.tags)
+            tags_text(&cur.tags),
+            tags_text(&new.tags)
         ));
     }
-    if cur.high_entropy != new.high_entropy {
-        parts.push(format!("high entropy {}", entropy_word(new.high_entropy)));
+    if cur.description != new.description {
+        parts.push(changed_text(
+            "description",
+            &cur.description,
+            &new.description,
+        ));
+    }
+    if cur.usage != new.usage {
+        parts.push(changed_text("usage", &cur.usage, &new.usage));
     }
     if parts.is_empty() {
         format!("EDIT {}: no field changes", new.name)
@@ -685,11 +743,7 @@ impl Daemon {
                 source,
             } => {
                 let value = decode(&value)?;
-                let shown = format!(
-                    "SET a new value for {name} ({}, {}); grants for it are revoked",
-                    length_class(value.len()),
-                    source_word(source)
-                );
+                let shown = set_text(&name, value.len(), source);
                 let op = format!("set {name}");
                 (vec![Mutation::Set { name, value }], op, shown, false)
             }
@@ -705,12 +759,7 @@ impl Daemon {
             Change::Rm { mut names } => {
                 names.sort();
                 names.dedup();
-                let shown = format!(
-                    "REMOVE {} secret{}: {}",
-                    names.len(),
-                    if names.len() == 1 { "" } else { "s" },
-                    names_text(&names, 10)
-                );
+                let shown = rm_text(&names);
                 let op = format!("rm {}", names.join(" "));
                 let ms = names
                     .into_iter()
@@ -730,7 +779,7 @@ impl Daemon {
                     ));
                 }
                 let names: Vec<String> = items.iter().map(|i| i.meta.name.clone()).collect();
-                let shown = format!("IMPORT {} secrets: {}", names.len(), names_text(&names, 10));
+                let shown = import_text(&names);
                 let op = format!("import {}", names.join(" "));
                 let mut ms = Vec::with_capacity(items.len());
                 for i in items {
@@ -1064,9 +1113,14 @@ impl Daemon {
                 ));
             }
         }
-        // The reason is free text: values of the request's session are
-        // redacted from it like from a request reason.
-        let reason = reason.map(|r| views::redact_text(&st, &rt, &rec.session.id, &r));
+        // The reason is free text: values of the request's session, and of
+        // the denier's, which may be another session holding other grants,
+        // are redacted from it like from a request reason.
+        let mut sessions = vec![rec.session.id.as_str()];
+        if let Some(s) = &who.session {
+            sessions.push(s.id.as_str());
+        }
+        let reason = reason.map(|r| views::redact_for_sessions(&st, &rt, &sessions, &r, "reason"));
         let from = match &who.session {
             Some(s) if s.id == rec.session.id => "own_session",
             Some(s) if s.is_human() => "terminal",
@@ -1120,6 +1174,7 @@ fn digest_of(c: &CanonicalRequest) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use countersign_approve::display::OPERATION_LIMIT;
 
     #[test]
     fn length_classes_hide_the_exact_length() {
@@ -1151,19 +1206,20 @@ mod tests {
         );
         assert!(t.contains("(cut from 400 characters)"), "{t}");
         assert!(
-            t.ends_with("; usage \"psql with it\"; projects [~/p/a]"),
+            t.ends_with("; usage \"psql with it\"; projects [\"~/p/a\"]"),
             "{t}"
         );
         assert!(!t.contains('\x1b'));
         let t = add_text(&meta("x"), 3, None);
         assert_eq!(
             t,
-            "ADD secret x (value under 16 bytes, source not given): description none; projects any"
+            "ADD secret x (value under 16 bytes, source not given): description none; \
+             projects any (all projects)"
         );
     }
 
     #[test]
-    fn edit_shows_each_changed_field_old_and_new() {
+    fn edit_shows_what_cnd_acts_on_first_then_each_changed_field() {
         let mut old = meta("db");
         old.description = "prod".into();
         old.usage = "read only".into();
@@ -1177,9 +1233,9 @@ mod tests {
         new.high_entropy = true;
         assert_eq!(
             edit_text(&old, &new),
-            "EDIT db: description \"prod\" -> \"prod primary\"; usage \"read only\" -> \
-             \"write too\"; projects [] -> [~/x]; tags [a] -> []; high entropy on (cn hide \
-             matches it without a grant)"
+            "EDIT db: high entropy on (cn hide matches it without a grant); projects any \
+             (all projects) -> [\"~/x\"]; tags [\"a\"] -> none; description \"prod\" -> \
+             \"prod primary\"; usage \"read only\" -> \"write too\""
         );
         // A long usage shows its new text, cut with a marker.
         new = old.clone();
@@ -1192,6 +1248,192 @@ mod tests {
         new = old.clone();
         new.high_entropy = false;
         assert!(edit_text(&old, &new).contains("high entropy off"));
+        // Emptied projects widen the secret to every project.
+        old.projects = vec!["~/work/prod".into()];
+        new = old.clone();
+        new.projects = vec![];
+        assert_eq!(
+            edit_text(&old, &new),
+            "EDIT db: projects [\"~/work/prod\"] -> any (all projects)"
+        );
+    }
+
+    /// `t` with every quoted part removed, escapes honoured; None if a
+    /// quote is left open.
+    fn outside_quotes(t: &str) -> Option<String> {
+        let (mut out, mut quoted, mut escaped) = (String::new(), false, false);
+        for c in t.chars() {
+            match (quoted, c) {
+                (true, _) if escaped => escaped = false,
+                (true, '\\') => escaped = true,
+                (_, '"') => quoted = !quoted,
+                (false, c) => out.push(c),
+                (true, _) => {}
+            }
+        }
+        (!quoted).then_some(out)
+    }
+
+    #[test]
+    fn agent_text_cannot_pose_as_a_change() {
+        // The re-review probe: a description that closes its quote and adds
+        // a high entropy change, with long projects and tags after it.
+        let old = meta("clickhouse-prod");
+        let mut new = old.clone();
+        new.projects = (0..6)
+            .map(|i| format!("~/projects/{i}{}", "x".repeat(70)))
+            .collect();
+        new.high_entropy = true;
+        new.description = "ok\"; high entropy off (cn hide matches it only when granted".into();
+        new.tags = (0..6).map(|i| format!("t{i}{}", "z".repeat(70))).collect();
+        countersign_core::store::check_meta(&new).unwrap();
+        let t = edit_text(&old, &new);
+        assert!(
+            t.starts_with(
+                "EDIT clickhouse-prod: high entropy on (cn hide matches it without a grant); \
+                 projects any (all projects) -> [\""
+            ),
+            "{t}"
+        );
+        assert!(
+            t.contains("description becomes \"ok\\\"; high entropy off"),
+            "{t}"
+        );
+        let outside = outside_quotes(&t).unwrap();
+        assert_eq!(outside.matches("high entropy").count(), 1, "{t}");
+        assert!(t.chars().count() < OPERATION_LIMIT);
+        // Nothing in the display cuts it.
+        let shown = DisplayView::new(&DisplayInput {
+            operation: Some(t.clone()),
+            ..DisplayInput::default()
+        });
+        assert_eq!(shown.operation(), Some(t.as_str()));
+
+        // The same for add, and for a project or tag that holds quotes.
+        let mut m = new.clone();
+        m.usage = "x\"; projects any (all projects".into();
+        m.projects = vec!["~/a\", \"~/b".into()];
+        m.tags = vec!["t\\".into()];
+        let t = add_text(&m, 40, None);
+        let outside = outside_quotes(&t).unwrap();
+        assert_eq!(outside.matches("projects").count(), 1, "{t}");
+        assert!(
+            t.ends_with("projects [\"~/a\\\", \\\"~/b\"]; tags [\"t\\\\\"]"),
+            "{t}"
+        );
+    }
+
+    /// Agent text at its longest once quoted: every character escaped.
+    fn quotes(n: usize) -> String {
+        "\"".repeat(n)
+    }
+
+    /// The pair from `candidates` whose `edit` text is longest when only
+    /// the field `set` writes differs.
+    fn longest_pair<T: Clone>(candidates: &[T], set: impl Fn(&mut SecretMeta, T)) -> (T, T) {
+        let base = meta(&"n".repeat(64));
+        let mut best = (0, candidates[0].clone(), candidates[0].clone());
+        for a in candidates {
+            for b in candidates {
+                let (mut cur, mut new) = (base.clone(), base.clone());
+                set(&mut cur, a.clone());
+                set(&mut new, b.clone());
+                countersign_core::store::check_meta(&cur).unwrap();
+                countersign_core::store::check_meta(&new).unwrap();
+                let n = edit_text(&cur, &new).chars().count();
+                if n > best.0 {
+                    best = (n, a.clone(), b.clone());
+                }
+            }
+        }
+        (best.1, best.2)
+    }
+
+    #[test]
+    fn every_store_change_dialog_fits_under_the_operation_limit() {
+        use countersign_core::store::{
+            MAX_DESCRIPTION_CHARS, MAX_ITEM_BYTES, MAX_LIST_ITEMS, MAX_USAGE_BYTES,
+        };
+        let fit = EDIT_FIELD_LIMIT;
+        let mut texts = vec![
+            String::new(),
+            "a".repeat(fit),
+            quotes(fit / 2),
+            "a".repeat(fit + 1),
+            quotes(fit / 2 + 1),
+            "a".repeat(MAX_DESCRIPTION_CHARS),
+            quotes(MAX_DESCRIPTION_CHARS),
+        ];
+        let descriptions = texts.clone();
+        texts.extend(["a".repeat(MAX_USAGE_BYTES), quotes(MAX_USAGE_BYTES)]);
+        let usages = texts;
+        let lists: Vec<Vec<String>> = vec![
+            vec![],
+            vec![quotes(MAX_ITEM_BYTES)],
+            vec![quotes(MAX_ITEM_BYTES); ITEMS_SHOWN],
+            vec![quotes(MAX_ITEM_BYTES); MAX_LIST_ITEMS],
+        ];
+        let name = "n".repeat(64);
+
+        // edit: every field changes, each in its longest way.
+        let (dc, dn) = longest_pair(&descriptions, |m, v| m.description = v);
+        let (uc, un) = longest_pair(&usages, |m, v| m.usage = v);
+        let (pc, pn) = longest_pair(&lists, |m, v| m.projects = v);
+        let (tc, tn) = longest_pair(&lists, |m, v| m.tags = v);
+        let cur = SecretMeta {
+            name: name.clone(),
+            description: dc,
+            usage: uc,
+            projects: pc,
+            tags: tc,
+            high_entropy: true,
+        };
+        let new = SecretMeta {
+            description: dn,
+            usage: un,
+            projects: pn,
+            tags: tn,
+            high_entropy: false,
+            ..cur.clone()
+        };
+        countersign_core::store::check_meta(&new).unwrap();
+        let edit = edit_text(&cur, &new);
+
+        // add: the longest of everything.
+        let add = add_text(
+            &SecretMeta {
+                name: name.clone(),
+                description: quotes(MAX_DESCRIPTION_CHARS),
+                usage: quotes(MAX_USAGE_BYTES),
+                projects: vec![quotes(MAX_ITEM_BYTES); MAX_LIST_ITEMS],
+                tags: vec![quotes(MAX_ITEM_BYTES); MAX_LIST_ITEMS],
+                high_entropy: true,
+            },
+            1000,
+            Some(ValueSource::Clipboard),
+        );
+
+        // rm names at most 16 secrets ([limits] max_names_per_request);
+        // import any number, so its two counts may each grow to 20 digits.
+        let names = vec![name.clone(); 16];
+        let rm = rm_text(&names);
+        let digits = |n: usize| n.to_string().len();
+        let import = import_text(&names);
+        let import_len = import.chars().count() + 2 * (digits(usize::MAX) - digits(names.len()));
+        let set = set_text(&name, 1000, Some(ValueSource::Clipboard));
+
+        for (what, n) in [
+            ("add", add.chars().count()),
+            ("edit", edit.chars().count()),
+            ("rm", rm.chars().count()),
+            ("import", import_len),
+            ("set", set.chars().count()),
+        ] {
+            assert!(n < OPERATION_LIMIT, "{what}: {n}");
+        }
+        for t in [&add, &edit, &rm, &import, &set] {
+            assert!(outside_quotes(t).is_some(), "{t}");
+        }
     }
 
     #[test]

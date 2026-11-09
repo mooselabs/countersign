@@ -544,10 +544,12 @@ The dialog reads `countersign request P2D-8TW, digest 7KMA-W41C: ADD secret
 acurast-rpc-bearer-token (value 16 to 63 bytes, from the clipboard, high
 entropy): description "Bearer token for the Acurast RPC endpoint (mainnet)";
 usage "Only for scripts/acurast_*.py read calls. Never log request
-headers."; projects [~/projects/moose/*]. terminal, no agent session (shell
+headers."; projects ["~/projects/moose/*"]. terminal, no agent session (shell
 bash, pid 40102); client-reported: cwd ~/projects/moose.` What `cnd` knows
-comes first, then the metadata the client sent; the description is cut at
-60 characters, the usage at 120. The value's size is only a class (`under 16
+comes first, then the metadata the client sent, quoted with `"` and `\`
+escaped; the description is cut at 60 characters, the usage at 120, and a
+cut says how long the text was. No projects reads `any (all projects)`. The
+value's size is only a class (`under 16
 bytes`, `16 to 63 bytes`, `64 to 1023 bytes`, `1 KiB or more`) and is never
 audited.
 
@@ -613,8 +615,12 @@ edited clickhouse-password
 ```
 
 - **Run by:** human.
-- **Approval:** `mutate`. The dialog names the changed fields
-  (`EDIT clickhouse-password: changes usage`).
+- **Approval:** `mutate`. The dialog shows each changed field, old -> new,
+  with what `cnd` acts on first: the high entropy flag, then projects
+  (`EDIT clickhouse-password: projects ["~/work/prod"] -> any (all
+  projects); usage "read only" -> "read and write"`). A description or usage
+  longer than 40 characters shows as its new text only (`usage becomes
+  "..."`).
 - **Audit:** `store.edit` with the list of changed fields and the new
   metadata (metadata is not secret).
 
@@ -629,7 +635,7 @@ revoked on commit.
 
 - **Run by:** human.
 - **Approval:** `mutate`; the dialog lists the names (`REMOVE 2 secrets: a,
-  b`, ten names then "and N more").
+  b`, eight names then "and N more").
 - **Audit:** `store.rm` per secret.
 
 ## `cn import`
@@ -687,7 +693,7 @@ ever in a readable file should be rotated after import; see
 - **Run by:** human. `cn` reads the files as the developer's uid, so it also
   works in a `!` command with `--metadata`.
 - **Approval:** one `mutate` approval; the dialog lists the names
-  (`IMPORT 3 secrets: ...`).
+  (`IMPORT 3 secrets: ...`, eight names then "and N more").
 - **Audit:** `request.create`, `request.approve`, `store.add` per secret, and
   one `import` record for the batch. Shredding happens in `cn` and is not
   audited.
@@ -966,7 +972,7 @@ from details `cnd` supplied. With the touch factor:
 ```text
 Authentication Required
   countersign request K7M-Q2X, digest 3QF8-ZK2M: USE clickhouse-password for 30m.
-  agent claude (pid 41210, registered by cn session exec); agent-reported: label orchestrator,
+  agent claude (pid 41210, registered by cn session exec); agent-reported: label "orchestrator",
   cwd ~/projects/moose/liskov-agent-orchestrator.
   Agent's reason: row counts for the weekly cost report via scripts/clickhouse_rows.py
   touch the device

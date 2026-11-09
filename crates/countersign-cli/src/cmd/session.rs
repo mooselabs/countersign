@@ -17,7 +17,11 @@ use crate::output::{Ctx, Done, clean_line};
 pub fn describe(s: &SessionView) -> String {
     let how = if s.anchor.registered {
         match &s.label {
-            Some(l) => format!("registered by cn session exec, label \"{}\"", clean_line(l)),
+            // Escaped, so the label cannot close its quotes.
+            Some(l) => format!(
+                "registered by cn session exec, label \"{}\"",
+                clean_line(l).replace('\\', "\\\\").replace('"', "\\\"")
+            ),
             None => "registered by cn session exec".into(),
         }
     } else {
@@ -105,4 +109,35 @@ pub fn exec(ctx: &Ctx, label: Option<&str>, command: &[OsString]) -> Result<Done
     } else {
         EXIT_CANNOT_EXECUTE
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use countersign_proto::{Anchor, Timestamp};
+
+    #[test]
+    fn a_label_cannot_close_its_quotes() {
+        let s = SessionView {
+            id: "s_1".into(),
+            anchor: Anchor {
+                pid: 1,
+                starttime: 1,
+                comm: "claude".into(),
+                registered: true,
+            },
+            started_at: Timestamp::now(),
+            label: Some("x\", matched \\".into()),
+            chain: vec![],
+            labels: Default::default(),
+            cwd: None,
+            alive: true,
+            active_grants: 0,
+        };
+        assert!(
+            describe(&s).contains("registered by cn session exec, label \"x\\\", matched \\\\\""),
+            "{}",
+            describe(&s)
+        );
+    }
 }

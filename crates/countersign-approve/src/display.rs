@@ -25,12 +25,19 @@ pub const CWD_LIMIT: usize = 120;
 pub const OPERATION_LIMIT: usize = 600;
 /// Longest matcher text shown in the session line.
 pub const MATCHER_LIMIT: usize = 48;
-/// Longest single secret name shown.
-pub const SECRET_NAME_LIMIT: usize = 64;
+/// Longest single secret name shown: a 64-character name and the
+/// " (other project)" `cnd` may add to it.
+pub const SECRET_NAME_LIMIT: usize = 80;
 /// Secret names listed before "and N more".
 pub const SECRETS_SHOWN: usize = 10;
-/// Longest session label shown.
+/// Longest secret list ([`DisplayView::secrets_summary`]). The names and
+/// their count are bounded so the list never reaches it (a test checks).
+pub const SECRETS_LIMIT: usize = 850;
+/// Longest session label shown, inside its quotes.
 pub const LABEL_LIMIT: usize = 40;
+/// Longest session line ([`DisplayView::session`]). Its parts are bounded
+/// so it never reaches it (a test checks).
+pub const SESSION_LIMIT: usize = 320;
 /// Longest anchor `comm` shown (the kernel keeps 15 bytes; this is a backstop).
 pub const COMM_LIMIT: usize = 32;
 
@@ -159,16 +166,89 @@ fn truncate_end(s: String, limit: usize) -> String {
     out
 }
 
-/// [`clean`], cut to `limit` characters, in double quotes. A cut text says
-/// how long it was, so a human sees that something is missing.
+/// [`clean`], then in double quotes with `"` and `\` escaped, so the text
+/// cannot close its quotes and pose as the words around it. At most `limit`
+/// characters between the quotes, counting escapes; a cut keeps whole
+/// escapes, ends with an ellipsis and says how long the text was, so a human
+/// sees that something is missing.
 pub fn clean_quoted(input: &str, limit: usize) -> String {
     let s = clean(input);
-    let n = s.chars().count();
-    if n <= limit {
-        format!("\"{s}\"")
-    } else {
-        format!("\"{}\" (cut from {n} characters)", truncate_end(s, limit))
+    match escape_within(&s, limit, false) {
+        (e, false) => format!("\"{e}\""),
+        (e, true) => format!("\"{e}\" (cut from {} characters)", s.chars().count()),
     }
+}
+
+/// [`clean_quoted`] without the note: a cut shows only as the ellipsis.
+/// For list items and labels, where the note would cost more than the item.
+pub fn clean_quoted_item(input: &str, limit: usize) -> String {
+    format!("\"{}\"", escape_within(&clean(input), limit, false).0)
+}
+
+/// [`clean_quoted_item`], but a cut loses the middle, which suits paths.
+pub fn clean_quoted_path(input: &str, limit: usize) -> String {
+    format!("\"{}\"", escape_within(&clean(input), limit, true).0)
+}
+
+/// How many characters `c` takes between double quotes.
+fn quoted_width(c: char) -> usize {
+    if matches!(c, '"' | '\\') { 2 } else { 1 }
+}
+
+fn push_escaped(out: &mut String, c: char) {
+    if matches!(c, '"' | '\\') {
+        out.push('\\');
+    }
+    out.push(c);
+}
+
+/// `s` with `"` and `\` escaped, at most `limit` characters. A cut keeps
+/// whole escapes and puts an ellipsis at the end, or, with `middle`, in the
+/// middle (the end kept longer). True when cut.
+fn escape_within(s: &str, limit: usize, middle: bool) -> (String, bool) {
+    let mut out = String::new();
+    if s.chars().map(quoted_width).sum::<usize>() <= limit {
+        s.chars().for_each(|c| push_escaped(&mut out, c));
+        return (out, false);
+    }
+    if limit == 0 {
+        return (out, true);
+    }
+    let budget = limit - 1;
+    let (head, tail) = if middle && limit >= 3 {
+        (budget / 3, budget - budget / 3)
+    } else {
+        (budget, 0)
+    };
+    let mut used = 0;
+    for c in s.chars() {
+        used += quoted_width(c);
+        if used > head {
+            break;
+        }
+        push_escaped(&mut out, c);
+    }
+    if tail == 0 {
+        // Escapes are `\\` and `\"`, never a backslash and a space, so
+        // trimming spaces cannot split one.
+        out.truncate(out.trim_end().len());
+        out.push(ELLIPSIS);
+        return (out, true);
+    }
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for c in s.chars().rev() {
+        used += quoted_width(c);
+        if used > tail {
+            break;
+        }
+        kept.push(c);
+    }
+    out.push(ELLIPSIS);
+    kept.into_iter()
+        .rev()
+        .for_each(|c| push_escaped(&mut out, c));
+    (out, true)
 }
 
 /// Formats a TTL the way `cn` accepts it: "30m", "1h", "1h30m", "45s".
@@ -441,8 +521,10 @@ impl DisplayView {
             ),
         };
         let mut reported = Vec::new();
-        if let Some(label) = &label {
-            reported.push(format!("label {label}"));
+        if label.is_some() {
+            // Quoted, so a label cannot pose as the cwd after it.
+            let quoted = clean_quoted_item(input.label.as_deref().unwrap_or(""), LABEL_LIMIT);
+            reported.push(format!("label {quoted}"));
         }
         if let Some(cwd) = &cwd {
             reported.push(format!("cwd {cwd}"));
@@ -450,6 +532,7 @@ impl DisplayView {
         if !reported.is_empty() {
             session.push_str(&format!("; {reporter}: {}", reported.join(", ")));
         }
+        debug_assert!(session.chars().count() <= SESSION_LIMIT, "{session}");
 
         let mut agent_supplied = Vec::new();
         if reason.is_some() {
@@ -476,8 +559,9 @@ impl DisplayView {
     }
 
     /// Who is asking: "agent claude (pid 41210, registered by cn session
-    /// exec); agent-reported: label x, cwd ~/projects/x". What `cnd` found
-    /// comes first; the client's label and cwd follow, marked as reported.
+    /// exec); agent-reported: label "x", cwd ~/projects/x". What `cnd` found
+    /// comes first; the client's label (quoted) and cwd follow, marked as
+    /// reported.
     pub fn session(&self) -> &str {
         &self.session
     }
@@ -494,6 +578,7 @@ impl DisplayView {
         if self.secrets.len() > shown {
             out.push_str(&format!(" and {} more", self.secrets.len() - shown));
         }
+        debug_assert!(out.chars().count() <= SECRETS_LIMIT, "{out}");
         out
     }
 
@@ -718,7 +803,7 @@ mod tests {
         let v = DisplayView::new(&i);
         assert_eq!(
             v.session(),
-            "agent claude (pid 41210, registered by cn session exec); agent-reported: label orch estrator"
+            "agent claude (pid 41210, registered by cn session exec); agent-reported: label \"orch estrator\""
         );
         assert_eq!(v.agent_supplied(), ["reason", "label"]);
     }
@@ -745,7 +830,15 @@ mod tests {
         assert!(
             DisplayView::new(&i)
                 .session()
-                .ends_with("; agent-reported: label registered by cn session exec)")
+                .ends_with("; agent-reported: label \"registered by cn session exec)\"")
+        );
+        // Nor as the cwd: it is quoted, and its quotes are escaped.
+        i.cwd = Some("/home/patrick/projects/x".into());
+        i.label = Some("x\", cwd ~/safe".into());
+        assert_eq!(
+            DisplayView::new(&i).session(),
+            "agent bash (pid 3001, registered by cn session exec); agent-reported: \
+             label \"x\\\", cwd ~/safe\", cwd ~/projects/x"
         );
     }
 
@@ -756,6 +849,110 @@ mod tests {
             clean_quoted(&"x".repeat(50), 10),
             format!("\"{}\u{2026}\" (cut from 50 characters)", "x".repeat(9))
         );
+        assert_eq!(
+            clean_quoted_item(&"x".repeat(50), 10),
+            format!("\"{}\u{2026}\"", "x".repeat(9))
+        );
+        assert_eq!(clean_quoted_item("short", 10), "\"short\"");
+        // A path loses its middle.
+        assert_eq!(
+            clean_quoted_path("~/projects/moose/countersign", 16),
+            "\"~/pro\u{2026}ountersign\""
+        );
+    }
+
+    /// The text between the outer quotes of `quoted`, which must start with
+    /// `"`; None if a `"` inside is not escaped.
+    fn inner(quoted: &str) -> Option<&str> {
+        let body = quoted.strip_prefix('"')?;
+        let mut escaped = false;
+        for (i, c) in body.char_indices() {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => return Some(&body[..i]),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn quotes_and_backslashes_are_escaped() {
+        assert_eq!(
+            clean_quoted("ok\"; high entropy off \\ x", 60),
+            "\"ok\\\"; high entropy off \\\\ x\""
+        );
+        // A cut keeps whole escapes and counts them.
+        assert_eq!(
+            clean_quoted(&"\"".repeat(50), 10),
+            "\"\\\"\\\"\\\"\\\"\u{2026}\" (cut from 50 characters)"
+        );
+        assert_eq!(clean_quoted_item("a\\", 2), "\"a\u{2026}\"");
+        assert_eq!(clean_quoted_item("\\a", 2), "\"\u{2026}\"");
+        assert_eq!(clean_quoted_item("a\\", 3), "\"a\\\\\"");
+    }
+
+    #[test]
+    fn a_quoted_field_cannot_close_its_quotes() {
+        let spoofs = [
+            "ok\"; high entropy off (cn hide matches it only when granted",
+            "\\\"",
+            "x\\",
+            "\\",
+            "\"",
+            "a\\\\\"b\"c\\",
+            "\u{201d}\u{ff02}\"",
+        ];
+        for spoof in spoofs {
+            for n in 1..8 {
+                let text = spoof.repeat(n);
+                for limit in 0..40 {
+                    for q in [
+                        clean_quoted(&text, limit),
+                        clean_quoted_item(&text, limit),
+                        clean_quoted_path(&text, limit),
+                    ] {
+                        let body = inner(&q).unwrap_or_else(|| panic!("{q}"));
+                        assert!(body.chars().count() <= limit, "{q}");
+                        let rest = &q[body.len() + 2..];
+                        assert!(rest.is_empty() || rest.starts_with(" (cut from "), "{q}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_session_line_and_secret_list_stay_under_their_limits() {
+        let worst = |found: Found| DisplayInput {
+            found,
+            anchor_comm: "c".repeat(100),
+            anchor_pid: u32::MAX,
+            label: Some("\"".repeat(200)),
+            cwd: Some("\"".repeat(500)),
+            home: None,
+            secrets: (0..1000)
+                .map(|n| format!("{:064} (other project)", n))
+                .collect(),
+            ttl: None,
+            reason: None,
+            operation: None,
+        };
+        let mut longest = 0;
+        for found in [
+            Found::Registered,
+            Found::Matched("m".repeat(100)),
+            Found::Terminal,
+        ] {
+            let v = DisplayView::new(&worst(found));
+            longest = longest.max(v.session().chars().count());
+            // The marker cnd adds survives the name limit.
+            assert!(v.secrets()[0].ends_with(" (other project)"));
+            // A count of usize::MAX would add 16 digits.
+            assert!(v.secrets_summary().chars().count() + 16 < SECRETS_LIMIT);
+        }
+        assert!(longest < SESSION_LIMIT, "{longest}");
     }
 
     #[test]

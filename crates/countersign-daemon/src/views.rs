@@ -292,6 +292,21 @@ pub fn redact_label(st: &State, rt: &Runtime, session: &str, text: &str) -> Stri
     TextRedactor::new(st, rt, session).apply(text, "label")
 }
 
+/// `text` redacted with the hide set of each of `sessions` in turn, for a
+/// text more than one session may have seen values of. `what` names it in
+/// the withheld text.
+pub fn redact_for_sessions(
+    st: &State,
+    rt: &Runtime,
+    sessions: &[&str],
+    text: &str,
+    what: &str,
+) -> String {
+    sessions.iter().fold(text.to_owned(), |t, s| {
+        TextRedactor::new(st, rt, s).apply(&t, what)
+    })
+}
+
 /// Every label value, redacted ([`TextRedactor`]).
 pub fn redact_labels(
     st: &State,
