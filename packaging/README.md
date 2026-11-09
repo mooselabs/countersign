@@ -12,7 +12,7 @@ secrets in it yet.
 ## Requirements
 
 - Linux 6.5 or later (`cnd` uses `SO_PEERPIDFD` and refuses to start without it).
-- systemd 250 or later, running as init (`systemd-creds`, `LoadCredentialEncrypted=`).
+- systemd 253 or later, running as init (`Type=notify-reload`, `systemd-creds`, `LoadCredentialEncrypted=`).
 - polkit 0.114 or later (action owners). The touch factors need polkit 125 or
   later, which runs its PAM helper as `polkit-agent-helper@.service`.
 - A graphical session with a polkit agent (GNOME Shell on Wayland is what has

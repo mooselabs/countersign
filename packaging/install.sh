@@ -169,7 +169,7 @@ note "kernel $rel"
 [ -d "$R/run/systemd/system" ] || die "systemd is not the running init system"
 sd_version=$(systemctl --version | awk 'NR == 1 { print $2 }')
 [[ $sd_version =~ ^[0-9]+$ ]] || die "cannot read the systemd version"
-version_ge "$sd_version" 250 || die "systemd $sd_version is too old: countersign needs 250 or later (systemd-creds)"
+version_ge "$sd_version" 253 || die "systemd $sd_version is too old: countersign needs 253 or later (Type=notify-reload, systemd-creds)"
 for tool in systemd-creds systemd-run systemd-sysusers systemd-tmpfiles; do
     command -v "$tool" >/dev/null || die "$tool not found"
 done

@@ -330,6 +330,14 @@ impl Daemon {
         if let Err(e) = st.audit.maybe_checkpoint() {
             error!("audit checkpoint failed: {e}");
         }
+        // Rate windows of sessions that never end through their anchor
+        // (human `h_` sessions) are dropped once a minute old.
+        let minute = Duration::from_secs(60);
+        let fresh = |t: &SystemTime| now.duration_since(*t).unwrap_or_default() < minute;
+        st.list_rate.retain(|_, q| q.back().is_some_and(fresh));
+        st.hide_streams.retain(|_, q| q.back().is_some_and(fresh));
+        st.hide_bytes
+            .retain(|_, q| q.back().is_some_and(|(t, _)| fresh(t)));
         drop(st);
         if changed {
             self.decided.notify_waiters();
