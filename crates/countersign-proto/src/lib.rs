@@ -3,8 +3,30 @@
 //! Frames are `u32` big-endian length (of kind + payload), a `u8` kind, then
 //! the payload. JSON messages carry a `type` tag and an `id` that the response
 //! echoes. Unknown fields are ignored.
+//!
+//! - [`Request`] and [`Response`] are the messages; the response module's
+//!   docs list which response answers which request.
+//! - Times are RFC 3339 UTC strings with whole seconds ([`Timestamp`]);
+//!   durations are integer seconds in fields ending `_seconds`.
+//! - Secret values travel as standard base64 in [`ValueB64`], which never
+//!   prints its contents and is zeroized on drop.
+//! - [`CanonicalRequest`] is what approvers sign; [`jcs`] is its RFC 8785
+//!   encoding, also used for audit record hashes.
 
-use std::collections::BTreeMap;
+mod canonical;
+pub mod jcs;
+mod request;
+mod response;
+mod time;
+
+pub use canonical::{APPROVE_DOMAIN, Anchor, ApprovalKind, CanonicalRequest, Digest};
+pub use request::{ImportItem, Mode, Request, SecretMeta, Use, ValueB64, ValueSource};
+pub use response::{
+    ApproverView, ChainEntry, Decision, Driven, GrantView, LastUse, RequestState, RequestView,
+    Response, RunValue, ScrubValue, SecretView, SessionView,
+};
+pub use time::{BadTimestamp, Timestamp};
+
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::str::FromStr;
@@ -131,209 +153,6 @@ pub struct Envelope<T> {
     pub body: T,
 }
 
-/// Grant mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Mode {
-    /// Values are injected into a child process by `cn run`.
-    Use,
-    /// The raw value may be printed by `cn reveal`.
-    Reveal,
-}
-
-/// One secret to inject for `cn run`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Use {
-    /// Secret name.
-    pub name: String,
-    /// Environment variable the child sees.
-    pub env: String,
-}
-
-/// Secret metadata. Never carries a value.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct SecretMeta {
-    /// Secret name.
-    pub name: String,
-    /// One-line description.
-    #[serde(default)]
-    pub description: String,
-    /// Prose on how the secret should be used.
-    #[serde(default)]
-    pub usage: String,
-    /// Project path globs the secret belongs to (organizational only).
-    #[serde(default)]
-    pub projects: Vec<String>,
-    /// Free-form tags.
-    #[serde(default)]
-    pub tags: Vec<String>,
-    /// Whether `cn hide` matches it without a grant.
-    #[serde(default)]
-    pub high_entropy: bool,
-}
-
-/// A message from `cn` to `cnd`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Request {
-    /// First frame on every connection.
-    Hello {
-        /// Protocol versions the client speaks.
-        protocols: Vec<u32>,
-        /// Client name and version, e.g. `cn/0.1.0`.
-        client: String,
-        /// Untrusted labels such as an agent session id, for the audit log.
-        #[serde(default)]
-        labels: BTreeMap<String, String>,
-        /// Client-reported working directory (an untrusted label).
-        #[serde(default)]
-        cwd: Option<String>,
-    },
-    /// Describe the caller's session.
-    Session,
-    /// List secrets.
-    List {
-        /// Include secrets scoped to other projects.
-        #[serde(default)]
-        all_projects: bool,
-    },
-    /// Ask for a grant.
-    Request {
-        /// Secrets requested.
-        names: Vec<String>,
-        /// Grant mode.
-        mode: Mode,
-        /// Requested lifetime in seconds.
-        ttl: u64,
-        /// Why, shown to the approver.
-        reason: String,
-    },
-    /// Fetch a pending request for display before approving.
-    GetRequest {
-        /// The human-facing code.
-        code: String,
-    },
-    /// Approve a pending request.
-    Approve {
-        /// The human-facing code.
-        code: String,
-        /// Approver instance name from the config (e.g. `desk-key`).
-        approver: String,
-        /// FIDO2 assertion, base64url, for client-driven approvers.
-        #[serde(default)]
-        assertion: Option<String>,
-    },
-    /// Deny a pending request.
-    Deny {
-        /// The human-facing code.
-        code: String,
-    },
-    /// List the session's active grants.
-    Grants,
-    /// Revoke one grant or all of them.
-    Revoke {
-        /// Grant id; `None` revokes all grants in the session.
-        #[serde(default)]
-        grant_id: Option<String>,
-    },
-    /// Start `cn run`.
-    Run {
-        /// Secrets to inject.
-        uses: Vec<Use>,
-        /// Program name, for the audit log.
-        argv0: String,
-        /// Argument count, for the audit log.
-        argc: u32,
-    },
-    /// Report the end of a `cn run` child.
-    RunFinish {
-        /// From the `run` response.
-        run_id: String,
-        /// Exit status, if the child exited.
-        #[serde(default)]
-        exit: Option<i32>,
-        /// Signal number, if the child was killed.
-        #[serde(default)]
-        signal: Option<i32>,
-        /// Wall time.
-        duration_ms: u64,
-        /// Redaction hits per secret.
-        #[serde(default)]
-        hits: BTreeMap<String, u64>,
-    },
-    /// Start a `cn hide` stream.
-    Hide,
-    /// End a `cn hide` stream.
-    HideEnd,
-    /// Print a raw value (needs a `reveal` grant).
-    Reveal {
-        /// Secret name.
-        name: String,
-    },
-    /// Propose a new secret (needs approval).
-    Add {
-        /// Metadata.
-        meta: SecretMeta,
-        /// Value, base64.
-        value_b64: String,
-    },
-    /// Propose a new value for an existing secret (needs approval).
-    Set {
-        /// Secret name.
-        name: String,
-        /// Value, base64.
-        value_b64: String,
-    },
-    /// Propose a metadata change (needs approval).
-    Edit {
-        /// The new metadata; `name` selects the secret.
-        meta: SecretMeta,
-    },
-    /// Propose removing a secret (needs approval).
-    Rm {
-        /// Secret name.
-        name: String,
-    },
-    /// Query the audit log.
-    AuditQuery {
-        /// Filter by session id.
-        #[serde(default)]
-        session: Option<String>,
-        /// Filter by secret name.
-        #[serde(default)]
-        secret: Option<String>,
-        /// Filter by event type.
-        #[serde(default)]
-        event: Option<String>,
-        /// RFC 3339 lower bound.
-        #[serde(default)]
-        since: Option<String>,
-        /// RFC 3339 upper bound.
-        #[serde(default)]
-        until: Option<String>,
-        /// Most records to return.
-        #[serde(default)]
-        limit: Option<u32>,
-    },
-    /// Fetch raw audit segments for `cn audit verify`.
-    AuditSegments {
-        /// First sequence number wanted.
-        from_seq: u64,
-    },
-    /// Register the caller as a session anchor (`cn session exec`).
-    SessionRegister {
-        /// Human label for the session.
-        #[serde(default)]
-        label: Option<String>,
-    },
-    /// Unseal the store.
-    Unlock {
-        /// FIDO2 hmac-secret output for client-side unlock, base64url.
-        #[serde(default)]
-        hmac_output: Option<String>,
-    },
-}
-
 /// Error codes from `cnd`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -366,8 +185,14 @@ pub enum ErrorCode {
     ApproverUnavailable,
     /// The request type is not known.
     UnknownRequest,
+    /// The arguments are invalid: a bad name, a value too large, a secret
+    /// that already exists, a `revoke` without exactly one selector.
+    BadRequest,
     /// Server fault; details only in the daemon log.
     Internal,
+    /// A code this version does not know (sent by a newer `cnd`). Never sent.
+    #[serde(other)]
+    Unknown,
 }
 
 impl fmt::Display for ErrorCode {
@@ -380,7 +205,7 @@ impl fmt::Display for ErrorCode {
 }
 
 /// An error response body.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
     /// Machine-readable code.
     pub code: ErrorCode,
@@ -391,12 +216,23 @@ pub struct ErrorBody {
     pub detail: serde_json::Value,
 }
 
+/// The default environment variable for a secret: its name in upper snake
+/// case, `.` and `-` becoming `_` (`clickhouse-prod` maps to `CLICKHOUSE_PROD`).
+pub fn default_env(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '.' | '-' => '_',
+            c => c.to_ascii_uppercase(),
+        })
+        .collect()
+}
+
 /// A human-facing request code: 6 Crockford base32 characters shown as
 /// `K7M-Q2X`. A handle, not a credential.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RequestCode([u8; 6]);
 
-const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+pub(crate) const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// A string that is not a valid request code.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -504,7 +340,7 @@ mod tests {
             body: Request::Request {
                 names: vec!["clickhouse-prod".into()],
                 mode: Mode::Use,
-                ttl: 3600,
+                ttl_seconds: Some(3600),
                 reason: "drift report".into(),
             },
         };
