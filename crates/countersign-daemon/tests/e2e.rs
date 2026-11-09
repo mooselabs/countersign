@@ -151,6 +151,28 @@ impl Cnd {
         }
     }
 
+    fn signal(&self, sig: rustix::process::Signal) {
+        let pid = rustix::process::Pid::from_child(self.child.as_ref().unwrap());
+        rustix::process::kill_process(pid, sig).unwrap();
+    }
+
+    /// One request on a raw connection, after `hello`; the response as JSON.
+    fn raw_call(&self, req: countersign_proto::Request) -> Value {
+        use countersign_proto::{Envelope, Request, write_message};
+        let mut s = std::os::unix::net::UnixStream::connect(self.path().join("sock")).unwrap();
+        let hello = Request::Hello {
+            protocols: vec![1],
+            client: "e2e".into(),
+            labels: Default::default(),
+            cwd: None,
+        };
+        write_message(&mut s, &Envelope { id: 1, body: hello }).unwrap();
+        countersign_proto::read_frame(&mut s).unwrap().unwrap();
+        write_message(&mut s, &Envelope { id: 2, body: req }).unwrap();
+        let (_, body) = countersign_proto::read_frame(&mut s).unwrap().unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
     fn log(&self) -> String {
         std::fs::read_to_string(self.path().join("cnd.log")).unwrap_or_default()
     }
@@ -160,18 +182,32 @@ impl Cnd {
     }
 
     fn cn_in(&self, args: &[&str], stdin: &[u8]) -> Output {
+        self.cn_env(args, stdin, &[])
+    }
+
+    fn cn_env(&self, args: &[&str], stdin: &[u8], env: &[(&str, &str)]) -> Output {
         let mut child = Command::new(cn_bin())
             .args(["--socket", "sock"])
             .args(args)
             .current_dir(self.path())
             .env_remove("COUNTERSIGN_SOCKET")
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(stdin).unwrap();
-        child.wait_with_output().unwrap()
+        // Write stdin on its own thread: cn may write output before it has
+        // read all its input, and a large input would then deadlock.
+        let mut pipe = child.stdin.take().unwrap();
+        let input = stdin.to_vec();
+        let writer = std::thread::spawn(move || {
+            // cn may exit without reading everything; that is its business.
+            let _ = pipe.write_all(&input);
+        });
+        let out = child.wait_with_output().unwrap();
+        writer.join().unwrap();
+        out
     }
 
     /// Runs `cn`, asserts the exit code, returns stdout.
@@ -900,6 +936,20 @@ require_wayland = false
         assert_eq!(call.details["digest"], digest_short);
         assert_eq!(call.details["code"], code);
         assert_eq!(call.details["secrets"], "pk-secret");
+        // Who is asking: what cnd found first, the client's cwd marked.
+        let who = &call.details["session"];
+        assert!(
+            who.starts_with(&format!(
+                "agent {} (pid {}, matched comm = ",
+                my_comm(),
+                std::process::id()
+            )),
+            "{who}"
+        );
+        assert!(
+            who.contains("; agent-reported: ") && who.contains("cwd "),
+            "{who}"
+        );
         assert_eq!(call.subject.kind, "unix-process");
         let pid: u32 = call.subject.details["pid"]
             .try_clone()
@@ -976,4 +1026,481 @@ fn an_abandoned_hide_stream_is_still_audited() {
     drop(s);
     let rec = cnd.wait_for_record(|r| r["event"] == "hide");
     assert_eq!(rec["hits"]["probe-target"], 1);
+    // bytes_out with bytes_in and the hits would give away the value's length.
+    assert!(rec.get("bytes_out").is_none(), "{rec}");
+}
+
+// ---------------------------------------------------------------------------
+// Limits, shutdown, init and the other review fixes.
+
+/// A `cn session exec` session that makes one request, then lives on (its
+/// anchor execs `sleep`) so the request stays pending. Returns the anchor
+/// and cn's exit code and stdout.
+#[expect(
+    clippy::zombie_processes,
+    reason = "the anchor is returned; the caller kills and waits for it"
+)]
+fn session_request(cnd: &Cnd, i: usize, secret: &str) -> (Child, i32, String) {
+    let cn = cn_bin();
+    let script = format!(
+        "{cn} --socket sock --json request {secret} --reason r{i} > out{i}.json 2> err{i}; \
+         echo $? > rc{i}; exec sleep 120",
+        cn = cn.display()
+    );
+    let mut child = Command::new(&cn)
+        .args(["--socket", "sock", "session", "exec", "--label"])
+        .arg(format!("s{i}"))
+        .args(["--", "sh", "-c", &script])
+        .current_dir(cnd.path())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let rc = cnd.path().join(format!("rc{i}"));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&rc) {
+            if let Ok(code) = text.trim().parse() {
+                let out = std::fs::read_to_string(cnd.path().join(format!("out{i}.json")))
+                    .unwrap_or_default()
+                    + &std::fs::read_to_string(cnd.path().join(format!("err{i}")))
+                        .unwrap_or_default();
+                return (child, code, out);
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("session {i} did not finish; log:\n{}", cnd.log());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn limits_hold_across_sessions_and_dialogs_queue() {
+    let cnd = Cnd::start(
+        r#"
+[approval]
+use = "slow"
+reveal = "slow"
+mutate = "auto"
+export = "auto"
+
+[approvers.auto]
+type = "insecure-auto"
+
+[approvers.slow]
+type = "insecure-auto"
+delay = "1h"
+
+[limits]
+max_pending_requests_per_uid = 4
+max_prompts_per_uid = 2
+list_calls_per_minute_per_uid = 3
+
+[hide]
+max_streams_per_minute_per_uid = 1
+"#,
+    );
+    add(&cnd, "a", "value-a-0123456789", "--high-entropy");
+    let mut anchors = Vec::new();
+    let mut codes = Vec::new();
+    // Each session is new, but the uid's limits count them all: two
+    // dialogs open, two requests wait their turn, the fifth is refused.
+    for i in 0..5 {
+        let (child, rc, out) = session_request(&cnd, i, "a");
+        anchors.push(child);
+        if i < 4 {
+            assert_eq!(rc, 0, "{out}");
+            let v: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(
+                v["data"]["queued"].as_bool().unwrap_or(false),
+                i >= 2,
+                "{v}"
+            );
+            codes.push(v["data"]["code"].as_str().unwrap().to_owned());
+        } else {
+            assert_eq!(rc, 10, "{out}");
+            assert!(out.contains("of this user are already pending"), "{out}");
+        }
+    }
+
+    // A deny from another session frees a dialog slot: the first queued
+    // request's dialog opens.
+    cnd.ok(&["deny", &codes[0], "--reason", "no"]);
+    let deny = cnd.wait_for_record(|r| r["event"] == "request.deny");
+    assert_eq!(deny["evidence"]["from"], "other_session", "{deny}");
+    assert_eq!(deny["evidence"]["peer"]["uid"], uid());
+    assert_eq!(deny["evidence"]["peer"]["comm"], "cn");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let v = cnd.raw_call(countersign_proto::Request::GetRequest {
+            code: codes[2].clone(),
+            wait_seconds: Some(1),
+        });
+        if v["queued"].as_bool() != Some(true) {
+            assert_eq!(v["state"], "pending", "{v}");
+            assert_eq!(v["approvers"][0]["prompted"], true, "{v}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "{v}");
+    }
+    let v = cnd.raw_call(countersign_proto::Request::GetRequest {
+        code: codes[3].clone(),
+        wait_seconds: Some(0),
+    });
+    assert_eq!(v["queued"], true, "{v}");
+
+    // The deny cools the secret down for the uid: a new session is refused.
+    let (child, rc, out) = session_request(&cnd, 9, "a");
+    anchors.push(child);
+    assert_eq!(rc, 10, "{out}");
+    assert!(out.contains("denied a moment ago"), "{out}");
+
+    // list and hide count per uid too.
+    for _ in 0..3 {
+        cnd.ok(&["list"]);
+    }
+    let out = cnd.cn(&["list"]);
+    assert_eq!(out.status.code(), Some(10));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("from this user"));
+    cnd.expect(&["hide"], b"x\n", 0);
+    let out = cnd.cn_in(&["hide"], b"x\n");
+    assert_eq!(
+        out.status.code(),
+        Some(10),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    for mut a in anchors {
+        let _ = a.kill();
+        let _ = a.wait();
+    }
+}
+
+#[test]
+fn connections_are_capped_and_quiet_ones_closed() {
+    use countersign_proto::{Envelope, Request, write_message};
+    let cnd = Cnd::start(&format!(
+        "{APPROVE_ALL}\n[limits]\nmax_connections_per_uid = 3\nidle_timeout = \"2s\"\n"
+    ));
+    // Three sockets that never say hello hold every slot.
+    let silent: Vec<_> = (0..3)
+        .map(|_| std::os::unix::net::UnixStream::connect(cnd.path().join("sock")).unwrap())
+        .collect();
+    std::thread::sleep(Duration::from_millis(200));
+    let out = cnd.cn(&["list"]);
+    assert_eq!(
+        out.status.code(),
+        Some(10),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("connections open"));
+    // After the hello timeout (5 s) they are closed and cn works again.
+    std::thread::sleep(Duration::from_secs(6));
+    cnd.ok(&["list"]);
+    drop(silent);
+
+    // A handshaken connection that stays quiet past idle_timeout is closed.
+    let mut s = std::os::unix::net::UnixStream::connect(cnd.path().join("sock")).unwrap();
+    let hello = Request::Hello {
+        protocols: vec![1],
+        client: "e2e".into(),
+        labels: Default::default(),
+        cwd: None,
+    };
+    write_message(&mut s, &Envelope { id: 1, body: hello }).unwrap();
+    countersign_proto::read_frame(&mut s).unwrap().unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let started = Instant::now();
+    assert!(countersign_proto::read_frame(&mut s).unwrap().is_none());
+    assert!(started.elapsed() >= Duration::from_millis(1500));
+}
+
+/// The process that connected exits; whoever holds the socket now gets
+/// nothing more from it.
+#[test]
+fn a_connection_ends_with_the_process_that_made_it() {
+    let script = r#"
+import json, os, socket, struct, sys, time
+def send(s, obj):
+    b = json.dumps(obj).encode()
+    s.sendall(struct.pack(">I", len(b) + 1) + b"\x01" + b)
+def recv(s):
+    hdr = b""
+    while len(hdr) < 4:
+        try:
+            c = s.recv(4 - len(hdr))
+        except ConnectionResetError:
+            return None
+        if not c:
+            return None
+        hdr += c
+    n = struct.unpack(">I", hdr)[0]
+    body = b""
+    while len(body) < n:
+        c = s.recv(n - len(body))
+        if not c:
+            return None
+        body += c
+    return body
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+send(s, {"id": 1, "type": "hello", "protocols": [1], "client": "py", "labels": {}, "cwd": None})
+recv(s)
+if os.fork():
+    os._exit(0)
+time.sleep(0.5)
+send(s, {"id": 2, "type": "list", "all_projects": True})
+print("answered" if recv(s) else "closed", flush=True)
+"#;
+    if Command::new("python3")
+        .arg("-c")
+        .arg("pass")
+        .status()
+        .is_err()
+    {
+        eprintln!("SKIPPED: python3 is not on PATH");
+        return;
+    }
+    let cnd = Cnd::start(APPROVE_ALL);
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(cnd.path().join("sock"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "closed",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn no_approver_able_to_run_is_approver_unavailable() {
+    let cnd = Cnd::start(
+        r#"
+[approval]
+use = "gone"
+reveal = "gone"
+mutate = "auto"
+export = "auto"
+
+[approvers.auto]
+type = "insecure-auto"
+
+[approvers.gone]
+type = "insecure-auto"
+decision = "unavailable"
+"#,
+    );
+    add(&cnd, "u", "value-u-0123456789", "--high-entropy");
+    let out = cnd.cn(&["request", "u", "--reason", "x", "--wait"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(14), "{err}");
+    assert!(
+        err.contains("approver_unavailable") && err.contains("cn doctor"),
+        "{err}"
+    );
+    // No deny cooldown: asking again gets the same answer, not rate_limited.
+    let out = cnd.cn(&["request", "u", "--reason", "x", "--wait"]);
+    assert_eq!(out.status.code(), Some(14));
+}
+
+#[test]
+fn a_stop_does_not_wait_on_a_pending_request() {
+    let mut cnd = Cnd::start(
+        r#"
+[approval]
+use = "slow"
+reveal = "slow"
+mutate = "auto"
+export = "auto"
+
+[approvers.auto]
+type = "insecure-auto"
+
+[approvers.slow]
+type = "insecure-auto"
+delay = "1h"
+"#,
+    );
+    add(&cnd, "w", "value-w-0123456789", "--high-entropy");
+    let mut waiting = Command::new(cn_bin())
+        .args([
+            "--socket", "sock", "request", "w", "--reason", "wait", "--wait",
+        ])
+        .current_dir(cnd.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    cnd.wait_for_record(|r| r["event"] == "request.create");
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    cnd.stop();
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "stop took {:?}",
+        started.elapsed()
+    );
+    let _ = waiting.kill();
+    let _ = waiting.wait();
+    // daemon.stop and the final checkpoint are the last records.
+    let events = cnd.events();
+    let n = events.len();
+    assert_eq!(events[n - 2..], ["daemon.stop", "checkpoint"], "{events:?}");
+}
+
+#[test]
+fn a_failed_init_leaves_nothing_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    write_key(&dir.path().join("mk"));
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!("[access]\nusers = [\"{}\"]\n", uid()),
+    )
+    .unwrap();
+    let init = |stdout: Stdio| {
+        Command::new(cnd_bin())
+            .args(base_args("mk"))
+            .arg("init")
+            .current_dir(dir.path())
+            .stdout(stdout)
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap()
+    };
+    // The phrase cannot be shown: no store may be left behind.
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let out = init(Stdio::from(full));
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("recovery phrase"));
+    let state = dir.path().join("state");
+    for f in [
+        "store.v1",
+        "keyslots.json",
+        "audit/checkpoint.pub",
+        "audit/000001.jsonl",
+    ] {
+        assert!(!state.join(f).exists(), "{f} was left behind");
+    }
+    // So init can simply run again.
+    let out = init(Stdio::piped());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(state.join("store.v1").exists());
+}
+
+#[test]
+fn verify_fails_when_the_start_of_the_log_is_gone() {
+    let mut cnd = Cnd::start(APPROVE_ALL);
+    add(&cnd, "v", "value-v-0123456789", "--high-entropy");
+    cnd.stop();
+    let copy = cnd.path().join("copy");
+    std::fs::create_dir(&copy).unwrap();
+    let audit = cnd.path().join("state/audit");
+    std::fs::copy(audit.join("checkpoint.pub"), copy.join("checkpoint.pub")).unwrap();
+    let text = std::fs::read_to_string(audit.join("000001.jsonl")).unwrap();
+    let tail: String = text.lines().skip(2).map(|l| format!("{l}\n")).collect();
+    std::fs::write(copy.join("000001.jsonl"), tail).unwrap();
+    let dir = copy.to_str().unwrap();
+    let out = cnd.cn(&["audit", "verify", "--dir", dir]);
+    assert_eq!(
+        out.status.code(),
+        Some(13),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("does not start at seq 1"));
+    cnd.ok(&["audit", "verify", "--dir", dir, "--from", "3"]);
+}
+
+#[test]
+fn labels_and_deny_reasons_are_redacted_and_imports_are_capped() {
+    let cnd = Cnd::start(&format!(
+        "{}\n[limits]\nmax_names_per_import = 2\n",
+        APPROVE_ALL.replace("use = \"auto\"", "use = \"slow\"")
+            + "\n[approvers.slow]\ntype = \"insecure-auto\"\ndelay = \"1h\"\n"
+    ));
+    const V: &str = "label-pasted-value-0123456789";
+    add(&cnd, "pasted", V, "--high-entropy");
+    let out = cnd.cn_env(
+        &["--json", "request", "pasted", "--reason", "x"],
+        b"",
+        &[("CLAUDE_CODE_SESSION_ID", V)],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let code = v["data"]["code"].as_str().unwrap().to_owned();
+    cnd.ok(&["deny", &code, "--reason", &format!("it was {V}")]);
+    let created = cnd.wait_for_record(|r| r["event"] == "request.create" && r["mode"] == "use");
+    assert_eq!(
+        created["session"]["labels"]["CLAUDE_CODE_SESSION_ID"],
+        "[countersign:pasted]"
+    );
+    let deny = cnd.wait_for_record(|r| r["event"] == "request.deny");
+    assert_eq!(deny["evidence"]["reason"], "it was [countersign:pasted]");
+    assert_eq!(deny["evidence"]["from"], "own_session");
+    let hits = files_containing(&cnd.path().join("state"), V.as_bytes());
+    assert!(hits.is_empty(), "{hits:?}");
+
+    // One approval adds at most max_names_per_import secrets.
+    let import_dir = cnd.path().join("many");
+    std::fs::create_dir(&import_dir).unwrap();
+    for n in ["one", "two", "three"] {
+        std::fs::write(
+            import_dir.join(format!(".secret-{n}")),
+            format!("value-{n}-0123456789"),
+        )
+        .unwrap();
+    }
+    let out = cnd.cn(&[
+        "import",
+        "--glob",
+        ".secret-*",
+        "--dir",
+        import_dir.to_str().unwrap(),
+        "--keep",
+        "--wait",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(9),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_reload_applies_the_audit_settings() {
+    let cnd = Cnd::start(APPROVE_ALL);
+    let checkpoints = || cnd.events().iter().filter(|e| *e == "checkpoint").count();
+    let config = std::fs::read_to_string(cnd.path().join("config.toml")).unwrap();
+    std::fs::write(
+        cnd.path().join("config.toml"),
+        format!("{config}\n[audit]\ncheckpoint_every_records = 2\n"),
+    )
+    .unwrap();
+    cnd.signal(rustix::process::Signal::HUP);
+    cnd.wait_for_record(|r| r["event"] == "config.load" && r["seq"].as_u64() > Some(4));
+    let before = checkpoints();
+    add(&cnd, "r1", "value-r1-0123456789", "--high-entropy");
+    add(&cnd, "r2", "value-r2-0123456789", "--high-entropy");
+    assert!(checkpoints() >= before + 2, "{:?}", cnd.events());
 }
