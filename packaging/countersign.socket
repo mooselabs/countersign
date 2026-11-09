@@ -1,0 +1,19 @@
+# countersign.socket: the socket cn talks to. Installed by packaging/install.sh.
+# The socket is the access gate: only members of countersign-users can connect,
+# and cnd checks each peer's uid again against [access] users in its config.
+[Unit]
+Description=countersign secret daemon socket
+Documentation=https://github.com/mooselabs/countersign
+
+[Socket]
+ListenStream=/run/countersign/cnd.sock
+SocketUser=countersign
+SocketGroup=countersign-users
+SocketMode=0660
+# /run/countersign itself stays root-owned 0755 (tmpfiles.d/countersign.conf),
+# so no non-root process can replace the socket.
+DirectoryMode=0755
+RemoveOnStop=no
+
+[Install]
+WantedBy=sockets.target

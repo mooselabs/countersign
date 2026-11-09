@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  countersign polkit actions. Installed as
+  /usr/share/polkit-1/actions/computer.mooselabs.countersign.policy.
+
+  Only cnd (user countersign, the action owner) may pass the details that fill
+  the messages. Each message starts with "countersign" and the request code and
+  digest, because polkit agents shorten long messages in the middle.
+
+  Never change allow_active to yes or to an *_keep value: polkit would then
+  approve later requests without asking. cnd checks this at start.
+-->
+<policyconfig>
+  <vendor>countersign</vendor>
+  <vendor_url>https://github.com/mooselabs/countersign</vendor_url>
+
+  <action id="computer.mooselabs.countersign.approve">
+    <description>Approve use of a secret by an agent session</description>
+    <message>countersign request $(code), digest $(digest): USE $(secrets) for $(ttl). $(session). Agent's reason: $(reason)</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.owner">unix-user:countersign</annotate>
+  </action>
+
+  <action id="computer.mooselabs.countersign.reveal">
+    <description>Reveal a secret value to an agent session</description>
+    <message>countersign request $(code), digest $(digest): REVEAL $(secrets) to the agent; the value enters its transcript permanently. $(session). Agent's reason: $(reason)</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.owner">unix-user:countersign</annotate>
+  </action>
+
+  <action id="computer.mooselabs.countersign.mutate">
+    <description>Change or export the countersign secret store</description>
+    <message>countersign request $(code), digest $(digest): $(operation). $(session).</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.owner">unix-user:countersign</annotate>
+  </action>
+</policyconfig>
