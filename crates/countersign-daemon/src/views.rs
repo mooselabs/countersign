@@ -245,17 +245,68 @@ pub fn hide_redactor(
         })
 }
 
-/// Agent-supplied text (a reason) with the session's hide set redacted,
-/// when `[audit] redact_agent_text` is on, so a value pasted into it reaches
-/// neither the dialog nor the audit log.
+/// Redacts client-supplied text with a session's hide set, when
+/// `[audit] redact_agent_text` is on, so a value pasted into it reaches
+/// neither a dialog nor the audit log. Built once for several texts.
+pub enum TextRedactor {
+    /// `redact_agent_text = false`.
+    Off,
+    /// The session's hide set.
+    On(Redactor),
+    /// The hide set could not be built: texts are withheld, not passed.
+    Failed,
+}
+
+impl TextRedactor {
+    /// For `session` (`""` for none: only `high_entropy` secrets match).
+    pub fn new(st: &State, rt: &Runtime, session: &str) -> Self {
+        if !rt.config.audit.redact_agent_text {
+            return Self::Off;
+        }
+        match hide_redactor(st, rt, session, &[]) {
+            Ok(r) => Self::On(r),
+            Err(_) => Self::Failed,
+        }
+    }
+
+    /// `text` with values replaced; `what` names it in the withheld text.
+    pub fn apply(&self, text: &str, what: &str) -> String {
+        if text.is_empty() {
+            return String::new();
+        }
+        match self {
+            Self::Off => text.to_owned(),
+            Self::On(r) => String::from_utf8_lossy(&r.redact(text.as_bytes()).0).into_owned(),
+            Self::Failed => format!("[{what} withheld: it could not be checked for secret values]"),
+        }
+    }
+}
+
+/// A request reason, redacted ([`TextRedactor`]).
 pub fn redact_text(st: &State, rt: &Runtime, session: &str, text: &str) -> String {
-    if !rt.config.audit.redact_agent_text || text.is_empty() {
-        return text.to_owned();
+    TextRedactor::new(st, rt, session).apply(text, "reason")
+}
+
+/// A session label, redacted ([`TextRedactor`]).
+pub fn redact_label(st: &State, rt: &Runtime, session: &str, text: &str) -> String {
+    TextRedactor::new(st, rt, session).apply(text, "label")
+}
+
+/// Every label value, redacted ([`TextRedactor`]).
+pub fn redact_labels(
+    st: &State,
+    rt: &Runtime,
+    session: &str,
+    labels: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    if labels.is_empty() {
+        return BTreeMap::new();
     }
-    match hide_redactor(st, rt, session, &[]) {
-        Ok(r) => String::from_utf8_lossy(&r.redact(text.as_bytes()).0).into_owned(),
-        Err(_) => "[reason withheld: it could not be checked for secret values]".into(),
-    }
+    let r = TextRedactor::new(st, rt, session);
+    labels
+        .iter()
+        .map(|(k, v)| (k.clone(), r.apply(v, "label")))
+        .collect()
 }
 
 /// `no_session`, for a request that needs an agent session.

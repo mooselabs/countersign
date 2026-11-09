@@ -5,8 +5,8 @@
 use std::time::{Duration, Instant};
 
 use countersign_proto::{
-    ApprovalKind, Driven, Mode, Request, RequestCode, RequestState, RequestView, Response,
-    Timestamp,
+    ApprovalKind, Driven, ErrorCode, Mode, Request, RequestCode, RequestState, RequestView,
+    Response, Timestamp,
 };
 use serde_json::{Value, json};
 
@@ -86,6 +86,8 @@ fn approve_command(view: &RequestView) -> String {
 fn approve_line(view: &RequestView) -> String {
     if view.approvers.iter().any(|a| a.driven == Driven::Client) {
         format!("the human runs:  {}", approve_command(view))
+    } else if view.queued {
+        "queued: its dialog opens when an earlier one is answered".into()
     } else if view.approvers.iter().any(|a| a.prompted) {
         "a desktop dialog is open".into()
     } else {
@@ -196,6 +198,23 @@ pub fn outcome(
     let data = request_data(view);
     match view.state {
         RequestState::Approved => Ok(Done::ok(data, approved(view))),
+        RequestState::Denied
+            if view.decision.as_ref().and_then(|d| d.error)
+                == Some(ErrorCode::ApproverUnavailable) =>
+        {
+            let why = view
+                .decision
+                .as_ref()
+                .and_then(|d| d.reason.as_deref())
+                .map(|r| format!(": {}", clean_line(r)))
+                .unwrap_or_default();
+            Err(CnError::new(
+                "approver_unavailable",
+                format!("request {code} could not be shown to the human{why}"),
+            )
+            .with_hint("cn doctor")
+            .with_detail(data))
+        }
         RequestState::Denied => {
             let reason = view
                 .decision

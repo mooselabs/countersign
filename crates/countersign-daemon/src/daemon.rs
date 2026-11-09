@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::os::unix::net::UnixListener as StdListener;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use countersign_core::audit::{AuditLog, Event, ListCoalescer, SessionRef};
 use countersign_core::grants::{Grants, Policy};
@@ -18,7 +18,8 @@ use countersign_core::time::{Clock, SystemClock};
 use countersign_proto::{ErrorBody, ErrorCode, LastUse, RequestState, Timestamp};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::Paths;
@@ -35,6 +36,12 @@ const TICK: Duration = Duration::from_secs(30);
 /// Worker threads. `cnd` serves one developer; two keep a slow `fsync`
 /// from stalling every other connection.
 const WORKERS: usize = 2;
+
+/// How long a stop waits for connections and approver tasks to end.
+const STOP_GRACE: Duration = Duration::from_secs(3);
+
+/// At most one `accept` error line per this long.
+const ACCEPT_LOG_EVERY: Duration = Duration::from_secs(10);
 
 /// Grant bookkeeping the core grant table does not keep.
 #[derive(Debug, Clone, Default)]
@@ -96,8 +103,19 @@ pub struct State {
     pub hide_streams: HashMap<String, VecDeque<SystemTime>>,
     /// `hide` bytes per session in the last minute.
     pub hide_bytes: HashMap<String, VecDeque<(SystemTime, u64)>>,
+    /// `list` calls per uid in the last minute.
+    pub uid_list_rate: HashMap<u32, VecDeque<SystemTime>>,
+    /// `hide` stream starts per uid in the last minute.
+    pub uid_hide_streams: HashMap<u32, VecDeque<SystemTime>>,
+    /// `hide` bytes per uid in the last minute.
+    pub uid_hide_bytes: HashMap<u32, VecDeque<(SystemTime, u64)>>,
+    /// Open connections per uid.
+    pub connections: HashMap<u32, usize>,
     /// The last time each secret's value was issued.
     pub last_use: HashMap<String, LastUse>,
+    /// Set when a stop began: a chain that decides now is not applied, so
+    /// nothing is audited after `daemon.stop` and the final checkpoint.
+    pub stopping: bool,
 }
 
 impl State {
@@ -127,10 +145,43 @@ impl State {
         }
     }
 
+    /// Appends records of one session all together, or none of them. A
+    /// failure is logged and returned as false.
+    pub fn record_all(&mut self, session: Option<&SessionRef>, events: &[Event]) -> bool {
+        match self.audit.append_all(session, events) {
+            Ok(_) => true,
+            Err(e) => {
+                error!("audit write failed: {e}");
+                false
+            }
+        }
+    }
+
     /// Whether a session is live.
     pub fn alive(&self, id: &str) -> bool {
         self.sessions.contains_key(id)
     }
+}
+
+/// Drops entries older than a minute.
+pub fn prune(q: &mut VecDeque<SystemTime>, now: SystemTime) {
+    while q
+        .front()
+        .is_some_and(|t| now.duration_since(*t).unwrap_or_default().as_secs() >= 60)
+    {
+        q.pop_front();
+    }
+}
+
+/// Drops byte counts older than a minute and returns the sum of the rest.
+pub fn prune_bytes(q: &mut VecDeque<(SystemTime, u64)>, now: SystemTime) -> u64 {
+    while q
+        .front()
+        .is_some_and(|(t, _)| now.duration_since(*t).unwrap_or_default().as_secs() >= 60)
+    {
+        q.pop_front();
+    }
+    q.iter().map(|(_, b)| b).sum()
 }
 
 /// An error body with no detail.
@@ -169,6 +220,12 @@ pub struct Daemon {
     pub shutdown: CancellationToken,
     /// Anchor liveness.
     pub watcher: Watcher,
+    /// Dialog slots per uid (`[limits] max_prompts_per_uid`). Requests
+    /// beyond them wait in order.
+    prompts: Mutex<HashMap<u32, Arc<Semaphore>>>,
+    /// The approver chains running, so a stop can wait for them to
+    /// withdraw their dialogs.
+    approvals: Mutex<JoinSet<()>>,
 }
 
 impl Daemon {
@@ -190,18 +247,48 @@ impl Daemon {
         self.clock.now()
     }
 
-    /// Records a newly seen session and starts watching its anchor. Returns
-    /// false when the anchor has already exited.
+    /// Runs an approver chain, kept track of for the stop.
+    pub fn spawn_approval(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        let mut set = self
+            .approvals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while set.try_join_next().is_some() {}
+        set.spawn(task);
+    }
+
+    /// The dialog slots of a uid.
+    pub fn prompt_slots(&self, uid: u32, rt: &Runtime) -> Arc<Semaphore> {
+        let mut map = self.prompts.lock().unwrap_or_else(PoisonError::into_inner);
+        map.entry(uid)
+            .or_insert_with(|| Arc::new(Semaphore::new(rt.config.limits.max_prompts_per_uid)))
+            .clone()
+    }
+
+    /// Records a newly seen session and starts watching its anchor.
+    /// `session_dead` when the anchor has already exited, `rate_limited`
+    /// when the uid already has `max_sessions_per_uid` live sessions.
     pub fn ensure_session(
         self: &Arc<Self>,
         session: &Session,
         uid: u32,
         labels: &BTreeMap<String, String>,
-    ) -> bool {
+    ) -> Result<(), ErrorBody> {
+        let dead = || err(ErrorCode::SessionDead, "the session's anchor has exited");
         {
+            let rt = self.rt();
             let mut st = self.lock();
             if st.sessions.contains_key(&session.id) {
-                return true;
+                return Ok(());
+            }
+            let live = st.sessions.values().filter(|e| e.uid == uid).count();
+            if live >= rt.config.limits.max_sessions_per_uid {
+                return Err(err(
+                    ErrorCode::RateLimited,
+                    format!(
+                        "uid {uid} already has {live} live sessions ([limits] max_sessions_per_uid)"
+                    ),
+                ));
             }
             let started_at = self.proc.started_at(session.anchor.start_time).map_or_else(
                 || Timestamp::from_system_time(self.now()),
@@ -227,7 +314,7 @@ impl Daemon {
         let anchor = session.anchor.clone();
         let Ok(fd) = sys::open_pidfd(anchor.pid) else {
             self.end_session(&session.id);
-            return false;
+            return Err(dead());
         };
         // The pid may have been reused before the pidfd was opened.
         let same = self
@@ -236,14 +323,14 @@ impl Daemon {
             .is_ok_and(|p| p.start_time == anchor.start_time);
         if !same || sys::pidfd_exited(&fd) {
             self.end_session(&session.id);
-            return false;
+            return Err(dead());
         }
         if let Err(e) = self.watcher.watch(fd, session.id.clone()) {
             error!("watching anchor {}: {e}", anchor.pid);
             self.end_session(&session.id);
-            return false;
+            return Err(dead());
         }
-        true
+        Ok(())
     }
 
     /// The session's anchor exited: its pending requests expire, its grants
@@ -327,6 +414,9 @@ impl Daemon {
             let sref = st.list_refs.get(&sid).cloned();
             st.record(sref.as_ref(), &rec.event());
         }
+        if let Some(e) = st.audit.take_checkpoint_error() {
+            error!("audit checkpoint failed: {e}");
+        }
         if let Err(e) = st.audit.maybe_checkpoint() {
             error!("audit checkpoint failed: {e}");
         }
@@ -337,6 +427,11 @@ impl Daemon {
         st.list_rate.retain(|_, q| q.back().is_some_and(fresh));
         st.hide_streams.retain(|_, q| q.back().is_some_and(fresh));
         st.hide_bytes
+            .retain(|_, q| q.back().is_some_and(|(t, _)| fresh(t)));
+        st.uid_list_rate.retain(|_, q| q.back().is_some_and(fresh));
+        st.uid_hide_streams
+            .retain(|_, q| q.back().is_some_and(fresh));
+        st.uid_hide_bytes
             .retain(|_, q| q.back().is_some_and(|(t, _)| fresh(t)));
         drop(st);
         if changed {
@@ -366,8 +461,24 @@ impl Daemon {
             .and_then(|rt| setup::check_own_uid(&self.paths, Some(&rt.uids)).map(|()| rt))
         {
             Ok(rt) => {
+                let old = self.rt();
+                if setup::audit_dir(&old.config, &self.paths.state_dir)
+                    != setup::audit_dir(&rt.config, &self.paths.state_dir)
+                {
+                    warning!("[audit] dir changed; it takes effect at the next start");
+                }
                 let mut st = self.lock();
                 st.grants.set_policy(Policy::from_config(&rt.config));
+                let a = &rt.config.audit;
+                st.audit
+                    .set_checkpoint_policy(a.checkpoint_every_records, a.checkpoint_interval);
+                st.lists.set_window(a.list_coalesce);
+                // New dialog slots for the new limit; requests already
+                // waiting keep their place in the old ones.
+                self.prompts
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clear();
                 st.record(
                     None,
                     &Event::ConfigLoad {
@@ -393,6 +504,20 @@ impl Daemon {
         for (sid, rec) in st.lists.flush(far) {
             let sref = st.list_refs.get(&sid).cloned();
             st.record(sref.as_ref(), &rec.event());
+        }
+        let runs: Vec<(String, RunEntry)> = st.runs.drain().collect();
+        for (run_id, run) in runs {
+            st.record(
+                Some(&run.session),
+                &Event::UseEnd {
+                    run_id,
+                    status: "client_lost".into(),
+                    exit: None,
+                    signal: None,
+                    duration_ms: 0,
+                    hits: BTreeMap::new(),
+                },
+            );
         }
         let ids: Vec<String> = st.sessions.keys().cloned().collect();
         for sid in ids {
@@ -471,7 +596,12 @@ pub fn serve(paths: Paths) -> Result<(), String> {
         list_rate: HashMap::new(),
         hide_streams: HashMap::new(),
         hide_bytes: HashMap::new(),
+        uid_list_rate: HashMap::new(),
+        uid_hide_streams: HashMap::new(),
+        uid_hide_bytes: HashMap::new(),
+        connections: HashMap::new(),
         last_use: HashMap::new(),
+        stopping: false,
     };
     let daemon = Arc::new(Daemon {
         rt: RwLock::new(Arc::new(rt)),
@@ -485,13 +615,19 @@ pub fn serve(paths: Paths) -> Result<(), String> {
         paths,
         shutdown: CancellationToken::new(),
         watcher: Watcher::new().map_err(|e| format!("epoll: {e}"))?,
+        prompts: Mutex::new(HashMap::new()),
+        approvals: Mutex::new(JoinSet::new()),
     });
     let watching = daemon.clone();
     std::thread::Builder::new()
         .name("anchors".into())
         .spawn(move || watching.watcher.run(|id| watching.end_session(id)))
         .map_err(|e| format!("anchor watcher thread: {e}"))?;
-    runtime.block_on(run(daemon, listener))
+    let result = runtime.block_on(run(daemon, listener));
+    // Tasks still running were given STOP_GRACE in `run`; do not wait on
+    // them again.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
 }
 
 /// The socket systemd passed, or in test builds the `--socket` path.
@@ -562,26 +698,77 @@ async fn run(d: Arc<Daemon>, listener: StdListener) -> Result<(), String> {
     let signals = tokio::spawn(signal_loop(d.clone()));
     let _ = sys::notify("READY=1\nSTATUS=serving");
 
+    let mut conns = JoinSet::new();
+    let mut accept_log = AcceptLog::default();
     loop {
         tokio::select! {
             () = d.shutdown.cancelled() => break,
+            Some(_) = conns.join_next(), if !conns.is_empty() => {}
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    tokio::spawn(crate::conn::handle(d.clone(), stream));
+                    conns.spawn(crate::conn::handle(d.clone(), stream));
                 }
                 Err(e) => {
-                    warning!("accept: {e}");
+                    accept_log.failed(&e);
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             },
         }
     }
     let _ = sys::notify("STOPPING=1");
+    d.lock().stopping = true;
+    // Connections see the shutdown and end (a waiting get_request answers,
+    // a run in progress is recorded as client_lost); a stuck one is
+    // aborted. Either way none runs once daemon.stop is written.
+    let _ = tokio::time::timeout(STOP_GRACE, async {
+        while conns.join_next().await.is_some() {}
+    })
+    .await;
+    conns.abort_all();
+    while conns.join_next().await.is_some() {}
+    // Withdraw the dialogs of pending requests.
+    for rec in d.lock().requests.values() {
+        rec.cancel.cancel();
+    }
+    let mut approvals =
+        std::mem::take(&mut *d.approvals.lock().unwrap_or_else(PoisonError::into_inner));
+    let _ = tokio::time::timeout(STOP_GRACE, async {
+        while approvals.join_next().await.is_some() {}
+    })
+    .await;
+    approvals.abort_all();
     d.stop("signal");
     timers.abort();
     signals.abort();
     info!("cnd stopped");
     Ok(())
+}
+
+/// `accept` failures (EMFILE under a connection flood) are logged at most
+/// once per [`ACCEPT_LOG_EVERY`], with a count of the ones left out.
+#[derive(Default)]
+struct AcceptLog {
+    last: Option<Instant>,
+    quiet: u64,
+}
+
+impl AcceptLog {
+    fn failed(&mut self, e: &std::io::Error) {
+        if self.last.is_some_and(|t| t.elapsed() < ACCEPT_LOG_EVERY) {
+            self.quiet += 1;
+            return;
+        }
+        if self.quiet > 0 {
+            warning!(
+                "accept: {e} (and {} more since the last report)",
+                self.quiet
+            );
+        } else {
+            warning!("accept: {e}");
+        }
+        self.last = Some(Instant::now());
+        self.quiet = 0;
+    }
 }
 
 async fn timer_loop(d: Arc<Daemon>) {
@@ -613,4 +800,23 @@ async fn signal_loop(d: Arc<Daemon>) {
         }
     }
     d.shutdown.cancel();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accept_errors_are_logged_at_most_once_per_window() {
+        let mut log = AcceptLog::default();
+        let e = std::io::Error::from_raw_os_error(24);
+        log.failed(&e);
+        for _ in 0..500 {
+            log.failed(&e);
+        }
+        assert_eq!(log.quiet, 500);
+        log.last = Some(Instant::now() - ACCEPT_LOG_EVERY);
+        log.failed(&e);
+        assert_eq!(log.quiet, 0);
+    }
 }

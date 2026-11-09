@@ -14,9 +14,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
+use countersign_approve::display::{clean_limited, clean_quoted};
 use countersign_approve::{
-    ApprovalRequest, ChainReport, Decision as ChainDecision, DisplayInput, DisplayView, Evidence,
-    Outcome, SessionRef as ApproveSession,
+    ApprovalRequest, ApproverError, ChainReport, Decision as ChainDecision, DisplayInput,
+    DisplayView, Evidence, Found, Outcome, SessionRef as ApproveSession,
 };
 use countersign_core::audit::{Event, SessionRef};
 use countersign_core::config::{Chain, CrossProject};
@@ -30,6 +31,7 @@ use countersign_proto::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::conn::Denier;
 use crate::daemon::{Daemon, GrantInfo, State, err, internal};
 use crate::log::error;
 use crate::setup::Runtime;
@@ -172,6 +174,122 @@ fn names_text(names: &[String], limit: usize) -> String {
     s
 }
 
+/// Longest quoted short field (description, one usage side) in a dialog.
+const FIELD_LIMIT: usize = 60;
+/// Longest new usage text shown when a usage is long.
+const USAGE_LIMIT: usize = 120;
+/// List items (projects, tags) shown before "and N more".
+const ITEMS_SHOWN: usize = 5;
+
+/// `[~/a, ~/b]`, each item cleaned and bounded.
+fn items_text(items: &[String]) -> String {
+    let mut shown: Vec<String> = items
+        .iter()
+        .take(ITEMS_SHOWN)
+        .map(|i| clean_limited(i, FIELD_LIMIT))
+        .collect();
+    if items.len() > ITEMS_SHOWN {
+        shown.push(format!("and {} more", items.len() - ITEMS_SHOWN));
+    }
+    format!("[{}]", shown.join(", "))
+}
+
+fn entropy_word(on: bool) -> &'static str {
+    if on {
+        "on (cn hide matches it without a grant)"
+    } else {
+        "off (cn hide matches it only when granted)"
+    }
+}
+
+/// The dialog text for `cn add`: what `cnd` knows (the value's size class
+/// and source) first, then the metadata the client sent.
+fn add_text(meta: &SecretMeta, len: usize, source: Option<ValueSource>) -> String {
+    let mut parts = vec![format!(
+        "description {}",
+        if meta.description.is_empty() {
+            "none".to_owned()
+        } else {
+            clean_quoted(&meta.description, FIELD_LIMIT)
+        }
+    )];
+    if !meta.usage.is_empty() {
+        parts.push(format!("usage {}", clean_quoted(&meta.usage, USAGE_LIMIT)));
+    }
+    parts.push(format!(
+        "projects {}",
+        if meta.projects.is_empty() {
+            "any".to_owned()
+        } else {
+            items_text(&meta.projects)
+        }
+    ));
+    if !meta.tags.is_empty() {
+        parts.push(format!("tags {}", items_text(&meta.tags)));
+    }
+    format!(
+        "ADD secret {} (value {}, {}{}): {}",
+        meta.name,
+        length_class(len),
+        source_word(source),
+        if meta.high_entropy {
+            ", high entropy"
+        } else {
+            ""
+        },
+        parts.join("; ")
+    )
+}
+
+/// The dialog text for `cn edit`: each changed field, old -> new.
+fn edit_text(cur: &SecretMeta, new: &SecretMeta) -> String {
+    let mut parts = Vec::new();
+    if cur.description != new.description {
+        parts.push(format!(
+            "description {} -> {}",
+            clean_quoted(&cur.description, FIELD_LIMIT),
+            clean_quoted(&new.description, FIELD_LIMIT)
+        ));
+    }
+    if cur.usage != new.usage {
+        let short = |u: &str| u.chars().count() <= FIELD_LIMIT;
+        if short(&cur.usage) && short(&new.usage) {
+            parts.push(format!(
+                "usage {} -> {}",
+                clean_quoted(&cur.usage, FIELD_LIMIT),
+                clean_quoted(&new.usage, FIELD_LIMIT)
+            ));
+        } else {
+            parts.push(format!(
+                "usage becomes {}",
+                clean_quoted(&new.usage, USAGE_LIMIT)
+            ));
+        }
+    }
+    if cur.projects != new.projects {
+        parts.push(format!(
+            "projects {} -> {}",
+            items_text(&cur.projects),
+            items_text(&new.projects)
+        ));
+    }
+    if cur.tags != new.tags {
+        parts.push(format!(
+            "tags {} -> {}",
+            items_text(&cur.tags),
+            items_text(&new.tags)
+        ));
+    }
+    if cur.high_entropy != new.high_entropy {
+        parts.push(format!("high entropy {}", entropy_word(new.high_entropy)));
+    }
+    if parts.is_empty() {
+        format!("EDIT {}: no field changes", new.name)
+    } else {
+        format!("EDIT {}: {}", new.name, parts.join("; "))
+    }
+}
+
 impl State {
     /// Moves a pending request's record to `state`, withdraws its approvers
     /// and, for an expiry, writes `request.expire`. The caller writes the
@@ -186,6 +304,7 @@ impl State {
         rec.cancel.cancel();
         rec.decided_at = Some(SystemTime::now());
         rec.view.state = state;
+        rec.view.queued = false;
         for a in &mut rec.view.approvers {
             a.prompted = false;
         }
@@ -195,6 +314,7 @@ impl State {
             reason: None,
             grant: None,
             grants_revoked: 0,
+            error: None,
         }));
         if state == RequestState::Expired {
             let sref = rec.session.clone();
@@ -214,6 +334,7 @@ impl State {
             reason,
             grant: None,
             grants_revoked: 0,
+            error: None,
         }
     }
 
@@ -323,6 +444,7 @@ impl State {
                     reason: None,
                     grant: Some(view),
                     grants_revoked: 0,
+                    error: None,
                 };
                 self.close_request(id, RequestState::Approved, Some(d));
             }
@@ -343,22 +465,23 @@ impl State {
                         return;
                     }
                 };
-                let mut written = changes
-                    .iter()
-                    .all(|c| self.record(Some(&sref), &Event::store(c, id)));
-                if written && import {
-                    written = self.record(
-                        Some(&sref),
-                        &Event::Import {
-                            request_id: id.to_owned(),
-                            count: changes.len() as u64,
-                        },
-                    );
+                // One write for every record of the change: all of them are
+                // in the log, or none and the store change is undone.
+                let mut events: Vec<Event> = changes.iter().map(|c| Event::store(c, id)).collect();
+                if import {
+                    events.push(Event::Import {
+                        request_id: id.to_owned(),
+                        count: changes.len() as u64,
+                    });
                 }
-                if !written {
-                    // audit.md, "Writes": the store change is undone.
+                if !self.record_all(Some(&sref), &events) {
+                    // audit.md, "Writes": the store change is undone. If that
+                    // fails the store refuses further changes until a restart.
                     if let Err(e) = self.store.rollback() {
-                        error!("request {id}: rolling back the store failed: {e}");
+                        error!(
+                            "request {id}: rolling back the store failed; store changes are \
+                             refused until cnd restarts: {e}"
+                        );
                     }
                     self.close_request(id, RequestState::Denied, Some(unrecorded()));
                     return;
@@ -385,6 +508,7 @@ impl State {
                     reason: None,
                     grant: None,
                     grants_revoked: revoked,
+                    error: None,
                 };
                 self.close_request(id, RequestState::Approved, Some(d));
             }
@@ -551,22 +675,7 @@ impl Daemon {
                 source,
             } => {
                 let value = decode(&value)?;
-                let shown = format!(
-                    "ADD secret {}: {} (value {}, {}{})",
-                    meta.name,
-                    if meta.description.is_empty() {
-                        "no description"
-                    } else {
-                        &meta.description
-                    },
-                    length_class(value.len()),
-                    source_word(source),
-                    if meta.high_entropy {
-                        ", high entropy"
-                    } else {
-                        ""
-                    }
-                );
+                let shown = add_text(&meta, value.len(), source);
                 let op = format!("add {}", meta.name);
                 (vec![Mutation::Add { meta, value }], op, shown, false)
             }
@@ -585,20 +694,11 @@ impl Daemon {
                 (vec![Mutation::Set { name, value }], op, shown, false)
             }
             Change::Edit { meta } => {
-                let fields = st
-                    .store
-                    .get(&meta.name)
-                    .map(|cur| countersign_core::store::meta_diff(&cur.meta, &meta))
-                    .unwrap_or_default();
-                let shown = format!(
-                    "EDIT {}: {}",
-                    meta.name,
-                    if fields.is_empty() {
-                        "no field changes".to_owned()
-                    } else {
-                        format!("changes {}", fields.join(", "))
-                    }
-                );
+                let shown = match st.store.get(&meta.name) {
+                    Some(cur) => edit_text(&cur.meta, &meta),
+                    // check_all below refuses it.
+                    None => format!("EDIT {}", meta.name),
+                };
                 let op = format!("edit {}", meta.name);
                 (vec![Mutation::Edit { meta }], op, shown, false)
             }
@@ -619,6 +719,16 @@ impl Daemon {
                 (ms, op, shown, false)
             }
             Change::Import { items } => {
+                let max = rt.config.limits.max_names_per_import.max(1);
+                if items.is_empty() || items.len() > max {
+                    return Err(err(
+                        ErrorCode::LimitExceeded,
+                        format!(
+                            "an import names 1 to {max} secrets ([limits] max_names_per_import); \
+                             import the rest in another request"
+                        ),
+                    ));
+                }
                 let names: Vec<String> = items.iter().map(|i| i.meta.name.clone()).collect();
                 let shown = format!("IMPORT {} secrets: {}", names.len(), names_text(&names, 10));
                 let op = format!("import {}", names.join(" "));
@@ -671,7 +781,13 @@ impl Daemon {
             AnchorKind::Registered { label } => label.clone(),
             _ => a.labels.values().next().cloned(),
         };
+        let found = match &a.session.kind {
+            AnchorKind::Registered { .. } => Found::Registered,
+            AnchorKind::Matched { matcher } => Found::Matched(matcher.clone()),
+            AnchorKind::Human => Found::Terminal,
+        };
         DisplayView::new(&DisplayInput {
+            found,
             anchor_comm: a.session.anchor.comm.clone(),
             anchor_pid: a.session.anchor.pid,
             label,
@@ -701,13 +817,25 @@ impl Daemon {
         };
         let digest = Digest::of(&bytes);
         let chain: Chain = rt.config.chain(prepared.kind).clone();
+        // At most max_prompts_per_uid dialogs at once for a uid; this one
+        // waits its turn if they are taken.
+        let slots = self.prompt_slots(a.uid, rt);
+        let permit = slots.clone().try_acquire_owned().ok();
+        let queued = permit.is_none();
+        let mut approvers = views::approver_views(rt, &chain);
+        if queued {
+            for v in &mut approvers {
+                v.prompted = false;
+            }
+        }
         let view = RequestView {
             request: canon.clone(),
             state: RequestState::Pending,
             digest: digest.hex(),
             digest_short: digest.short(),
-            approvers: views::approver_views(rt, &chain),
+            approvers,
             decision: None,
+            queued,
         };
         let sref = a.session.audit_ref(a.labels);
         let created = Event::RequestCreate {
@@ -757,17 +885,55 @@ impl Daemon {
         self.wake.notify_one();
         let d = self.clone();
         let rt = rt.clone();
-        tokio::spawn(async move {
+        self.spawn_approval(async move {
+            let _permit = match permit {
+                Some(p) => p,
+                None => {
+                    let p = tokio::select! {
+                        p = slots.acquire_owned() => p,
+                        // Expiry, cn deny or the anchor's exit closed it.
+                        () = cancel.cancelled() => return,
+                    };
+                    let Ok(p) = p else { return };
+                    if !d.dequeue(areq.request_id(), &rt, &chain) {
+                        return;
+                    }
+                    p
+                }
+            };
             let report = countersign_approve::evaluate(&chain, &rt.registry, &areq, &cancel).await;
             d.finish(areq.request_id(), &report);
         });
         Ok(Response::RequestCreated(view))
     }
 
+    /// A queued request got a dialog slot: its view shows the dialog open.
+    /// False if it is no longer pending.
+    fn dequeue(&self, id: &str, rt: &Runtime, chain: &Chain) -> bool {
+        let mut st = self.lock();
+        if st.stopping {
+            return false;
+        }
+        let Some(rec) = st.requests.get_mut(id) else {
+            return false;
+        };
+        if rec.view.state != RequestState::Pending {
+            return false;
+        }
+        rec.view.queued = false;
+        rec.view.approvers = views::approver_views(rt, chain);
+        drop(st);
+        self.decided.notify_waiters();
+        true
+    }
+
     /// Applies a chain's result to its request.
     fn finish(&self, id: &str, report: &ChainReport) {
         let mut guard = self.lock();
         let st = &mut *guard;
+        if st.stopping {
+            return;
+        }
         let Some(rec) = st.requests.get(id) else {
             return;
         };
@@ -816,7 +982,12 @@ impl Daemon {
                         evidence: serde_json::json!({ "error": e.to_string() }),
                     },
                 );
-                let d = State::deny_decision(vec!["cnd".into()], Some(e.to_string()));
+                let mut d = State::deny_decision(vec!["cnd".into()], Some(e.to_string()));
+                // No approver could run: the client says so (exit 14, see
+                // cn doctor), not that a human denied.
+                if matches!(e, ApproverError::Unavailable(_)) {
+                    d.error = Some(ErrorCode::ApproverUnavailable);
+                }
                 st.close_request(id, RequestState::Denied, Some(d));
             }
         }
@@ -845,8 +1016,10 @@ impl Daemon {
                     .get(&code)
                     .and_then(|id| st.requests.get(id))
                     .ok_or_else(|| err(ErrorCode::RequestNotFound, "no request with that code"))?;
+                // On shutdown, answer now with what is known.
                 if rec.view.state != RequestState::Pending
                     || tokio::time::Instant::now() >= deadline
+                    || self.shutdown.is_cancelled()
                 {
                     return Ok(Response::RequestStatus(rec.view.clone()));
                 }
@@ -859,11 +1032,19 @@ impl Daemon {
         }
     }
 
-    /// `cn deny`: anyone allowed on the socket may refuse a request.
-    pub fn deny(&self, code: &str, reason: Option<String>) -> Result<Response, ErrorBody> {
+    /// `cn deny`: anyone allowed on the socket may refuse a request. The
+    /// audit record says who: the peer's uid, pid and comm, and whether it
+    /// came from the request's own session, another session or a terminal.
+    pub fn deny(
+        &self,
+        code: &str,
+        reason: Option<String>,
+        who: &Denier,
+    ) -> Result<Response, ErrorBody> {
         let code = normal_code(code)?;
         let reason =
             reason.map(|r| views::truncate_utf8(&r, countersign_core::grants::MAX_REASON_BYTES));
+        let rt = self.rt();
         let mut st = self.lock();
         let id = st
             .codes
@@ -883,6 +1064,15 @@ impl Daemon {
                 ));
             }
         }
+        // The reason is free text: values of the request's session are
+        // redacted from it like from a request reason.
+        let reason = reason.map(|r| views::redact_text(&st, &rt, &rec.session.id, &r));
+        let from = match &who.session {
+            Some(s) if s.id == rec.session.id => "own_session",
+            Some(s) if s.is_human() => "terminal",
+            Some(_) => "other_session",
+            None => "no_session",
+        };
         if st.grants.deny(&id).is_err() {
             let _ = st.grants.expire(&id);
             st.close_request(&id, RequestState::Expired, None);
@@ -898,7 +1088,12 @@ impl Daemon {
                 approver: "client".into(),
                 credential_id: None,
                 grant_ids: Vec::new(),
-                evidence: serde_json::json!({ "reason": reason }),
+                evidence: serde_json::json!({
+                    "reason": reason,
+                    "peer": { "uid": who.uid, "pid": who.pid, "comm": who.comm },
+                    "from": from,
+                    "session": who.session.as_ref().map(|s| s.id.clone()),
+                }),
             },
         );
         let d = State::deny_decision(vec!["client".into()], reason);
@@ -931,6 +1126,72 @@ mod tests {
         assert_eq!(length_class(8), "under 16 bytes");
         assert_eq!(length_class(40), "16 to 63 bytes");
         assert_eq!(length_class(5000), "1 KiB or more");
+    }
+
+    fn meta(name: &str) -> SecretMeta {
+        SecretMeta {
+            name: name.into(),
+            ..SecretMeta::default()
+        }
+    }
+
+    #[test]
+    fn add_shows_what_cnd_knows_first_then_the_metadata() {
+        let mut m = meta("db");
+        m.description = format!("{}\x1b[31m", "d".repeat(400));
+        m.usage = "psql with it".into();
+        m.projects = vec!["~/p/a".into()];
+        m.high_entropy = true;
+        let t = add_text(&m, 40, Some(ValueSource::Stdin));
+        assert!(
+            t.starts_with(
+                "ADD secret db (value 16 to 63 bytes, from stdin, high entropy): description \""
+            ),
+            "{t}"
+        );
+        assert!(t.contains("(cut from 400 characters)"), "{t}");
+        assert!(
+            t.ends_with("; usage \"psql with it\"; projects [~/p/a]"),
+            "{t}"
+        );
+        assert!(!t.contains('\x1b'));
+        let t = add_text(&meta("x"), 3, None);
+        assert_eq!(
+            t,
+            "ADD secret x (value under 16 bytes, source not given): description none; projects any"
+        );
+    }
+
+    #[test]
+    fn edit_shows_each_changed_field_old_and_new() {
+        let mut old = meta("db");
+        old.description = "prod".into();
+        old.usage = "read only".into();
+        old.tags = vec!["a".into()];
+        let mut new = old.clone();
+        assert_eq!(edit_text(&old, &new), "EDIT db: no field changes");
+        new.description = "prod\nprimary".into();
+        new.usage = "write too".into();
+        new.projects = vec!["~/x".into()];
+        new.tags = vec![];
+        new.high_entropy = true;
+        assert_eq!(
+            edit_text(&old, &new),
+            "EDIT db: description \"prod\" -> \"prod primary\"; usage \"read only\" -> \
+             \"write too\"; projects [] -> [~/x]; tags [a] -> []; high entropy on (cn hide \
+             matches it without a grant)"
+        );
+        // A long usage shows its new text, cut with a marker.
+        new = old.clone();
+        new.usage = "u".repeat(500);
+        let t = edit_text(&old, &new);
+        assert!(t.starts_with("EDIT db: usage becomes \"uuu"), "{t}");
+        assert!(t.ends_with("(cut from 500 characters)"), "{t}");
+        // Turning high entropy off is shown too: hide stops matching it.
+        old.high_entropy = true;
+        new = old.clone();
+        new.high_entropy = false;
+        assert!(edit_text(&old, &new).contains("high entropy off"));
     }
 
     #[test]

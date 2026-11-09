@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 use countersign_approve::polkit::{Bus, PolkitApprover};
 use countersign_approve::{
     ApprovalRequest, ApproverError, CancellationToken, DaemonApprover, DisplayInput, DisplayView,
-    Outcome, SessionRef,
+    Found, Outcome, SessionRef,
 };
 use countersign_core::config::{OnDismiss, PolkitConfig, PolkitSubject as SubjectMode};
 use countersign_proto::{APPROVE_DOMAIN, Anchor, ApprovalKind, CanonicalRequest};
@@ -291,6 +291,7 @@ fn session() -> SessionRef {
 
 fn use_request(expires_in: Duration) -> ApprovalRequest {
     let display = DisplayView::new(&DisplayInput {
+        found: Found::Registered,
         anchor_comm: "claude".into(),
         anchor_pid: 41210,
         label: None,
@@ -392,7 +393,10 @@ async fn details_map_is_exact() {
         ("digest", req.digest_short()),
         ("secrets", "clickhouse-password, github-token"),
         ("ttl", "30m"),
-        ("session", "agent claude (pid 41210) in ~/projects/x"),
+        (
+            "session",
+            "agent claude (pid 41210, registered by cn session exec); agent-reported: cwd ~/projects/x",
+        ),
         ("reason", "row counts for the cost report"),
         ("operation", "none"),
     ]
@@ -404,7 +408,10 @@ async fn details_map_is_exact() {
         ("digest", mutate.digest_short()),
         ("secrets", "none"),
         ("ttl", "none"),
-        ("session", "agent claude (pid 41210)"),
+        (
+            "session",
+            "agent claude (pid 41210, registered by cn session exec)",
+        ),
         ("reason", "none"),
         (
             "operation",

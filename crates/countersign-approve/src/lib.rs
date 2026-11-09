@@ -34,7 +34,7 @@ pub mod polkit;
 mod request;
 
 pub use chain::{ChainReport, Decision, MemberResult, Registry, evaluate};
-pub use display::{DisplayInput, DisplayView};
+pub use display::{DisplayInput, DisplayView, Found};
 pub use request::{ApprovalRequest, SessionRef};
 
 /// A boxed, `Send` future, as returned by [`DaemonApprover::present`].
