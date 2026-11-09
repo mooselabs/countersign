@@ -15,6 +15,18 @@ aho-corasick = "1.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+argon2 = "0.5"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+ed25519-dalek = "2"
+getrandom = "0.3"
+hkdf = "0.12"
+humantime = "2"
+regex = "1"
+sha2 = "0.10"
+tempfile = "3"
+toml = "0.9"
+zeroize = "1"
 
 countersign-proto = { path = "crates/countersign-proto" }
 countersign-core = { path = "crates/countersign-core" }
