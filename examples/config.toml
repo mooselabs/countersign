@@ -12,6 +12,11 @@
 #
 # Durations: "90s", "30m", "1h", "1h30m", "8h".
 # See docs/design.md, docs/approvers.md and docs/cli.md.
+#
+# This is the Phase 1 configuration: every approval goes through the polkit
+# dialog. The fido2 and command approvers, and FIDO2 store unlock, are
+# Phase 2; a config that names them is refused. Every key is optional; the
+# values shown are the defaults unless a comment says otherwise.
 
 # ---------------------------------------------------------------------------
 # Who may connect to /run/countersign/cnd.sock
@@ -27,23 +32,17 @@ allow_root_clients = false
 # Store unseal
 # ---------------------------------------------------------------------------
 [unlock]
-# Key slots that may unseal the master key; any one is enough.
-#   "systemd-creds"  sealed with systemd-creds (TPM2 when present, else the
-#                    host key); unsealed at start with no interaction. Default.
-#   "fido2"          wrapped with the YubiKey's hmac-secret; cnd starts sealed
-#                    and every request returns store_sealed until a human
-#                    runs `/usr/bin/cn unlock`.
-#   "recovery"       Argon2id of a recovery phrase printed once at `cnd init`.
-# With systemd-creds only, a backup that also holds
-# /var/lib/systemd/credential.secret (host-key sealing) can open the store.
-slots = ["systemd-creds"]
-# slots = ["fido2"]                    # unlock with a touch after each boot
-
-# Who talks to the key for `cn unlock`:
-#   "client"  cn does, and passes the hmac-secret output to cnd (default).
-#   "daemon"  cnd does, so the output never enters your uid. Needs the udev
-#             rule and PrivateDevices=no in the unit (docs/design.md).
-fido2_side = "client"
+# Key slots that wrap the store's data key; any one is enough.
+#   "systemd-creds"  the master key sealed with systemd-creds (TPM2 when
+#                    present, else the host key); unsealed at start with no
+#                    interaction. Required in Phase 1.
+#   "recovery"       Argon2id of the recovery phrase printed once by
+#                    `cnd init`; used by `cnd recover` after the machine key
+#                    is lost or replaced.
+# A "fido2" slot (unlock with a YubiKey touch) is Phase 2.
+# With host-key sealing, a backup that also holds
+# /var/lib/systemd/credential.secret can open the store.
+slots = ["systemd-creds", "recovery"]
 
 # ---------------------------------------------------------------------------
 # Sessions: how cnd finds the agent process a grant belongs to
@@ -101,17 +100,17 @@ cross_project = "flag"
 #           unavailable members are skipped. An any_of is only as strong as
 #           its weakest member.
 [approval]
-# Frequent: one YubiKey touch on the GNOME polkit dialog (pam_u2f).
+# Each kind has its own polkit action, so the dialog says what is asked.
+# What the dialog asks for (password, key touch, or both) is chosen at
+# install time in the polkit PAM stack (install.sh --factor).
 use    = "polkit"
-# Rare and permanent: the polkit dialog shows the true request, and the FIDO2
-# assertion adds a signature over the request digest to the audit log.
-reveal = { all_of = ["polkit", "desk-key"] }
-mutate = { all_of = ["polkit", "desk-key"] }
-export = { all_of = ["polkit", "desk-key"] }
+reveal = "polkit"
+mutate = "polkit"
+export = "polkit"
 
-# For ssh sessions or a machine with no graphical session. This makes the
-# terminal display of `! cn approve` sufficient for every use request.
-# use = { any_of = ["polkit", "desk-key"] }
+# Phase 2 adds a fido2 approver, and the recommended chain for the rare,
+# permanent kinds becomes:
+# reveal = { all_of = ["polkit", "desk-key"] }
 
 # Whether `cn list` and `cn show` need a use-level approval once per session.
 list_requires_approval = false
@@ -126,10 +125,15 @@ type = "polkit"
 action_use    = "computer.mooselabs.countersign.approve"
 action_reveal = "computer.mooselabs.countersign.reveal"
 action_mutate = "computer.mooselabs.countersign.mutate"   # also used for export
-# The subject passed to polkitd is always the uid's logind graphical session
-# (unix-session), resolved by cnd; it is not configurable. Never a
-# unix-process subject: the agent could register its own authentication agent
-# for its process.
+# The subject polkitd is asked about:
+#   "process"  the session anchor (the agent process, e.g. claude) as a
+#              unix-process subject with its pid, start time and uid. Default.
+#   "session"  the uid's logind graphical session (unix-session). Aborts
+#              polkitd on current polkit (polkit-org/polkit#699).
+# Limit of "process": a same-uid agent can register its own authentication
+# agent for that process (pkttyagent --process) and draw the prompt. It still
+# needs your password or key touch, so it can spoof the display, not approve.
+subject = "process"
 # Refuse to use polkit unless the graphical session is Wayland (on X11 the
 # agent's uid can synthesize input into the dialog).
 require_wayland = true
@@ -138,39 +142,13 @@ require_wayland = true
 on_dismiss = "deny"
 timeout = "2m"
 # cn doctor checks that /etc/pam.d/polkit-1 contains pam_u2f with a
-# root-owned authfile when this is true.
-expect_pam_u2f = true
+# root-owned authfile when this is true. Default false; true when installed
+# with --factor touch or touch+password.
+expect_pam_u2f = false
 
-[approvers.desk-key]
-type = "fido2"
-# Credential records installed by root with `cn approver enroll`:
-#   /etc/countersign/approvers.d/desk-key.approver.toml
-credential = "desk-key"
-rp_id = "countersign"
-# "discouraged" (presence only), "preferred", or "required" (PIN or
-# fingerprint). A PIN needs a real terminal; `!` commands have none, and a PIN
-# typed there would land in the transcript.
-user_verification = "discouraged"
-# "client": `cn approve` talks to the key (default).
-# "daemon": cnd talks to the key; needs the udev rule. Does not fix the
-#           terminal-display problem, see docs/approvers.md.
-side = "client"
-# Attestation required at enrollment. "required" rejects software
-# authenticators; "none" accepts any credential.
-attestation = "required"
-attestation_roots = ["/usr/share/countersign/attestation/yubico-fido-root-ca.pem"]
-# aaguids = ["cb69481e-8ff7-4039-93ec-0a2729a154a8"]   # optional allowlist
-timeout = "60s"
-
-# A command approver, e.g. a phone push. Weakest adapter: its strength is
-# whatever the script does. Executable and its parent directories must be
-# root-owned and not group/world-writable. Protocol: request JSON on stdin;
-# exit 0 approve, 1 deny, 2 unavailable, anything else error (fails closed).
-# [approvers.phone]
-# type = "command"
-# argv = ["/usr/libexec/countersign/approvers/ntfy-signed", "--config", "/etc/countersign/phone.toml"]
-# env = []                     # variables passed through; environment is otherwise empty
-# timeout = "90s"
+# Phase 2 adapters, refused by this version:
+#   type = "fido2"    a YubiKey assertion over the request digest (cn approve)
+#   type = "command"  an executable, e.g. a phone push
 
 # ---------------------------------------------------------------------------
 # Listing
@@ -219,8 +197,9 @@ max_names_per_request = 16
 # ---------------------------------------------------------------------------
 [audit]
 # Append-only, hash-chained JSONL segments owned by the countersign user.
-# Format and verification: docs/audit.md.
-dir = "/var/lib/countersign/audit"
+# Format and verification: docs/audit.md. Default: audit/ in the state
+# directory (/var/lib/countersign/audit).
+# dir = "/var/lib/countersign/audit"
 # Signed checkpoint of the chain head, whichever comes first.
 checkpoint_interval = "1h"
 checkpoint_every_records = 1000
@@ -229,19 +208,20 @@ list_coalesce = "10m"
 # Agent-supplied text (reason, labels) is passed through the redaction engine
 # before it is written, in case an agent pasted a value into it.
 redact_agent_text = true
+# Not in Phase 1 (parsed with a warning):
 # Delete whole closed segments older than this, only if a checkpoint covers
 # them. Default: keep everything.
 # retention = "400d"
 # Hand each new checkpoint line to this command on stdin, for off-box copies.
 # checkpoint_command = ["/usr/local/bin/cn-push-checkpoint"]
 
-# Extra copies. Each sink receives every record; a sink failure is logged but
-# does not block the primary log. Checkpoints held outside
+# Extra copies (optional). Each sink receives every record; a sink failure is
+# logged but does not block the primary log. Checkpoints held outside
 # /var/lib/countersign are what make truncation detectable.
-[[audit.sink]]
-type = "journald"
-# "full" = every record; "checkpoints" = checkpoints and approvals only.
-level = "full"
+# [[audit.sink]]
+# type = "journald"
+# # "full" = every record; "checkpoints" = checkpoints and approvals only.
+# level = "full"
 
 # A second copy on another filesystem or a mounted backup target.
 # [[audit.sink]]
