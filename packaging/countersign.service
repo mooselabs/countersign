@@ -1,0 +1,69 @@
+# countersign.service: cnd, socket-activated by countersign.socket.
+# Installed by packaging/install.sh. Every directive below was checked against
+# systemd.exec(5) and systemd.resource-control(5) of systemd 261.
+[Unit]
+Description=countersign secret daemon
+Documentation=https://github.com/mooselabs/countersign
+Requires=countersign.socket
+After=countersign.socket
+
+[Service]
+Type=notify
+ExecStart=/usr/libexec/countersign/cnd
+User=countersign
+Group=countersign
+
+# Store, keyslots and audit log. cnd also reads $STATE_DIRECTORY.
+StateDirectory=countersign
+StateDirectoryMode=0700
+# No RuntimeDirectory=: /run/countersign holds the socket, and systemd would
+# chown a RuntimeDirectory recursively to countersign:countersign, taking the
+# socket away from the countersign-users group.
+
+# The master key, sealed with systemd-creds at install. It appears read-only
+# at $CREDENTIALS_DIRECTORY/countersign-mk, readable by this unit's user only.
+LoadCredentialEncrypted=countersign-mk
+
+UMask=0077
+LimitCORE=0
+
+# No privileges: cnd needs no capability at all.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Filesystem: read-only everywhere except the state directory.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# "default", not "invisible": cnd walks the developer's processes through
+# /proc/PID/stat, /proc/PID/comm and /proc/PID/cmdline. No ProcSubset=pid
+# either: cnd reads /proc/sys/kernel/random/boot_id.
+ProtectProc=default
+
+# Network: AF_UNIX only. That covers the listening socket, sd_notify and the
+# system D-Bus socket cnd uses to reach polkitd and logind (both are
+# filesystem sockets, so a private network namespace does not hide them).
+RestrictAddressFamilies=AF_UNIX
+PrivateNetwork=yes
+
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+# No [Install] section: the service starts on the first connection to
+# countersign.socket. Enable the socket, not the service.

@@ -42,6 +42,10 @@ developer's uid. Containers and PID namespaces are out of scope.
 | YubiKey | n/a | FIDO2 credential used for approval and, optionally, store unlock. |
 | `cn session exec` | developer | Launcher that registers itself as a session anchor and then `exec`s the agent, keeping the same pid. |
 
+In Phase 1 polkit is the only approver (decision 14): every approval is the
+desktop dialog. The FIDO2 paths in the picture (`! cn approve` with a key
+touch, daemon-side hidraw) are Phase 2.
+
 `cnd` is the only process that can read the store file or write the audit log.
 `cn` is an ordinary client: nothing it tells `cnd` is trusted except what the
 kernel attests (peer credentials, pidfd) and what an approver signs.
@@ -52,13 +56,22 @@ kernel attests (peer credentials, pidfd) and what an approver signs.
 | --- | --- | --- |
 | `/usr/bin/cn` | root 0755 | CLI. Documentation tells humans to approve with `/usr/bin/cn` by absolute path. |
 | `/usr/libexec/countersign/cnd` | root 0755 | Daemon. |
-| `/etc/countersign/config.toml` | root 0644 (0640 `root:countersign` if it holds adapter credentials) | Policy: approvers, TTL limits, matchers, allowed uids. Not writable by the agent. |
-| `/etc/countersign/approvers.d/` | root 0755, records 0644 | Enrolled FIDO2 credential records (`NAME.approver.toml`). Approver policy, so root-owned (threat model T13). |
-| `/etc/credstore.encrypted/countersign-mk` | root 0600 | Master key sealed with `systemd-creds` (TPM2 if present, else host key). |
-| `/var/lib/countersign/` | countersign 0700 | `store.v1`, `store.v1.prev`, `keyslots.json`, `approvers/` (FIDO2 signature counters only), `audit/`. |
-| `/run/countersign/` | countersign 0755 | Runtime directory. |
+| `/usr/lib/systemd/system/countersign.{socket,service}` | root 0644 | Units ([below](#systemd-units)). |
+| `/usr/lib/sysusers.d/countersign.conf`, `/usr/lib/tmpfiles.d/countersign.conf` | root 0644 | User, group and directories. |
+| `/usr/share/polkit-1/actions/computer.mooselabs.countersign.policy` | root 0644 | The three polkit actions ([approvers.md](approvers.md#actions)). |
+| `/etc/countersign/config.toml` | root 0644 (0640 `root:countersign` if it holds adapter credentials) | Policy: approvers, TTL limits, matchers, allowed uids. Not writable by the agent. `cnd --config PATH` overrides the path. |
+| `/etc/countersign/u2f_mappings` | root 0644 | Touch factors only: the `pam_u2f` key enrolment, origin `pam://countersign`. Root-owned so the agent cannot add a key. |
+| `/etc/pam.d/polkit-1` | root 0644 | Touch factors only: polkit's PAM stack with `pam_u2f`, written by the installer from the distribution's `/usr/lib/pam.d/polkit-1`. Machine-wide. |
+| `/etc/systemd/system/polkit-agent-helper@.service.d/countersign-hidraw.conf` | root 0644 | Touch factors only: lets polkit's sandboxed PAM helper open the key. |
+| `/etc/credstore.encrypted/countersign-mk` | root 0600 | Master key, 32 random bytes sealed with `systemd-creds` (TPM2 if present, else host key) by the installer. |
+| `/var/lib/countersign/` | countersign 0700 | `store.v1`, `store.v1.prev`, `keyslots.json`, `audit/`. `$STATE_DIRECTORY` or `cnd --state-dir PATH` overrides the path. |
+| `/run/countersign/` | root 0755 | Holds the socket. Root-owned, so no other process can replace the socket. |
 | `/run/countersign/cnd.sock` | countersign:countersign-users 0660 | IPC socket. |
-| `/usr/lib/udev/rules.d/70-countersign.rules` | root 0644 | Optional hidraw access for daemon-side FIDO2. |
+| `/etc/countersign/approvers.d/` | root 0755, records 0644 | Phase 2: enrolled FIDO2 credential records (`NAME.approver.toml`). Approver policy, so root-owned (threat model T13). FIDO2 signature counters go in `/var/lib/countersign/approvers/`. |
+| `/usr/lib/udev/rules.d/70-countersign.rules` | root 0644 | Phase 2: optional hidraw access for daemon-side FIDO2. |
+
+[`packaging/install.sh`](../packaging/install.sh) installs all of it; see
+[packaging/README.md](../packaging/README.md).
 
 ### Fixed user, not DynamicUser
 
@@ -81,67 +94,37 @@ g countersign-users -
 
 ### systemd units
 
-```ini
-# countersign.socket
-[Socket]
-ListenStream=/run/countersign/cnd.sock
-SocketUser=countersign
-SocketGroup=countersign-users
-SocketMode=0660
-RemoveOnStop=no
+The units are [`packaging/countersign.socket`](../packaging/countersign.socket)
+and [`packaging/countersign.service`](../packaging/countersign.service); the
+files are the reference, and each directive carries a comment. In short:
 
-[Install]
-WantedBy=sockets.target
-```
-
-```ini
-# countersign.service
-[Unit]
-Description=countersign secret daemon
-Requires=countersign.socket
-
-[Service]
-Type=notify
-ExecStart=/usr/libexec/countersign/cnd
-User=countersign
-Group=countersign
-StateDirectory=countersign
-StateDirectoryMode=0700
-RuntimeDirectory=countersign
-RuntimeDirectoryPreserve=yes
-LoadCredentialEncrypted=countersign-mk
-UMask=0077
-NoNewPrivileges=yes
-CapabilityBoundingSet=
-AmbientCapabilities=
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-PrivateDevices=yes          # set to no + DeviceAllow when daemon-side FIDO2 is enabled
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-ProtectClock=yes
-ProtectHostname=yes
-ProtectProc=default         # cnd must see other users' /proc/<pid>/stat
-RestrictAddressFamilies=AF_UNIX
-RestrictNamespaces=yes
-RestrictRealtime=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-MemoryDenyWriteExecute=yes
-SystemCallArchitectures=native
-SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources
-LimitCORE=0
-
-[Install]
-WantedBy=multi-user.target
-```
+- The socket listens on `/run/countersign/cnd.sock`, `countersign:countersign-users`
+  0660, and is the unit that gets enabled. The service has no `[Install]`
+  section; it starts on the first connection (`Type=notify`).
+- `cnd` runs as `countersign` with no capabilities, `NoNewPrivileges=yes`,
+  `ProtectSystem=strict` (only `StateDirectory=countersign` is writable),
+  `ProtectHome=yes`, `PrivateDevices=yes`, `PrivateTmp=yes`,
+  `PrivateNetwork=yes`, `RestrictAddressFamilies=AF_UNIX`, a
+  `@system-service` system call filter without `@privileged` and
+  `@resources`, `MemoryDenyWriteExecute=yes` and `LimitCORE=0`.
+- `ProtectProc=default`, not `invisible`, because `cnd` walks the
+  developer's processes through `/proc/<pid>/stat`; no `ProcSubset=pid`,
+  because it reads `/proc/sys/kernel/random/boot_id`.
+- AF_UNIX is enough for the system D-Bus, which `cnd` uses to reach polkitd
+  and logind. Both are filesystem sockets, so the private network namespace
+  does not hide them.
+- `LoadCredentialEncrypted=countersign-mk` hands `cnd` the master key at
+  `$CREDENTIALS_DIRECTORY/countersign-mk`.
+- No `RuntimeDirectory=`. systemd would chown it recursively to
+  `countersign:countersign`, socket included, and lock the
+  `countersign-users` group out. `/run/countersign` is root-owned instead
+  (tmpfiles).
 
 `cnd` also calls `prctl(PR_SET_DUMPABLE, 0)` and `mlockall(MCL_CURRENT|MCL_FUTURE)`
-where the memlock limit allows, and zeroizes value buffers after use.
+where the memlock limit allows, and zeroizes value buffers after use. The unit
+leaves `LimitMEMLOCK` at systemd's default (8 MiB); with `MCL_FUTURE`, any
+allocation beyond the limit fails, so `cnd` must check the limit before
+locking everything.
 
 `cnd` holds **no capabilities**. That has a consequence: `/proc/<pid>/exe`,
 `/proc/<pid>/cwd` and `/proc/<pid>/environ` of the developer's processes are
@@ -152,7 +135,7 @@ Project scope is organizational, so an untrusted cwd is acceptable. If the host
 mounts `/proc` with `hidepid=`, the `countersign` user must be given the
 `gid=` exemption group.
 
-### Daemon-side FIDO2 (optional)
+### Daemon-side FIDO2 (Phase 2, optional)
 
 When `[unlock] fido2_side = "daemon"` is set, `cnd` talks to the key itself so
 the `hmac-secret` output never enters the developer's uid:
@@ -190,23 +173,28 @@ matchers = [
 label_env = ["CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID"]
 
 [approval]                       # chains name approver instances from [approvers.*]
-use     = "polkit"                       # GNOME dialog, backed by pam_u2f (YubiKey touch)
-reveal  = { all_of = ["polkit", "desk-key"] }   # desk-key is a fido2 approver
-mutate  = { all_of = ["polkit", "desk-key"] }
-export  = { all_of = ["polkit", "desk-key"] }
+use     = "polkit"               # Phase 1: polkit for every kind (decision 14)
+reveal  = "polkit"
+mutate  = "polkit"
+export  = "polkit"
 list_requires_approval = false
+
+[approvers.polkit]
+type = "polkit"
+subject = "process"              # the session anchor; "session" once polkit#699 is fixed
 
 [hide]
 max_streams_per_minute = 30
 
 [unlock]
-slots = ["systemd-creds"]        # or ["fido2"], or both; "recovery" adds the recovery slot
+slots = ["systemd-creds", "recovery"]   # Phase 1; "fido2" is Phase 2
 ```
 
-The default chains follow [approvers.md](approvers.md#recommended-default-for-the-owner):
-no `any_of`, because an `any_of` is only as strong as its weakest member, and a
-`fido2` approver on its own has only the terminal, which the agent can alter,
-as its display.
+The default chains follow [approvers.md](approvers.md#recommended-default-for-the-owner).
+Phase 2 proposes adding a `fido2` approver to `reveal`, `mutate` and `export`
+with `all_of`, never `any_of`: an `any_of` is only as strong as its weakest
+member, and a `fido2` approver on its own has only the terminal, which the
+agent can alter, as its display.
 
 ## 3. Store
 
@@ -231,20 +219,30 @@ The default environment variable for a secret is its name in upper snake case:
 ### Key hierarchy
 
 ```text
-MK (32 random bytes, generated at `cnd init`)
+MK  master key: 32 random bytes made by the installer, sealed with systemd-creds
+    in /etc/credstore.encrypted/countersign-mk; cnd reads it from
+    $CREDENTIALS_DIRECTORY/countersign-mk
+DK  data key: random, generated by `cnd init`
  ├─ wrapped by key slots (keyslots.json), any one unseals:
- │    systemd-creds   MK sealed in /etc/credstore.encrypted/countersign-mk
- │    fido2           MK wrapped with KEK = HKDF(hmac-secret(salt), "countersign/kek/v1")
- │    recovery        MK wrapped with KEK = Argon2id(recovery phrase), printed once at init
- ├─ FK  = HKDF-SHA256(MK, info="countersign/v1/file")       seals store.v1
- ├─ VK  = HKDF-SHA256(MK, info="countersign/v1/value")      seals each value
- └─ AK  = HKDF-SHA256(MK, info="countersign/v1/audit-sign") seed of the Ed25519 checkpoint key
+ │    systemd-creds   DK wrapped with MK
+ │    recovery        DK wrapped with KEK = Argon2id(recovery phrase), the phrase
+ │                    generated and printed once by `cnd init`
+ │    fido2           Phase 2: DK wrapped with KEK = HKDF(hmac-secret(salt), "countersign/kek/v1")
+ ├─ FK  = HKDF-SHA256(DK, info="countersign/v1/file")       seals store.v1
+ ├─ VK  = HKDF-SHA256(DK, info="countersign/v1/value")      seals each value
+ └─ AK  = HKDF-SHA256(DK, info="countersign/v1/audit-sign") seed of the Ed25519 checkpoint key
 ```
 
-"Wrapped" means XChaCha20-Poly1305 with a random nonce. The `systemd-creds`
-slot is the default: `cnd` reads `$CREDENTIALS_DIRECTORY/countersign-mk` at
-start and is unsealed without interaction. With only the `fido2` slot enabled
-`cnd` starts sealed and answers `store_sealed` until `cn unlock` succeeds.
+"Wrapped" means XChaCha20-Poly1305 with a random nonce. In Phase 1 `cnd init`
+always creates both slots, so every store has a portable one. It runs once,
+as the `countersign` user with the credential (the installer uses
+`systemd-run`), refuses if a store exists, and prints the recovery phrase once
+on stdout. `cnd recover` reads the phrase from stdin, unwraps the data key
+with it, and wraps it again for the `systemd-creds` slot with the current
+master key: the path after a lost or replaced machine key. At start `cnd`
+unseals with the `systemd-creds` slot without interaction. With a `fido2`
+slot only (Phase 2), `cnd` would start sealed and answer `store_sealed` until
+`cn unlock` succeeds.
 
 Algorithm: **XChaCha20-Poly1305** (RustCrypto `chacha20poly1305`) with random
 192-bit nonces, so no nonce counter has to survive crashes. age was considered
@@ -282,9 +280,8 @@ from being moved to another name by editing the file.
 ### Backup and export
 
 - The raw `store.v1` is safe to copy anywhere, but on a TPM-sealed machine
-  it can only be opened elsewhere with the `fido2` or `recovery` slot.
-  `cnd init` refuses to finish without at least one portable slot unless
-  `--no-portable-slot` is passed.
+  it can only be opened elsewhere with the `recovery` slot (or, in Phase 2,
+  a `fido2` slot). Back up `keyslots.json` with it.
 - `cn export --recipient age1... > backup.age` writes the decrypted store,
   values included, encrypted to an age recipient the human controls. It
   requires an `export` approval and is audited.
@@ -380,12 +377,11 @@ Protocol rules: unknown fields are ignored; unknown `type` values return
 
 Run once per connection, during `Hello`:
 
-1. **Peer.** Get `SO_PEERPIDFD` (Linux 6.5+), which gives a pidfd for the
-   connecting process without a pid-reuse race. On older kernels read
-   `SO_PEERCRED`, call `pidfd_open(pid)`, then confirm the process is still
-   the one that connected by checking its uid and that its start time is not
-   later than the connection's accept time. Reject the peer if its uid is not
-   in `[access]`, or is 0 and `allow_root_clients` is false.
+1. **Peer.** Get `SO_PEERPIDFD`, which gives a pidfd for the connecting
+   process without a pid-reuse race, and `SO_PEERCRED` for its uid. Linux 6.5
+   or later is required; `cnd` refuses to start without `SO_PEERPIDFD`
+   (decision 16). Reject the peer if its uid is not in `[access]`, or is 0 and
+   `allow_root_clients` is false.
 2. **Read stat.** Parse `/proc/<pid>/stat` from the *last* `)` (the `comm`
    field may contain spaces and parentheses). Take field 4 (`ppid`) and field
    22 (`starttime`, clock ticks since boot).
@@ -689,22 +685,19 @@ never standing. Every use is audited as usual with `standing: id`.
 | --- | --- |
 | `countersign-proto` | Frame codec, message enums (serde), protocol version constants, error codes, the canonical request type and its JCS digest (shared so `cn` and `cnd` compute the same bytes). |
 | `countersign-core` | Store format and crypto, key slots, atomic writes, data-model validation; session discovery and liveness; grant state machine and TTL policy; config parsing; audit writer, chain, checkpoints and verifier. Used by `cnd`; the verifier also by `cn`. |
-| `countersign-approve` | `Approver` trait (`present(request) -> Outcome`), combinators (`all_of`, `any_of`), adapters `fido2` (registration, assertion verify), `polkit` (D-Bus `CheckAuthorization`), `command` (exit-code protocol). |
+| `countersign-approve` | `Approver` trait (`present(request) -> Outcome`), combinators (`all_of`, `any_of`), adapter `polkit` (D-Bus `CheckAuthorization`), and `insecure-auto` behind the debug-only `insecure-test` feature (decision 17). Phase 2: `fido2` (registration, assertion verify), `command` (exit-code protocol). |
 | `countersign-hide` | Pattern generation from values and encodings, Aho-Corasick engine, chunk-boundary carry-over, newline flush. Used by `cnd` for `hide` and by `cn` for `run`. |
 | `countersign-daemon` | `cnd`: socket accept loop (tokio), peer credentials, epoll on pidfds, request dispatch, sd_notify, startup unseal. |
-| `countersign-cli` | `cn`: argument parsing, `run` fork/exec and scrubbing, `hide` streaming, FIDO2 client side for `approve`/`unlock` (libfido2 or `ctap-hid-fido2`), `audit verify`, `session exec`, `import`. |
+| `countersign-cli` | `cn`: argument parsing, `run` fork/exec and scrubbing, `hide` streaming, `audit verify`, `session exec`, `import`. Phase 2: FIDO2 client side for `approve`/`unlock` (libfido2 or `ctap-hid-fido2`). |
 
 ## 12. Open questions
 
-1. **polkit message rendering.** The design assumes the action's `<message>`
-   can interpolate `$(secrets)`, `$(ttl)`, `$(digest)` from the details cnd
-   passes, and that gnome-shell shows it. This needs testing on current
-   polkit and GNOME, KDE and others. If the message cannot carry request
-   details, the polkit dialog is not a trusted display of *what* is approved,
-   only of *that* something is.
-2. **Peer start-time check on pre-6.5 kernels.** The `SO_PEERCRED` +
-   `pidfd_open` fallback has a narrow reuse window. Is supporting kernels
-   older than 6.5 worth it, or should v1 require `SO_PEERPIDFD`?
+1. ~~**polkit message rendering.**~~ Settled by the
+   [spike](../spikes/polkit-dialog/README.md): polkit 128 interpolates the
+   details `cnd` passes as the action owner, and GNOME Shell shows the whole
+   message. KDE is unchecked.
+2. ~~**Peer start-time check on pre-6.5 kernels.**~~ Settled by decision 16:
+   Linux 6.5 or later, `SO_PEERPIDFD` only.
 3. **Mutation previews.** The human approving `cn set` for a DSN cannot see
    whether the new value points at an attacker's host. Show a masked preview
    for URL-shaped values (scheme and host, no userinfo) in the trusted
@@ -712,8 +705,8 @@ never standing. Every use is audited as usual with `standing: id`.
 4. **File-shaped secrets.** Some tools want a path, not an env var
    (`GOOGLE_APPLICATION_CREDENTIALS`). A `--use-file NAME=VAR` that passes a
    `memfd` as `/proc/self/fd/N` is the likely answer; not designed yet.
-5. **Recovery slot at init.** Requiring a portable key slot is safer but adds
-   a step. Default on, as written, or opt-in?
+5. ~~**Recovery slot at init.**~~ Settled for Phase 1: `cnd init` always
+   creates the recovery slot and prints the phrase once (decision 14).
 6. **Grants surviving a `cnd` restart.** In-memory grants mean a package
    upgrade revokes everything mid-task. Accept, or persist grants bound to
    (boot id, anchor pid, start time) which can be revalidated?

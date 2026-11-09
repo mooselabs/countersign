@@ -1,9 +1,14 @@
 # `cn` command reference
 
 `cn` is the countersign client. It talks to `cnd` over
-`/run/countersign/cnd.sock`, runs commands with secrets injected, and performs
-the client side of FIDO2 approvals. It never holds state of its own: secrets,
-grants, sessions and the audit log all live in `cnd`.
+`/run/countersign/cnd.sock`, runs commands with secrets injected, and (in
+Phase 2) performs the client side of FIDO2 approvals. It never holds state of
+its own: secrets, grants, sessions and the audit log all live in `cnd`.
+
+**Phase 1** (decision 14): polkit is the only approver. Every approval is the
+desktop dialog `cnd` raises; `cn approve` only prints the pending request so
+the human can cross-check it. `cn unlock`, `cn approver enroll` and the FIDO2
+path of `cn approve` are Phase 2.
 
 This document covers every command, the global options, the exit codes, the
 `--json` output convention that agents parse, and a worked session. The
@@ -45,7 +50,7 @@ mechanisms behind the commands are in [design.md](design.md); approvers are in
 | `cn list` | agent | no (configurable) | `list` (coalesced) |
 | `cn show NAME` | agent | no (follows `list`) | `list` (coalesced) |
 | `cn request` | agent | creates one | `request.create` |
-| `cn approve CODE` | human | is one | `request.approve` or `request.approve_fail` |
+| `cn approve CODE` | human | Phase 1: no, prints the request; the dialog is the approval. Phase 2 (FIDO2): is one | Phase 2: `request.approve` or `request.approve_fail` |
 | `cn deny CODE` | human or agent | no | `request.deny` |
 | `cn grants` | agent or human | no | none |
 | `cn revoke` | human or agent | no | `grant.revoke` |
@@ -62,8 +67,8 @@ mechanisms behind the commands are in [design.md](design.md); approvers are in
 | `cn session exec` | human | no | `session.start` |
 | `cn audit` | agent or human | no | none |
 | `cn audit verify` | human | no | none |
-| `cn unlock` | human | FIDO2 touch | `unlock` |
-| `cn approver enroll` | human | root installs the result | `config.load` when `cnd` loads it |
+| `cn unlock` (Phase 2) | human | FIDO2 touch | `unlock` |
+| `cn approver enroll` (Phase 2) | human | root installs the result | `config.load` when `cnd` loads it |
 | `cn doctor` | human or agent | no | none |
 
 ## Global options
@@ -71,7 +76,7 @@ mechanisms behind the commands are in [design.md](design.md); approvers are in
 | Option | Meaning |
 | --- | --- |
 | `--json` | Machine-readable output; see [JSON output](#json-output). |
-| `--socket PATH` | Socket path. Default `/run/countersign/cnd.sock`. Also `COUNTERSIGN_SOCKET`. Ignored by `approve`, `unlock` and `approver enroll` (see below). |
+| `--socket PATH` | Debug builds only, for tests: socket path, also `COUNTERSIGN_SOCKET`. A release build always uses `/run/countersign/cnd.sock`. |
 | `--no-color` | No ANSI colour. Colour is also off when stdout is not a terminal. |
 | `-q`, `--quiet` | Suppress informational lines on stderr. |
 | `-h`, `--help` | Help for the command. |
@@ -79,9 +84,9 @@ mechanisms behind the commands are in [design.md](design.md); approvers are in
 
 Before sending anything, `cn` checks the server end of the socket with
 `SO_PEERCRED` and refuses to talk to a peer that is not running as the
-`countersign` system user. `approve`, `unlock` and `approver enroll` always use
-the default socket path and ignore `--socket` and `COUNTERSIGN_SOCKET`, so a
-fake daemon on another path cannot feed them a request to display.
+`countersign` system user. A release build only ever connects to
+`/run/countersign/cnd.sock`, so a fake daemon on another path cannot feed it
+a request to display.
 
 `cn` strips every `COUNTERSIGN_*` variable from the environment of any child
 it starts.
@@ -171,8 +176,8 @@ grant applies only to processes descending from that session's anchor.
 
 When the configured chain includes a daemon-driven approver (polkit), `cnd`
 raises the dialog as soon as the request is created; the human answers it on
-the desktop. When it includes a client-driven approver (FIDO2), the human must
-run `/usr/bin/cn approve CODE`. The output says which. With the default chains
+the desktop. In Phase 2, when it includes a client-driven approver (FIDO2),
+the human must run `/usr/bin/cn approve CODE`. The output says which. With the default chains
 ([approvers.md](approvers.md#recommended-default-for-the-owner)) a `use`
 request raises the polkit dialog only:
 
@@ -184,8 +189,8 @@ approve a desktop dialog is open
 expires 2026-11-08T09:25:11Z (5m)
 ```
 
-When the chain has a client-driven member, the `approve` line names the
-command instead: `approve the human runs:  ! /usr/bin/cn approve K7M-Q2X`.
+When the chain has a client-driven member (Phase 2), the `approve` line names
+the command instead: `approve the human runs:  ! /usr/bin/cn approve K7M-Q2X`.
 
 A request for a secret that already has an active grant of the same or wider
 mode in this session returns the existing grant and creates nothing.
@@ -205,8 +210,27 @@ mode in this session returns the existing grant and creates nothing.
 /usr/bin/cn approve CODE [--approver NAME] [--timeout DUR] [--json]
 ```
 
-Fetches the pending request from `cnd`, prints it, and runs the client side of
-the approval chain:
+**Phase 1.** Fetches the pending request from `cnd` and prints it: code,
+session and anchor, reported cwd, secrets, mode, TTL, the agent's reason and
+the short digest. It approves nothing. The approval is the polkit dialog, and
+the printout lets the human cross-check what the dialog shows. In Phase 1 the
+`--approver` and `--timeout` flags below do not apply.
+
+```console
+! /usr/bin/cn approve K7M-Q2X
+countersign request K7M-Q2X
+  session   s_7k2mq9d4x1ha  anchor claude pid 41210 (registered by cn session exec)
+  cwd       /home/patrick/projects/moose/liskov-agent-orchestrator   (reported, untrusted)
+  secrets   clickhouse-password   (this project)
+  mode      use
+  ttl       30m  (max 8h)
+  reason    (agent-supplied) row counts for the weekly cost report via scripts/clickhouse_rows.py
+  digest    3QF8-ZK2M
+approve in the desktop dialog
+```
+
+**Phase 2.** Fetches the pending request from `cnd`, prints it, and runs the
+client side of the approval chain:
 
 - For a **client-driven** approver (FIDO2): computes the canonical digest from
   the request `cnd` returned, checks it equals the digest `cnd` reports, asks
@@ -247,12 +271,14 @@ non-zero, and is statically linked so `LD_PRELOAD` has no effect. None of this
 protects against a replaced binary or shell function; that is the trusted
 display problem, covered in [approvers.md](approvers.md).
 
-- **Run by:** human. An agent can run it too; it then reaches the key prompt
-  and stops, because it cannot touch the key. The Claude Code hook examples in
+- **Run by:** human. An agent can run it too; in Phase 1 it only prints, and
+  in Phase 2 it reaches the key prompt and stops, because it cannot touch the
+  key. The Claude Code hook examples in
   [agent-integration.md](agent-integration.md) stop confused agents from
   trying.
-- **Approval:** this is the approval.
-- **Audit:** `request.approve` with the approver's evidence (for FIDO2:
+- **Approval:** Phase 1: none, the dialog is the approval. Phase 2 (FIDO2):
+  this is the approval.
+- **Audit:** Phase 2: `request.approve` with the approver's evidence (for FIDO2:
   credential id, flags, signature counter, the signature and authenticator
   data, so the approval can be re-verified later). A failed verification
   writes `request.approve_fail` and counts toward the per-session
@@ -604,7 +630,7 @@ high_entropy = false
 `cn import` warns about each source file that is tracked by git, appears in
 git history (`git log --all -- PATH`), or is world-readable. Values that were
 ever in a readable file should be rotated after import; see
-[agent-integration.md](agent-integration.md#migrating-from-secret-files).
+[the migration guide](../integrations/migrating-from-secret-files.md#7-rotate).
 
 - **Run by:** human. `cn` reads the files as the developer's uid, so it also
   works in a `!` command with `--metadata`.
@@ -719,7 +745,7 @@ were also exported (journald or a remote sink) and are compared.
 - **Approval:** none.
 - **Audit:** none.
 
-## `cn unlock`
+## `cn unlock` (Phase 2)
 
 ```text
 /usr/bin/cn unlock [--timeout DUR] [--json]
@@ -742,7 +768,7 @@ unsealed store and a `mutate` approval.
 - **Audit:** `unlock` (slot, result) and `store.unseal` on success; `--enroll`
   writes `keyslot.add`.
 
-## `cn approver enroll`
+## `cn approver enroll` (Phase 2)
 
 ```text
 /usr/bin/cn approver enroll --name NAME [--uv required|preferred|discouraged] [--out FILE]
@@ -948,17 +974,16 @@ waiting up to 3m...
 The agent tells the human: "I requested `clickhouse-password` for 30 minutes
 (code K7M-Q2X, digest 3QF8-ZK2M). Please approve the desktop dialog."
 
-**Path A: polkit dialog, backed by `pam_u2f` (the default chain).** GNOME Shell shows its
-authentication dialog, rendered from details `cnd` supplied:
+**Path A: polkit dialog (Phase 1, and the default chain).** GNOME Shell shows its
+authentication dialog, rendered from details `cnd` supplied. With the touch
+factor:
 
 ```text
 Authentication Required
-  Agent session "orchestrator" (claude, pid 41210) asks to USE
-  clickhouse-password for 30m in ~/projects/moose/liskov-agent-orchestrator.
-  Agent's reason: row counts for the weekly cost report via
-  scripts/clickhouse_rows.py
-  Request K7M-Q2X  digest 3QF8-ZK2M
-  Please touch the device.
+  countersign request K7M-Q2X, digest 3QF8-ZK2M: USE clickhouse-password for 30m.
+  agent claude (pid 41210) in ~/projects/moose/liskov-agent-orchestrator.
+  Agent's reason: row counts for the weekly cost report via scripts/clickhouse_rows.py
+  touch the device
 ```
 
 ```text
@@ -969,7 +994,7 @@ Authentication Required
 [agent] approved by polkit  grant g_4hx2 active until 09:51:40
 ```
 
-**Path B: FIDO2 from the Claude Code prompt.** Only with a non-default chain
+**Path B: FIDO2 from the Claude Code prompt (Phase 2).** Only with a non-default chain
 that lets a `fido2` approver decide alone (`use = "desk-key"`, or an `any_of`
 for a machine with no graphical session). The terminal is then the only
 display, which a planning agent can alter
@@ -1046,9 +1071,10 @@ SEQ    TIME      EVENT          DETAIL
 2. **Rejected `run` attempts in the audit.** [audit.md](audit.md) has no
    event for a `cn run` refused with `grant_required`. Is that worth a record
    (useful to see probing) or noise (coalesce per session)?
-3. **`cn approve` in a polkit-only chain.** It re-raises the dialog. Should the
-   agent be allowed to trigger that (prompt spam), or should `approve` for
-   daemon-driven approvers only work from outside any agent session?
+3. **`cn approve` in a polkit-only chain.** In Phase 1 it only prints the
+   request. Should it also re-raise a dialog the human dismissed by accident?
+   If so, should the agent be allowed to trigger that (prompt spam), or only a
+   caller outside any agent session?
 4. **Exit code granularity.** Exit 5 covers a human's explicit deny and a
    dismissed dialog. Agents should treat both the same; if a reason is needed
    it is in `error.detail.by`.
