@@ -4,9 +4,10 @@ An approver is the part of countersign that turns a pending request into a
 human decision. It is the security boundary of the whole tool: everything else
 (the agent, `cn`, the shell, the transcript) runs as the developer's uid and
 can be driven by the agent. This document defines the approver interface, how
-approvers are combined, the three v1 adapters (`polkit`, `fido2`, `command`),
+approvers are combined, the three adapters (`polkit`, `fido2`, `command`),
 the trusted-display problem, and the default recommended for the owner's
-machine.
+machine. Phase 1 builds the `polkit` adapter only (decision 14); `fido2` and
+`command` are Phase 2.
 
 Related: request codes and the canonical request digest are specified in
 [design.md](design.md#6-grants); the threats referred to as T3, T4, T13 and
@@ -132,6 +133,14 @@ pub enum Chain {
 }
 ```
 
+In Phase 1 only `DaemonApprover` is implemented. `ClientApprover` and the
+`Approver::Client` variant arrive with `fido2` in Phase 2. `present` returns a
+boxed `Send` future; it honours the cancellation token and `expires_at`, and
+dropping the future or cancelling it withdraws the prompt (for polkit,
+`CancelCheckAuthorization`). `ApprovalRequest.session` carries the subject
+data `cnd` resolved: the developer's uid, the anchor's pid and start time, and
+the logind session id when there is one.
+
 Rules every adapter follows:
 
 - The only request data an adapter may show a human is `display`, and it shows
@@ -218,7 +227,7 @@ make the human see request A while approving request B.
 | --- | --- | --- |
 | `cn approve` output in a `!` command | `cn`, run by the agent's shell, in the agent's environment, output in the agent's transcript | Yes: see below. |
 | `cn approve` in a separate terminal the human opened | `cn` under the human's shell | Yes, if the agent has edited rc files, `PATH` directories or the terminal profile beforehand. No, if not. |
-| GNOME Shell polkit dialog (Wayland) | gnome-shell, from text polkitd received from `cnd` | Not by a non-persistent agent. A persistent agent can install a GNOME Shell extension that runs inside the shell after the next login. |
+| GNOME Shell polkit dialog (Wayland) | gnome-shell, from text polkitd received from `cnd` | Not the dialog itself. But with the Phase 1 process subject the agent can register its own authentication agent for the anchor and draw the prompt instead (decision 15). A persistent agent can also install a GNOME Shell extension that runs inside the shell after the next login. |
 | Polkit dialog on X11 | the polkit agent | Input can be synthesized (XTEST) and the screen read; not trusted. |
 | A phone app showing a push (via `command`) | a separate device | No, if the response is authenticated. |
 | The YubiKey | no display | Shows nothing. A touch proves presence only. |
@@ -254,7 +263,7 @@ as a fallback and not as the default.
 
 | Attack | Mitigation |
 | --- | --- |
-| `cnd` passes the requesting process as a `unix-process` subject; the agent registers its own per-process authentication agent for it (as `pkttyagent --process` does) and receives the prompt instead of gnome-shell. | `cnd` always uses a `unix-session` subject: the uid's logind graphical session, resolved by `cnd`. One authentication agent per session is allowed, and gnome-shell holds it. |
+| `cnd` passes the session anchor as a `unix-process` subject (the Phase 1 default, decision 15); a same-uid agent registers its own per-process authentication agent for it (as `pkttyagent --process` does) and receives the prompt instead of gnome-shell. | The prompt still runs the human's factor through PAM: a hijacking agent can draw its own prompt, but it gets an approval only if the human types their password into it or touches the key. It spoofs the display; it does not bypass approval. A careless or confused agent does not do this. With `subject = "session"`, once polkit-org/polkit#699 is fixed, one authentication agent per session is allowed and gnome-shell holds it. |
 | The agent draws a lookalike dialog. | A lookalike collects nothing: with `pam_u2f`, the touch only completes the real PAM conversation run by `polkit-agent-helper-1`. On GNOME Wayland, client windows cannot cover the shell's modal dialog, so the real one is visible. |
 | The agent ptraces gnome-shell. | gnome-shell is not a descendant of the agent; Yama `ptrace_scope=1` refuses. |
 | The agent synthesizes a click or keystrokes in the dialog. | Not possible on Wayland. On X11 it is; `cn doctor` warns, and the polkit adapter can be set to refuse non-Wayland sessions (`require_wayland = true`). |
@@ -277,17 +286,26 @@ is rendered outside the developer's uid's control: the polkit dialog on
 Wayland, against an agent that has not planted persistence in the desktop, or
 a separate device. The default below follows from that.
 
+In Phase 1, with the process subject, the polkit dialog is a trusted display
+against careless and confused agents. A deliberately malicious same-uid agent
+can take the prompt over (above) and show something else while the human
+supplies their factor.
+
 ---
 
 ## Adapter: `polkit`
 
-Daemon-driven. `cnd` asks polkitd to authorize an action for the developer's
-graphical session; polkitd asks that session's authentication agent (gnome-shell
-on GNOME) to authenticate the user, and the shell shows its dialog.
+Daemon-driven. `cnd` asks polkitd to authorize an action for the session
+anchor (the agent process); polkitd asks the authentication agent of that
+process's login session (gnome-shell on GNOME) to authenticate the user, and
+the shell shows its dialog.
 
 ### Actions
 
-The package installs `/usr/share/polkit-1/actions/computer.mooselabs.countersign.policy`:
+The package installs
+[`packaging/computer.mooselabs.countersign.policy`](../packaging/computer.mooselabs.countersign.policy)
+as `/usr/share/polkit-1/actions/computer.mooselabs.countersign.policy`. Its
+actions, which that file must match:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -300,7 +318,7 @@ The package installs `/usr/share/polkit-1/actions/computer.mooselabs.countersign
 
   <action id="computer.mooselabs.countersign.approve">
     <description>Approve use of a secret by an agent session</description>
-    <message>$(session) asks to USE $(secrets) for $(ttl) in $(cwd). Agent's reason: $(reason). Request $(code), digest $(digest).</message>
+    <message>countersign request $(code), digest $(digest): USE $(secrets) for $(ttl). $(session). Agent's reason: $(reason)</message>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
@@ -311,7 +329,7 @@ The package installs `/usr/share/polkit-1/actions/computer.mooselabs.countersign
 
   <action id="computer.mooselabs.countersign.reveal">
     <description>Reveal a secret value to an agent session</description>
-    <message>REVEAL: $(session) asks to PRINT the value of $(secrets). The value will enter the agent's transcript permanently. Agent's reason: $(reason). Request $(code), digest $(digest).</message>
+    <message>countersign request $(code), digest $(digest): REVEAL $(secrets) to the agent; the value enters its transcript permanently. $(session). Agent's reason: $(reason)</message>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
@@ -321,8 +339,8 @@ The package installs `/usr/share/polkit-1/actions/computer.mooselabs.countersign
   </action>
 
   <action id="computer.mooselabs.countersign.mutate">
-    <description>Change the countersign secret store</description>
-    <message>$(operation). Initiated by: $(session). Request $(code), digest $(digest).</message>
+    <description>Change or export the countersign secret store</description>
+    <message>countersign request $(code), digest $(digest): $(operation). $(session).</message>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
@@ -333,12 +351,18 @@ The package installs `/usr/share/polkit-1/actions/computer.mooselabs.countersign
 </policyconfig>
 ```
 
+Every message starts with "countersign", the request code and the short
+digest. GNOME and `pkexec` shorten a long message by cutting its middle (spike
+finding 7), and the human must be able to tell countersign's dialog from any
+other polkit prompt.
+
 `export` uses the `mutate` action with an `operation` text that says so.
 
 Notes on the defaults:
 
-- **`auth_self`**: the session's user authenticates as themselves. With
-  `pam_u2f` in the `polkit-1` stack that is a YubiKey touch.
+- **`auth_self`**: the session's user authenticates as themselves, with the
+  factor chosen at install ([below](#approval-factor-password-or-key-touch)):
+  their password, a key touch, or both.
 - **`auth_admin`**: an administrator authenticates. On openSUSE the default
   admin identity is root, so this asks for the root password. It is useful
   only if you want approval to need a credential the developer's day-to-day
@@ -358,93 +382,110 @@ Notes on the defaults:
 
 ```text
 org.freedesktop.PolicyKit1.Authority.CheckAuthorization(
-    subject         = ("unix-session", {"session-id": <s "3">}),
+    subject         = ("unix-process", {"pid": <u 41210>,
+                                        "start-time": <t 8812345>,
+                                        "uid": <i 1000>}),
     action_id       = "computer.mooselabs.countersign.approve",
-    details         = {"session": "Agent session \"orchestrator\" (claude, pid 41210)",
+    details         = {"code": "K7M-Q2X",
+                       "digest": "3QF8-ZK2M",
                        "secrets": "clickhouse-password",
                        "ttl": "30m",
-                       "cwd": "~/projects/moose/liskov-agent-orchestrator",
-                       "reason": "row counts for the weekly cost report via ...",
-                       "code": "K7M-Q2X",
-                       "digest": "3QF8-ZK2M"},
+                       "session": "agent claude (pid 41210) in ~/projects/moose/liskov-agent-orchestrator",
+                       "reason": "row counts for the weekly cost report via ..."},
     flags           = 0x1,           # AllowUserInteraction
     cancellation_id = "r_9w1k...")   # the request id
   -> (is_authorized: b, is_challenge: b, details: a{ss})
 ```
 
-- **Subject.** `cnd` resolves the developer's graphical session with logind:
-  the `Display` property of the user object for the anchor's uid
-  (`org.freedesktop.login1.User`). It requires the session to be local, active,
-  on a seat, and (with `require_wayland = true`) of type `wayland`. It does not
-  use the anchor's own session, because terminal apps on current GNOME run
-  under the user's systemd manager rather than inside the login session scope,
-  and an ssh session must not be the one asked.
-- **Details.** Every value is escaped: control characters, ANSI escapes,
-  newlines and Unicode bidi overrides are removed; each field is
-  length-limited (reason 300 characters, cwd 120 with the middle elided,
-  secret list 10 names then "and N more"). Keys beginning `polkit.` are
-  reserved by polkit and are never set.
+The dialog then reads:
+
+```text
+countersign request K7M-Q2X, digest 3QF8-ZK2M: USE clickhouse-password for 30m.
+agent claude (pid 41210) in ~/projects/moose/liskov-agent-orchestrator.
+Agent's reason: row counts for the weekly cost report via ...
+```
+
+- **Subject.** Config `[approvers.polkit] subject = "process" | "session"`,
+  default `"process"` (decision 15).
+  - `"process"`: the session anchor, the long-lived agent process `cnd`
+    resolved for the request (design.md section 5), as a `unix-process`
+    subject with its `pid`, `start-time` (field 22 of `/proc/PID/stat`) and
+    `uid`. The anchor must be the developer's own process: the spike found
+    that a subject process not owned by the developer returns `(false,
+    false)`. polkitd finds the authentication agent through the process's
+    login session. The limit is the hijack described in
+    [How the polkit display is subverted](#how-the-polkit-display-is-subverted-and-what-stops-it).
+  - `"session"`: the uid's logind graphical session (the `Display` property
+    of `org.freedesktop.login1.User`), required to be local, active, on a
+    seat and, with `require_wayland = true`, of type `wayland`. This is the
+    stronger subject, but polkitd 127 and 128 abort on it
+    ([polkit-org/polkit#699](https://github.com/polkit-org/polkit/issues/699)),
+    so it is for a polkit with that fixed.
+- **Details.** The adapter always sets every key its action's message uses:
+  `code`, `digest`, `secrets`, `ttl`, `session` and `reason` for `approve`
+  and `reveal`; `code`, `digest`, `operation` and `session` for `mutate`.
+  An empty value is sent as "none", so the dialog never shows a raw `$(key)`.
+  `session` reads like `agent claude (pid 41210) in ~/projects/x`. Every value
+  is sanitised: control characters, ANSI escapes, newlines and Unicode bidi
+  overrides are removed. Each is length-limited: reason 300 characters, the
+  cwd inside `session` 120 with the middle elided, the secret list 10 names
+  then "and N more". Keys beginning `polkit.` are reserved by polkit and are
+  never set. Only an action owner may pass details at all (spike finding 3),
+  so an agent cannot write this text.
 - **Result.** `is_authorized = true` -> `Approved`. `details["polkit.dismissed"]
-  = "true"` -> `Denied` (dismissed), or ignored when the approver has
-  `on_dismiss = "ignore"` (useful in an `any_of` with `fido2`).
-  `is_challenge = true` with no interaction -> `Unavailable` (no
+  = "true"` (the human pressed Cancel) -> `Denied` (dismissed), or ignored
+  when the approver has `on_dismiss = "ignore"` (useful in an `any_of` in
+  Phase 2). `is_challenge = true` with no interaction -> `Unavailable` (no
   authentication agent for the session). Otherwise -> `Denied`.
 - **Cancellation.** When the request expires, is denied by `cn deny`, or
   another `any_of` member approves, `cnd` calls `CancelCheckAuthorization` with
-  the request id and the dialog closes.
-- **Evidence.** `{action_id, subject_session, is_authorized, dismissed,
+  the request id and the dialog closes. `cnd` must enforce expiry itself: with
+  a key-touch factor, GNOME retries the touch about every 30 seconds for as
+  long as the dialog is open (spike U3), so without the cancel the dialog
+  would stay up.
+- **Evidence.** `{action_id, subject, is_authorized, dismissed,
   duration_ms}`. polkit gives no signature; the evidence is "polkitd said
-  yes", which is why `reveal` and `mutate` add `fido2` in the recommended
-  chain.
+  yes". That is why Phase 2 proposes adding `fido2` for `reveal`, `mutate` and
+  `export` (P1).
 
-### `pam_u2f`: GNOME dialog plus YubiKey touch
+### Approval factor: password or key touch
 
-polkit authenticates through the PAM service `polkit-1`. Adding `pam_u2f`
-there turns the GNOME dialog into "touch the key". Setup on openSUSE
-Tumbleweed:
+polkit authenticates `auth_self` through the PAM service `polkit-1`. What the
+dialog asks for is chosen at install (decision 19), with
+`packaging/install.sh --factor` ([packaging/README.md](../packaging/README.md#approval-factors)):
 
-```console
-$ sudo zypper install pam_u2f            # provides pam_u2f.so and pamu2fcfg
-$ pamu2fcfg -u patrick > u2f_mappings     # touch the key
-$ sudo install -o root -g root -m 0644 u2f_mappings /etc/u2f_mappings
-$ shred -u u2f_mappings
-```
+| Factor | The dialog asks for | `polkit-1` auth lines |
+| --- | --- | --- |
+| `password` (default) | The user's password. | The distribution's, unchanged. |
+| `touch` | A security key touch, nothing else. No key, no approval. | `auth [success=done default=die] pam_u2f.so authfile=/etc/countersign/u2f_mappings origin=pam://countersign appid=pam://countersign cue` |
+| `touch+password` | A touch, then the password. | `auth requisite pam_u2f.so ...` (same arguments), then the distribution's auth lines. |
 
-Tumbleweed ships vendor PAM files under `/usr/lib/pam.d/`. Copy the vendor
-file to `/etc/pam.d/polkit-1` if it is not already there, and add the
-`pam_u2f` line before the existing `auth` lines:
+There is no click-only factor: polkit has no confirm-only mode
+([polkit#463](https://github.com/polkit-org/polkit/issues/463)), and with the
+process subject a prompt that needs no credential could be answered by an
+agent that drew its own prompt (decision 15).
 
-```text
-#%PAM-1.0
-auth     sufficient  pam_u2f.so authfile=/etc/u2f_mappings cue
-auth     include     common-auth
-account  include     common-account
-password include     common-password
-session  include     common-session
-```
+Points that matter for the touch factors:
 
-| `pam_u2f` control | Effect |
-| --- | --- |
-| `sufficient` (recommended) | A touch alone approves. If the key is absent, the dialog falls back to the password. |
-| `[success=done default=die]` | Touch only; no password fallback. Strictest; approvals are impossible without the key. |
-| `required` | Touch and password. Two factors; slow for frequent approvals. |
-
-Points that matter:
-
-- **`authfile=/etc/u2f_mappings`, root-owned.** By default `pam_u2f` reads
-  `~/.config/Yubico/u2f_keys`, which the agent can write. A user-writable
-  mapping lets the agent add a credential, or delete yours so a `sufficient`
-  line falls through to the password.
+- **`authfile=/etc/countersign/u2f_mappings`, root-owned.** By default
+  `pam_u2f` reads `~/.config/Yubico/u2f_keys`, which the agent can write. A
+  user-writable mapping lets the agent add a credential of its own.
+- **Its own origin**, `pam://countersign`, so the enrolment is not shared with
+  another PAM service. The installer enrols with `pamu2fcfg` run as the user;
+  a key with a FIDO2 PIN asks for it, so enrolment needs a real terminal (not
+  a Claude Code `!` command).
 - Do not set `nouserok`.
-- `cue` makes PAM send "Please touch the device."; gnome-shell shows it in the
-  dialog.
-- This changes every polkit prompt on the machine (pkexec, NetworkManager,
-  systemd, package tools). polkit has no per-action PAM service. For most
-  developers that is welcome; it is still a system-wide change.
-- Test it before relying on it:
-  `pkcheck --action-id computer.mooselabs.countersign.approve --process $$ --allow-user-interaction`
-  should show the dialog and ask for a touch. (This test uses a process
-  subject; `cnd` uses the session subject.)
+- `cue` makes PAM send "touch the device"; gnome-shell shows it in the dialog.
+- **polkit 125 and later run their PAM helper sandboxed** as
+  `polkit-agent-helper@.service`, which hides the key. The installer adds a
+  drop-in with `DevicePolicy=auto`, `DeviceAllow=char-hidraw rw` and
+  `PrivateDevices=no`, as polkit-agent-helper(8) asks of PAM modules that
+  need hardware.
+- **This changes every polkit prompt on the machine** (`pkexec`,
+  NetworkManager, systemd, package tools). polkit has no per-action PAM
+  service. The installer says so before it makes the change.
+- Touch only while the countersign dialog is showing: a touch approves
+  whatever request is pending.
 
 ### Locking out user GNOME Shell extensions (optional)
 
@@ -465,7 +506,9 @@ root keep working. This requires `/etc/dconf/profile/user` to include
 
 ---
 
-## Adapter: `fido2`
+## Adapter: `fido2` (Phase 2)
+
+Deferred to Phase 2 by decision 14; nothing below is built in Phase 1.
 
 Client-driven. The human runs `/usr/bin/cn approve CODE`; `cn` asks the
 security key for an assertion over the request digest; `cnd` verifies it
@@ -473,7 +516,7 @@ against an enrolled public key.
 
 ### Enrollment
 
-`cn approver enroll --name desk-key` (see [cli.md](cli.md#cn-approver-enroll)):
+`cn approver enroll --name desk-key` (see [cli.md](cli.md#cn-approver-enroll-phase-2)):
 
 1. `cn` gets an enrollment nonce from `cnd`.
 2. `authenticatorMakeCredential` with:
@@ -553,7 +596,7 @@ land in the transcript. So:
 
 ### Daemon-side option
 
-With the udev rule in [design.md](design.md#daemon-side-fido2-optional),
+With the udev rule in [design.md](design.md#daemon-side-fido2-phase-2-optional),
 `cnd` can talk to the key itself (`side = "daemon"`), and `cn approve` only
 tells `cnd` which request to sign. That keeps the assertion out of the
 developer's uid but does not change the display problem: the human still
@@ -575,7 +618,7 @@ learns what they are approving from `cn`'s output. It is mainly useful for
 
 ---
 
-## Adapter: `command`
+## Adapter: `command` (Phase 2)
 
 Daemon-driven, generic. Runs an executable for each request and reads the
 decision from its exit code. Covers phone push (ntfy, Pushover), a chat bot,
@@ -652,14 +695,47 @@ depend on the desktop at all.
 The owner runs GNOME on Wayland (openSUSE Tumbleweed), has a YubiKey and
 prefers it, and approves requests while working in Claude Code.
 
-The two candidates:
+### Phase 1
 
-**A. polkit backed by `pam_u2f`.** The request is shown by gnome-shell from
-text that went `cnd` -> polkitd -> gnome-shell; nothing on that path runs code
-the agent controls, as long as the agent has not installed a shell extension.
-The approval is a YubiKey touch, the gesture the owner wants. It works from
-any terminal, any agent and any `!`-less workflow, because `cnd` raises the
-dialog itself.
+polkit for every kind, with the touch factor (decisions 14 and 19):
+
+```toml
+[approval]
+use    = "polkit"
+reveal = "polkit"
+mutate = "polkit"
+export = "polkit"
+
+[approvers.polkit]
+type = "polkit"
+subject = "process"
+```
+
+- The request is shown by gnome-shell from text that went `cnd` -> polkitd
+  -> gnome-shell; nothing on that path runs code the agent controls, as long
+  as the agent has not installed a shell extension or registered its own
+  authentication agent for the anchor (the process-subject limit).
+- The approval is a YubiKey touch, the gesture the owner wants. It works from
+  any terminal and any agent, because `cnd` raises the dialog itself.
+- `reveal`, `mutate` and `export` get their own actions and messages, so the
+  dialog says plainly when a value would enter the transcript or the store
+  would change.
+
+Setup, in order:
+
+1. `sudo packaging/install.sh --factor touch` from a terminal you opened
+   yourself ([packaging/README.md](../packaging/README.md)).
+2. Optionally lock user GNOME Shell extensions off ([above](#locking-out-user-gnome-shell-extensions-optional)).
+3. `/usr/bin/cn doctor` from a terminal you opened yourself.
+4. Start agents with `cn session exec -- claude`, so the dialog can name the
+   session.
+
+### Phase 2
+
+The candidates once `fido2` exists:
+
+**A. polkit backed by `pam_u2f`**, as in Phase 1: a trusted display (within
+the subject's limit) and a touch.
 
 **B. `fido2` through `! cn approve`, with a daemon-rendered notification as
 the trusted cross-check.** The touch is bound cryptographically to the request
@@ -671,7 +747,7 @@ posted by a process in the developer's uid, which the agent can run or
 imitate (GNOME notifications carry a sender-chosen name and icon). Without
 polkit, B's display is the terminal, which a planning agent controls.
 
-**Recommendation: A, with `fido2` added for the rare high-stakes kinds.**
+**Proposal (P1): A, with `fido2` added for the rare high-stakes kinds.**
 
 ```toml
 [approval]
@@ -681,10 +757,8 @@ mutate = { all_of = ["polkit", "desk-key"] }
 export = { all_of = ["polkit", "desk-key"] }
 ```
 
-Reasoning:
-
 - `use` is frequent. One touch on a dialog the agent cannot alter is the right
-  cost. Every touch is still a YubiKey touch.
+  cost.
 - `reveal`, `mutate` and `export` are rare and their damage is permanent or
   affects every later session. Two touches buy both properties: the polkit
   dialog shows the true request, and the FIDO2 signature over the digest goes
@@ -696,36 +770,21 @@ Reasoning:
   [Strength of a chain](#strength-of-a-chain)).
 - For ssh or a machine with no graphical session, where polkit is
   `Unavailable`, the owner can switch `use` to `{ any_of = ["polkit",
-  "desk-key"] }` knowingly, accepting a terminal display.
-
-Setup, in order:
-
-1. Install `pam_u2f`, write `/etc/u2f_mappings` as root, add the `pam_u2f`
-   line to `/etc/pam.d/polkit-1` ([above](#pam_u2f-gnome-dialog-plus-yubikey-touch)).
-2. Optionally lock user GNOME Shell extensions off ([above](#locking-out-user-gnome-shell-extensions-optional)).
-3. `cn approver enroll --name desk-key`; install the record as root; reload.
-4. Set the chains in `/etc/countersign/config.toml`.
-5. `/usr/bin/cn doctor` from a terminal you opened yourself.
-6. Start agents with `cn session exec -- claude`, so the dialog can name the
-   session.
+  "desk-key"] }` knowingly, accepting a terminal display. A phone push
+  approver (decision 19) would be the better answer there.
 
 ## Open questions
 
-1. **polkit message expansion and display.** This design assumes polkitd
-   expands `$(key)` in an action's `<message>` from the details `cnd` passes,
-   and that gnome-shell shows the full expanded message. Both need testing on
-   the polkit version in Tumbleweed and on current GNOME Shell; KDE's agent
-   should be checked too. If expansion does not work, the alternative is the
-   `polkit.message` detail override, which polkit may only honour for
-   privileged callers. If neither works, the dialog proves presence but not
-   intent, and the recommendation changes. This is the most important item to
-   verify before building the adapter. (Also design.md open question 1.)
-2. **`org.freedesktop.policykit.owner` and the session subject.** Confirm that
-   a `countersign`-uid caller with this annotation can call
-   `CheckAuthorization` with `AllowUserInteraction` for another uid's
-   `unix-session`, and that the shell's agent receives it.
-3. **Resolving the graphical session.** Using the uid's logind `Display`
-   session works for a solo desktop. It is wrong if the developer has two
+1. ~~**polkit message expansion and display.**~~ Settled by the
+   [spike](../spikes/polkit-dialog/README.md) on polkit 128 and GNOME Shell
+   51: polkitd expands `$(key)` from the details an action owner passes, and
+   gnome-shell shows the whole message. KDE's agent is still unchecked.
+2. ~~**`org.freedesktop.policykit.owner` and the session subject.**~~ Settled
+   by the spike: the owner annotation works across uids with a process
+   subject; a session subject aborts polkitd 127/128 (polkit#699), hence
+   decision 15.
+3. **Resolving the graphical session** (`subject = "session"` only). Using
+   the uid's logind `Display` session works for a solo desktop. It is wrong if the developer has two
    graphical sessions, or approves from a remote desktop. Should the
    approver refuse when the uid has more than one graphical session?
 4. **Where `command` adapters run.** Forking them from `cnd` gives them the
@@ -742,8 +801,9 @@ Setup, in order:
    with self or no attestation. `attestation = "none"` re-opens enrollment of
    a software key by a shadowed `cn`. Should `cnd` then require that the record
    be produced by `cn` run as root (a different, root-owned environment)?
-7. **Lookalike dialogs for password-fallback setups.** With `sufficient` and
-   the key unplugged, the dialog asks for the password. A lookalike window
-   could phish it. Harmless for countersign on Wayland (the agent cannot type
-   into the real dialog), but the password also unlocks sudo. Recommend
-   `[success=done default=die]` for owners who never want password fallback?
+7. **Lookalike dialogs for the password factor.** With `--factor password`
+   (or a hijacked process subject), the human types their password into a
+   prompt. A lookalike window, or the agent's own registered prompt, could
+   collect it. That gives the agent nothing in countersign on Wayland it could
+   not get by asking, but the password also unlocks sudo. Should `cn doctor`
+   warn when the factor is `password`?

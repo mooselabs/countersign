@@ -2,16 +2,17 @@
 
 A local secret manager built for coding agents. The agent can see which secrets
 exist and what they are for, ask to use them, and run commands with them. You
-approve each request with a YubiKey touch on a desktop prompt. Values are kept
+approve each request on a desktop prompt, with a YubiKey touch or your
+password. Values are kept
 out of the agent's context and transcript (against careless and confused
 agents, not a deliberately malicious one; see below), and every use lands in
 an audit log the agent cannot change.
 
 CLI `cn`, daemon `cnd`. Rust, Linux first. Apache-2.0.
 
-> **Status: design phase.** The documents under [`docs/`](docs/) are the spec.
-> The streaming redaction engine (`crates/countersign-hide`) is implemented and
-> tested; nothing else works yet. Do not store real secrets in it.
+> **Status: Phase 1 in progress** ([roadmap](docs/roadmap.md)). The documents
+> under [`docs/`](docs/) are the spec. Phase 1 has not been reviewed: do not
+> store real secrets in it until it has.
 
 ## The problem
 
@@ -54,9 +55,10 @@ $ some-verbose-command | cn hide
 - **Use, don't read.** `cn run` puts values into the child process's
   environment and scrubs them from its output. Reading a raw value
   (`cn reveal`) is a separate grant mode and loudly audited.
-- **Approval the agent cannot fake.** An agent can type `cn approve` as easily
-  as you can. It cannot touch your YubiKey or answer a polkit dialog drawn by
-  your desktop on Wayland. Approvers are adapters chosen in config.
+- **Approval the agent cannot fake.** `cnd` raises a polkit dialog on your
+  desktop that starts with the request code and digest. The agent cannot
+  write that text, touch your YubiKey, or type into the dialog on Wayland.
+  Approvers are adapters chosen in config; Phase 1 has polkit only.
 - **Grants belong to one agent session** and expire. The daemon identifies
   the session from the kernel's view of the calling process's ancestry, not
   from environment variables or anything else the agent reports.
@@ -89,10 +91,28 @@ Containing that needs the agent in a sandbox or under a separate user.
 | [decisions.md](docs/decisions.md) | Decisions agreed so far |
 | [roadmap.md](docs/roadmap.md) | What gets built in which order |
 
-## Building
+## Install
+
+Linux 6.5 or later with systemd and polkit. Build as yourself, then install
+from a terminal you opened yourself:
 
 ```sh
-cargo test --all-targets
+cargo build --release --locked
+sudo packaging/install.sh --dry-run --factor touch   # read the plan first
+sudo packaging/install.sh --factor touch             # or password, touch+password
+```
+
+[packaging/README.md](packaging/README.md) explains what the script changes
+(including polkit's machine-wide PAM stack for the touch factors), the
+recovery phrase, uninstalling, and a smoke test to run afterwards. To set up
+agents, see [`integrations/`](integrations/) and
+[agent-integration.md](docs/agent-integration.md).
+
+## Building and testing
+
+```sh
+cargo test --all-targets --all-features
+bash packaging/tests/dry-run.sh
 ```
 
 ## License

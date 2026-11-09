@@ -3,7 +3,7 @@
 Ordered by what makes countersign useful to one developer soonest. Each phase
 ends with something the owner uses daily, not a demo.
 
-## Phase 0: design (now)
+## Phase 0: design (done)
 
 - Spec documents under `docs/`: threat model, design, approvers, audit, CLI,
   agent integration, prior art.
@@ -14,23 +14,30 @@ ends with something the owner uses daily, not a demo.
   codes.
 - Resolve the blocking open questions below before Phase 1 code.
 
-## Phase 1: replaces `.secret-*` files on one machine
+## Phase 1: replaces `.secret-*` files on one machine (in progress)
 
 Done when the owner has deleted every `.secret-*` file from the liskov
-workspace and its scripts use `cn run`.
+workspace and its scripts use `cn run`. Decisions 14 to 19 set its scope.
 
-1. `cnd` skeleton: socket activation, peer credentials, handshake, sessions
-   (launcher registration first, then matchers), in-memory grants.
+1. `cnd` skeleton: socket activation, peer credentials through
+   `SO_PEERPIDFD` (Linux 6.5+), handshake, sessions (launcher registration
+   first, then matchers), in-memory grants.
 2. Store: data model, XChaCha20-Poly1305 file, `systemd-creds` key slot,
-   recovery key slot, atomic writes.
+   recovery phrase slot, atomic writes; `cnd init` and `cnd recover`.
 3. Audit writer: hash-chained JSONL, `cn audit`, `cn audit verify`.
-4. Approvers: `fido2` (client-driven, YubiKey touch), then `polkit`.
-5. `cn`: `list`, `show`, `request`, `approve`, `deny`, `grants`, `revoke`,
-   `run`, `hide`, `add`, `set`, `edit`, `rm`, `import`, `session`,
-   `session exec`, `approver enroll`, `doctor`, with `--json`.
+4. Approver: `polkit` only, for every kind, with the session anchor as a
+   `unix-process` subject and request expiry enforced by `cnd`. An
+   `insecure-auto` approver behind the debug-only `insecure-test` feature for
+   end-to-end tests.
+5. `cn`: `list`, `show`, `request`, `approve` (prints the request for
+   cross-checking; the approval itself is the dialog), `deny`, `grants`,
+   `revoke`, `run`, `hide`, `add`, `set`, `edit`, `rm`, `import`, `session`,
+   `session exec`, `doctor`, with `--json`.
 6. Packaging: an install script for openSUSE (sysusers, tmpfiles, units,
-   polkit policy, udev rule), then an RPM spec.
-7. Agent integration: the AGENTS.md snippet and a Claude Code skill.
+   polkit policy, master key, approval factor with `pam_u2f`), then an RPM
+   spec. See [packaging/README.md](../packaging/README.md).
+7. Agent integration: the AGENTS.md snippet, a Claude Code skill and the
+   migration guide, in [`integrations/`](../integrations/).
 
 ## Phase 2: unattended and stricter
 
@@ -53,10 +60,24 @@ workspace and its scripts use `cn run`.
   `cn hide`, and whether a grant may cover a command pattern or only an
   exact argv.
 
+- **The `fido2` approver** (deferred from Phase 1 by decision 14):
+  client-driven approval with `/usr/bin/cn approve CODE` and a signature over
+  the request digest, `cn approver enroll`, root-owned credential records
+  (P2), and the all-of-polkit-and-FIDO2 chain for `reveal`, `mutate` and
+  `export` (P1). Needs the library choice (blocker 3 below).
+- **FIDO2 store unlock**: a `fido2` key slot, `cn unlock`, and the udev rule
+  for daemon-side FIDO2.
+- **A phone push approver.** A phone app that shows the request and signs
+  its answer over the digest: a display outside the desktop, and an approval
+  that works without a graphical session. Considered, not designed
+  (decision 19).
+- **Session subject for polkit** once polkit-org/polkit#699 is fixed:
+  `subject = "session"` closes the process-subject hijack (decision 15).
 - Standing grants for unattended hosts (an agent factory), anchored to a
   systemd unit, approved once.
 - Optional hard limits per secret: allowed executables, allowed hosts.
-- `reveal` mode with its own approver chain.
+- `reveal` with a stricter chain than `use` (polkit and FIDO2, P1). In
+  Phase 1 a reveal is approved through the polkit `reveal` action.
 - Masked previews for value swaps (scheme and host of a URL-shaped value).
 - macOS port (LOCAL_PEERPID, Touch ID approver).
 
@@ -71,32 +92,25 @@ workspace and its scripts use `cn run`.
   the developer's uid. Check first how much of this agent sandboxes already
   provide.
 
-## Open questions that block Phase 1
+## Open questions that blocked Phase 1
 
-Collected from the other documents. Each needs an owner decision or a test
-result before the code it names is written. Questions settled elsewhere (X11,
-grant persistence, expiry of running children, the key
-slot model) are no longer listed.
+Collected from the other documents. Questions settled elsewhere (X11,
+grant persistence, expiry of running children, the key slot model) are no
+longer listed.
 
-1. **polkit subject until polkit-org/polkit#699 is fixed.** The spike
-   ([spikes/polkit-dialog](../spikes/polkit-dialog/README.md)) showed GNOME
-   renders the request code, digest and summary that `cnd` passes as the
-   action owner, that an agent cannot pass dialog text, and that `auth_self`
-   does not cache. But a `unix-session` subject aborts polkitd 127/128, and a
-   `unix-process` subject can be taken over by a same-uid agent registering
-   its own authentication agent. Decide: ship Phase 1 on the process subject
-   (trusted display against careless agents only, documented), and/or
-   upstream a fix for #699 and switch to the session subject by polkit
-   version. Also confirm the spike's T4 (authorized after the human was told
-   to cancel) before polkit counts as an approver.
-2. **Kernel floor.** Require Linux 6.5+ for `SO_PEERPIDFD`, or keep the
-   `pidfd_open` fallback and its narrow pid-reuse window? Blocks the `cnd`
-   peer-credential code. ([design](design.md#12-open-questions) 2,
-   [threat model](threat-model.md) T8)
-3. **FIDO2 library.** `libfido2` conflicts with a statically linked `cn`;
+1. ~~**polkit subject until polkit-org/polkit#699 is fixed.**~~ Settled by
+   decision 15: Phase 1 ships on the `unix-process` subject (the session
+   anchor), with the hijack limit documented; `subject = "session"` is
+   available for when #699 is fixed. The spike's T4 was confirmed (the human
+   had authenticated; a real Cancel returns `polkit.dismissed`).
+   ([spike](../spikes/polkit-dialog/README.md))
+2. ~~**Kernel floor.**~~ Settled by decision 16: Linux 6.5 or later,
+   `SO_PEERPIDFD` only, no `pidfd_open` fallback.
+3. **FIDO2 library.** Deferred to Phase 2 with the `fido2` approver
+   (decision 14). `libfido2` conflicts with a statically linked `cn`;
    the pure-Rust options have smaller user bases, and `ctap-hid-fido2` cannot
-   link statically on musl ([fnox evaluation](fnox-evaluation.md)). Blocks the `fido2` client
-   side of `cn approve`. ([approvers](approvers.md#library-choice-open))
+   link statically on musl ([fnox evaluation](fnox-evaluation.md),
+   [approvers](approvers.md#library-choice-open)).
 4. ~~**Overlap with fnox.**~~ Settled: countersign keeps its own store; fnox
    trusts the agent's uid by design and cannot host a separate-uid broker. In
    Phase 3 `cnd` may call `fnox env --json` as its own user to reach

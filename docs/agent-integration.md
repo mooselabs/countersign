@@ -2,7 +2,8 @@
 
 How coding agents (Claude Code, Codex, Grok and others) use countersign, what
 to put in a project's agent instructions, optional Claude Code hooks, and how
-to move a project off plaintext `.secret-*` files.
+to move a project off plaintext `.secret-*` files. The files to install live
+in [`integrations/`](../integrations/); this document explains them.
 
 The commands are specified in [cli.md](cli.md). What these measures do and do
 not protect against is in [threat-model.md](threat-model.md); the short
@@ -15,8 +16,9 @@ agent                                   human                       cnd
 -----                                   -----                       ---
 cn list / cn show NAME          ─────────────────────────────────►  names, prose, grants
 cn request NAME --reason ... --wait ──────────────────────────────►  pending K7M-Q2X
-  tells the human the code      ──► polkit dialog: touch key   ──►  approved, grant g_…
-                                    or: ! /usr/bin/cn approve K7M-Q2X
+  tells the human the code      ──► polkit dialog: checks code ──►  approved, grant g_…
+                                    and digest, touches the key
+                                    or types the password
 cn run --use NAME -- cmd        ─────────────────────────────────►  values issued, use.start
   output scrubbed by cn run
 other output | cn hide          ─────────────────────────────────►  scrubbed in cnd
@@ -26,6 +28,12 @@ cn revoke --all (when done)     ────────────────
 In this flow the agent never reads a value. It sees names, descriptions and usage prose,
 asks for a grant with a reason, and runs commands that receive the value in
 their environment.
+
+In Phase 1 the only approver is polkit (decision 14), so every approval
+happens in the desktop dialog that `cnd` raises. `cn approve CODE` only prints
+the pending request, so the human can cross-check it against the dialog. The
+client-driven path (`! /usr/bin/cn approve CODE` with a FIDO2 touch) comes
+with the `fido2` approver in Phase 2.
 
 ## Start the agent under a session
 
@@ -49,108 +57,35 @@ human explicitly chose.
 
 ## Snippet for AGENTS.md / CLAUDE.md
 
-Paste this into the project's agent instructions. It is short on purpose:
-agents follow short imperative rules better than explanations.
-
-````markdown
-## Secrets (countersign)
-
-Credentials for this project are held by countersign (`cn`). Use them only
-through `cn`.
-
-- Never read, print, copy, grep or source `.secret-*` files, `.env` files with
-  credentials, or anything under `/var/lib/countersign`. If you find a
-  plaintext secret file, tell the human and do not open it.
-- Run `cn list` first, and `cn show NAME` to read a secret's usage notes.
-  Follow those notes.
-- To use a secret, request it with a specific reason and the shortest TTL that
-  does the job:
-  `cn request NAME --reason "<what you will run and why>" --ttl 30m --wait 100s`
-- Then tell the human the request code and digest and ask them to approve the
-  desktop dialog, or to type exactly: `! /usr/bin/cn approve <CODE>`.
-  Never run `cn approve` yourself.
-- Run commands with the secret injected:
-  `cn run --use NAME[=ENVVAR] -- <command>`. Never put a value in a command
-  argument, a file, `export`, or a commit.
-- Pipe any output that might contain a secret through `| cn hide`: logs,
-  `env`, config dumps, verbose HTTP output, and files a `cn run` command wrote.
-- Never run `cn reveal` unless the human has asked for the raw value in this
-  conversation.
-- Never run `cn add`, `set`, `edit`, `rm`, `import`, `export`, `unlock` or
-  `approver`. Ask the human. You may draft descriptions and usage text for
-  them.
-- Exit 4 (no grant) or 7 (expired): request again. Exit 5 (denied): stop and
-  ask the human; do not look for another way to get the value.
-- Use `--json` when you parse `cn` output. Run `cn revoke --all` when the task
-  is done.
-````
+[`integrations/AGENTS.snippet.md`](../integrations/AGENTS.snippet.md) is the
+text to paste into a project's agent instructions. It is short on purpose:
+agents follow short imperative rules better than explanations. It tells the
+agent to list and read usage notes first, to request with a specific reason
+and a short TTL, to have the human approve the dialog after comparing the
+code and digest, to run commands through `cn run` and pipe other output
+through `cn hide`, never to open `.secret-*` files, never to ask the human to
+paste a value into the chat, and what to do on each exit code.
 
 The snippet works for any agent that reads `AGENTS.md` or `CLAUDE.md`. In a
 repository whose `CLAUDE.md` imports `AGENTS.md`, put it in `AGENTS.md` only.
 
-## Claude Code skill (sketch)
+## Claude Code skill
 
 A skill carries the longer procedure, so the always-loaded snippet can stay
-short. Install as `.claude/skills/countersign/SKILL.md` in the project, or
-under `~/.claude/skills/` for every project.
+short: [`integrations/claude-code/skills/countersign/SKILL.md`](../integrations/claude-code/skills/countersign/SKILL.md).
+Its description makes Claude Code load it when a task mentions secrets,
+credentials, API keys, tokens or `.secret-*` files. It walks through `cn list`,
+`cn show`, `cn request --wait`, the message to the human, `cn run`, `cn hide`
+and `cn revoke`, shows what the approval dialog looks like to the human, and
+lists what never to do.
 
-````markdown
----
-name: countersign
-description: Use when a task needs an API key, password, token, DSN or other
-  credential, when a command fails for lack of one, or when you are about to
-  read a .secret-* or .env file. Covers listing secrets, requesting a grant,
-  getting human approval, running commands with secrets injected, and
-  scrubbing output.
----
+Install it in the project as `.claude/skills/countersign/SKILL.md`, or under
+`~/.claude/skills/countersign/` for every project:
 
-# Using secrets through countersign
-
-## Steps
-
-1. `cn list --json`. Pick the secret whose description and usage fit the
-   task. If none fits, stop and tell the human what credential is missing;
-   suggest a name, description and usage text they could add with `cn add`.
-2. `cn show NAME`. Read the usage prose and follow it. If it says to prefer a
-   sandbox secret, use that one unless the task names production.
-3. Check for an existing grant: `cn grants --json`. If one covers the secret,
-   go to step 6.
-4. `cn request NAME --reason "<command you will run> to <purpose>" --ttl 30m --wait 100s --json`.
-   - Request only the secrets the next commands need. Ask for `--mode reveal`
-     only when the human asked to see the value.
-   - The reason is shown to the human as yours. Be specific: name the script
-     and what it does with the secret.
-5. If the result is `pending` (exit 6) or `approvers` lists a client-driven
-   approver, tell the human, in one line:
-   "Please approve countersign request K7M-Q2X (digest 3QF8-ZK2M): touch the
-   key in the desktop dialog, or run `! /usr/bin/cn approve K7M-Q2X`."
-   Then wait for the human to reply, and confirm with `cn grants --json`.
-6. Run: `cn run --use NAME[=ENVVAR] -- <command>`. Use the variable name the
-   program already reads. Several secrets: repeat `--use`.
-7. If you read anything else that might contain the value (log files the
-   command wrote, `docker compose config`, `env`), pipe it through `| cn hide`.
-8. When finished: `cn revoke --all`.
-
-## Exit codes
-
-| Exit | Do |
-| --- | --- |
-| 4 `grant_required` | Go to step 4. |
-| 5 `denied` | Stop. Ask the human what they want instead. |
-| 6 `pending` | Ask the human to approve (step 5). |
-| 7 `request_expired` | Request again. |
-| 8 `unknown_secret` | `cn list --all`; the name may be scoped to another project. |
-| 11 `no_session` | Tell the human; they should start you with `cn session exec`. |
-| 12 `store_sealed` | Ask the human to run `/usr/bin/cn unlock`. |
-| 125 from `cn run` | `cn` failed before running the command; read the error code on stderr. |
-
-## Never
-
-- Read `.secret-*` files or `/proc/*/environ`.
-- Run `cn approve`, `cn add/set/edit/rm/import/export`, `cn unlock`.
-- Put a value on a command line, in a file, or in a commit.
-- Work around a denial.
-````
+```console
+$ mkdir -p ~/.claude/skills/countersign
+$ cp integrations/claude-code/skills/countersign/SKILL.md ~/.claude/skills/countersign/
+```
 
 ## Claude Code hooks (defence in depth)
 
@@ -248,7 +183,7 @@ case "$tool" in
 
     # Approvals and store changes are for the human.
     if grep -Eq '(^|[[:space:];&|(/])cn[[:space:]]+(approve|add|set|edit|rm|import|export|unlock|approver)([[:space:]]|$)' <<<"$cmd"; then
-      deny "approvals and store changes are for the human. Ask them to run: ! /usr/bin/cn approve <CODE>"
+      deny "approvals and store changes are for the human. Ask them to approve the countersign dialog."
     fi
 
     # Reading other processes' environments or the daemon's state.
@@ -278,7 +213,7 @@ exit 0
 Notes:
 
 - The guard blocks the agent's tool calls only. A `!` command typed by the
-  human is not a tool call, so `! /usr/bin/cn approve K7M-Q2X` still works.
+  human is not a tool call, so `! /usr/bin/cn import ...` still works.
 - The `| cn hide` rule is a reminder implemented as a block: the agent sees
   the message and re-runs the command with the pipe. Extend the pattern list
   with the project's own noisy commands.
@@ -294,193 +229,13 @@ over where the tool supports pre-execution checks.
 
 ## Migrating from `.secret-*` files
 
-Starting point: files such as `.secret-clickhouse-password`,
-`.secret-typesafe-api-key` and `.secret-acurast-rpc-bearer-token` in a project
-root, read by scripts as a fallback when an environment variable such as
-`TYPESAFE_API_KEY` is not set.
-
-End point: no plaintext files; scripts read only the environment variable;
-the agent runs them through `cn run`.
-
-### 1. Inventory
-
-The agent can do this; none of it reads a value.
-
-```console
-$ ls -la .secret-*
-$ git ls-files -- '.secret-*'                         # tracked: values are in git
-$ git log --all --format='%h %ad %s' -- '.secret-*'   # ever committed
-$ grep -rn --exclude-dir=.git -e '\.secret-' .        # which scripts read which file
-```
-
-Record, per file: which scripts read it, which environment variable they try
-first, whether it was ever tracked, and its mode (0644 means every local user
-could read it).
-
-### 2. Draft the metadata
-
-The agent drafts `countersign-import.toml` from what the scripts do. No
-values go in this file.
-
-```toml
-[clickhouse-password]
-description = "ClickHouse analytics, read-only user `reporter`"
-usage = """
-Read-only queries from scripts/clickhouse_*.py via CLICKHOUSE_PASSWORD.
-Never write it into committed config or a URL. Production data: prefer the
-sandbox service unless the task names production.
-"""
-projects = ["~/projects/moose/*"]
-high_entropy = false
-
-[typesafe-api-key]
-description = "Typesafe API, production account"
-usage = "Used by scripts/typesafe_*.py via TYPESAFE_API_KEY. Read-only calls unless the task says otherwise."
-projects = ["~/projects/moose/*"]
-high_entropy = true
-
-[acurast-rpc-bearer-token]
-description = "Bearer token for the Acurast RPC endpoint (mainnet)"
-usage = "Only for scripts/acurast_*.py read calls via ACURAST_RPC_BEARER_TOKEN. Never log request headers."
-projects = ["~/projects/moose/*"]
-high_entropy = true
-```
-
-The human reviews it: usage prose steers every later agent session.
-
-### 3. Import
-
-The human runs the import. It needs no prompt, so it works as a `!` command:
-
-```console
-! /usr/bin/cn import --glob '.secret-*' --metadata countersign-import.toml --shred --wait
-importing 3 secrets from /home/patrick/projects/moose/liskov-agent-orchestrator
-  clickhouse-password        from .secret-clickhouse-password        (0644, never tracked)
-  typesafe-api-key           from .secret-typesafe-api-key           (0644, never tracked)
-  acurast-rpc-bearer-token   from .secret-acurast-rpc-bearer-token   (0644, never tracked)
-request W3J-9QA pending  mutate: add 3 secrets
-digest  A71C-HH2P
-approve a desktop dialog is open
-added 3 secrets; shredded 3 files
-```
-
-The approval dialog lists the names being added. Delete
-`countersign-import.toml` afterwards or keep it out of git; it holds no values
-but it is not useful once imported.
-
-### 4. Change the scripts
-
-Keep the environment variable the script already reads. Remove the file
-fallback, and fail with a message that names the `cn run` command.
-
-Python, before:
-
-```python
-def typesafe_api_key() -> str:
-    value = os.environ.get("TYPESAFE_API_KEY")
-    if value:
-        return value
-    path = Path(".secret-typesafe-api-key")
-    if path.exists():
-        return path.read_text().strip()
-    sys.exit("set TYPESAFE_API_KEY or create .secret-typesafe-api-key")
-```
-
-After:
-
-```python
-def typesafe_api_key() -> str:
-    value = os.environ.get("TYPESAFE_API_KEY")
-    if value is None or value == "":
-        sys.exit(
-            "TYPESAFE_API_KEY is not set. Run this script under countersign:\n"
-            "  cn run --use typesafe-api-key=TYPESAFE_API_KEY -- python3 "
-            + " ".join(sys.argv)
-        )
-    return value
-```
-
-Shell:
-
-```sh
-: "${TYPESAFE_API_KEY:?run under: cn run --use typesafe-api-key=TYPESAFE_API_KEY -- $0}"
-```
-
-Invocation:
-
-```console
-$ cn run --use typesafe-api-key=TYPESAFE_API_KEY -- python3 scripts/typesafe_sync.py
-$ cn run --use clickhouse-password=CLICKHOUSE_PASSWORD \
-         --use acurast-rpc-bearer-token=ACURAST_RPC_BEARER_TOKEN \
-         -- python3 scripts/acurast_usage_report.py
-```
-
-`--use typesafe-api-key` alone maps to `TYPESAFE_API_KEY` by the default
-upper-snake rule; spell the variable out when the script reads a different
-name.
-
-A script can wrap itself so callers do not have to remember the flags:
-
-```sh
-#!/bin/sh
-# scripts/typesafe-sync: re-exec under countersign when the key is missing.
-if [ -z "${TYPESAFE_API_KEY:-}" ]; then
-  exec cn run --use typesafe-api-key=TYPESAFE_API_KEY -- "$0" "$@"
-fi
-exec python3 "$(dirname "$0")/typesafe_sync.py" "$@"
-```
-
-Make or just targets do the same:
-
-```make
-typesafe-sync:
-	cn run --use typesafe-api-key=TYPESAFE_API_KEY -- python3 scripts/typesafe_sync.py
-```
-
-Things to check in each script:
-
-- It must not print the value, put it in a URL that gets logged, or write it
-  to a file. `cn run` scrubs stdout and stderr, not files.
-- It must not pass the value as an argument to another program; the child can
-  read the variable itself.
-- Test runners and CI that set the variable directly keep working: the script
-  only reads the environment.
-
-### 5. Leave a tripwire
-
-- Keep `.secret-*` in `.gitignore`.
-- Add the snippet above to the project's `AGENTS.md`.
-- Optionally install the hook, which blocks any command mentioning
-  `.secret-`.
-- `cn doctor` reports leftover `.secret-*` files and placeholder descriptions.
-
-### 6. Rotate
-
-Importing does not un-disclose anything. Rotate every value that was:
-
-- ever in a file with mode 0644 on a multi-user machine;
-- ever committed (`git log --all` above);
-- ever read into an agent transcript. Claude Code keeps transcripts under
-  `~/.claude/projects/`; other agents keep their own logs. To check whether a
-  value appears in them without displaying it, the human can run, in a
-  terminal:
-
-  ```console
-  $ cat ~/.claude/projects/*/*.jsonl | cn hide --stats > /dev/null
-  hits: typesafe-api-key 4
-  ```
-
-  This only matches high-entropy secrets and secrets granted to the current
-  session (to check `clickhouse-password`, request a use grant for it first).
-
-`--from-file` on `cn add` and `cn set`, and `cn import --shred`, overwrite and unlink, which does
-not erase data on btrfs (copy-on-write, and snapshots), on SSDs, or in
-backups. Check whether snapper or a backup tool captures the project
-directory. Treat the old values as disclosed and rotate:
-
-```console
-$ /usr/bin/cn set typesafe-api-key --from-clipboard --wait
-```
+The step-by-step guide is
+[`integrations/migrating-from-secret-files.md`](../integrations/migrating-from-secret-files.md):
+inventory the files and the scripts that read them, draft a metadata file
+(no values), import with one approved `cn import`, change the scripts to read
+only the environment variable and run them through `cn run`, add the snippet
+and the skill, leave a tripwire, and rotate every value that was ever
+readable.
 
 ## What this does and does not protect
 
@@ -500,8 +255,9 @@ model), and later the egress proxy, where the value never enters your uid.
 1. **Does `!` bypass PreToolUse hooks?** This document assumes a `!` command
    is not a tool call and so is not blocked by the guard. That matches current
    Claude Code behaviour as understood, but should be checked against the
-   current release; if hooks do apply, the guard must allow
-   `/usr/bin/cn approve`.
+   current release; if hooks do apply, the guard must allow the human's
+   `/usr/bin/cn import` and other store commands (and, in Phase 2,
+   `/usr/bin/cn approve`).
 2. **`--wait` length.** The snippet uses `--wait 100s` to stay under Claude
    Code's default Bash tool timeout (about two minutes). A human who takes
    longer leaves the agent with exit 6 and a follow-up `cn grants` call. Is
