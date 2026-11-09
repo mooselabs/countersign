@@ -1,6 +1,6 @@
 # shellcheck shell=bash
-# Sourced by install.sh and trusted-build.sh, which run as root. Not run on
-# its own.
+# Sourced by install.sh, uninstall.sh and trusted-build.sh, which run as
+# root. Not run on its own.
 
 # untrusted_reason PATH: prints why a user other than root could change PATH,
 # or nothing when only root can. PATH is resolved first (symlinks followed),

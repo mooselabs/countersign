@@ -375,9 +375,26 @@ expect "uninstall: unchanged config removed" has "would run: rm -f /etc/counters
 expect "uninstall: keeps the store" not has "rm -rf /var/lib/countersign"
 expect "uninstall: keeps the key" not has "rm -f /etc/credstore.encrypted/countersign-mk"
 expect "uninstall: changed nothing" test "$before" = "$(snapshot)"
+expect "uninstall: checks itself" has "this script can be changed by root only"
 plan uninstall.sh --purge
 expect "uninstall --purge: deletes the store" has "would run: rm -rf /var/lib/countersign"
 expect "uninstall --purge: deletes the key" has "would run: rm -f /etc/credstore.encrypted/countersign-mk"
+
+# Run from a tree a non-root user can change.
+FAKE_ROOT_OWNED='' plan uninstall.sh
+expect "uninstall from a user-owned tree: refused" not ok
+expect "uninstall from a user-owned tree: says why" has "is owned by uid $(id -u), not root"
+expect "uninstall from a user-owned tree: points to the trusted tree" has "packaging/trusted-build.sh"
+expect "uninstall from a user-owned tree: before any step" not has "== stop and remove the units"
+FAKE_ROOT_OWNED='' plan uninstall.sh --allow-user-tree
+expect "uninstall from a user-owned tree with --allow-user-tree: exit 0" ok
+expect "uninstall from a user-owned tree with --allow-user-tree: warns" has "WARNING: --allow-user-tree"
+FAKE_GROUP_WRITABLE=$(realpath "$pkg/..") plan uninstall.sh
+expect "uninstall from a group-writable checkout: refused" not ok
+expect "uninstall from a group-writable checkout: says why" has "is writable by group"
+FAKE_GROUP_WRITABLE=$(realpath "$pkg/../examples/config.toml") plan uninstall.sh
+expect "uninstall with a group-writable example config: refused" not ok
+expect "uninstall: changed nothing, refusals included" test "$before" = "$(snapshot)"
 expect "uninstall: ran no system tool" test ! -s "$calls"
 
 printf '\n'

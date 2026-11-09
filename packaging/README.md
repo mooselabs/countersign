@@ -245,7 +245,9 @@ Without the phrase, a store whose master key is lost cannot be opened.
 ## Uninstall
 
 Run the copy in the root-owned tree, not one in your checkout: it runs as
-root too.
+root too. Like `install.sh`, it refuses to run when it, the files next to it
+or the example config it compares against could be changed by a user other
+than root; `--allow-user-tree` accepts that, with a warning.
 
 ```console
 $ sudo /usr/local/src/countersign/<commit>/packaging/uninstall.sh --dry-run

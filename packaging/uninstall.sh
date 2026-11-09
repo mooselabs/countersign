@@ -1,7 +1,8 @@
 #!/bin/bash
 # Remove countersign from this machine. See packaging/README.md.
 #
-#   sudo packaging/uninstall.sh [--purge] [--user NAME] [--dry-run]
+#   sudo /usr/local/src/countersign/<commit>/packaging/uninstall.sh \
+#       [--purge] [--user NAME] [--dry-run] [--allow-user-tree]
 #
 # Removes the binaries, units, polkit policy, the touch-factor PAM stack (your
 # earlier /etc/pam.d/polkit-1 comes back if install.sh had backed it up), the
@@ -18,18 +19,27 @@
 #              unless you have an export.
 #   --user     only for the closing message (default: $SUDO_USER)
 #   --dry-run  print every action and change nothing; needs no root
+#   --allow-user-tree
+#              run even though this script or the files next to it could be
+#              changed by a user other than root (a developer's checkout).
+#              Without it, uninstall.sh refuses: it runs as root, so whoever
+#              can change those files can run code as root. Run the copy in
+#              the root-owned tree trusted-build.sh made instead.
 #
 # pam_u2f stays installed; it does nothing unless a PAM stack uses it.
 set -euo pipefail
 
-here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+here=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(dirname "$here")
+# shellcheck source-path=SCRIPTDIR source=lib/trusted-path.sh
+. "$here/lib/trusted-path.sh"
 
 # For tests only: with --dry-run, every system path is read below this prefix.
 R=${COUNTERSIGN_INSTALL_ROOT:-}
 
 purge=0
 dry=0
+allow_user_tree=0
 user=${SUDO_USER:-}
 
 usage() {
@@ -40,6 +50,7 @@ while [ $# -gt 0 ]; do
     case $1 in
     --purge) purge=1; shift ;;
     --dry-run) dry=1; shift ;;
+    --allow-user-tree) allow_user_tree=1; shift ;;
     --user) user=${2:?--user needs a value}; shift 2 ;;
     --user=*) user=${1#*=}; shift ;;
     -h | --help) usage; exit 0 ;;
@@ -91,6 +102,28 @@ if [ "$dry" = 0 ]; then
     [ "$(id -u)" = 0 ] || die "run with sudo (or add --dry-run to see the plan without root)"
 fi
 [ "$dry" = 0 ] || say "Dry run: nothing below is done."
+
+# This script runs as root, so it and what it reads to decide must be
+# changeable by root only. In a developer's checkout, anything running as
+# the developer (an agent included) could change it and run code as root.
+# The example config decides whether the installed one is removed.
+untrusted=
+for f in "${BASH_SOURCE[0]}" "$here/lib/trusted-path.sh" "$config_src"; do
+    [ "$f" != "$config_src" ] || [ -e "$f" ] || continue
+    untrusted=$(untrusted_reason "$f")
+    [ -z "$untrusted" ] || break
+done
+if [ -z "$untrusted" ]; then
+    note "this script can be changed by root only"
+elif [ "$allow_user_tree" = 0 ]; then
+    die "refusing to run from files a user other than root can change: $untrusted. Anything running as that user, an agent included, could have changed what this script runs as root. Run the uninstall.sh in the root-owned tree packaging/trusted-build.sh made (packaging/README.md, \"Uninstall\"), or pass --allow-user-tree to accept that"
+else
+    say ""
+    say "  WARNING: --allow-user-tree: $untrusted."
+    say "  Anything running as that user, an agent included, could have changed this"
+    say "  script, and so runs code as root through it."
+    say ""
+fi
 
 step "stop and remove the units"
 if exists "$unit_dir/countersign.socket" || exists "$unit_dir/countersign.service"; then
