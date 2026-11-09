@@ -86,6 +86,11 @@ pub enum StoreError {
     /// Metadata or a value that breaks a data-model rule.
     #[error("{0}")]
     Invalid(String),
+    /// A failed write or rollback left the files in a state this process
+    /// could not confirm. Changes are refused until `cnd` restarts and
+    /// reads the store again.
+    #[error("the store refuses changes until cnd restarts: {0}")]
+    Poisoned(String),
 }
 
 impl StoreError {
@@ -161,6 +166,7 @@ pub struct Store {
     keys: Keys,
     generation: u64,
     secrets: BTreeMap<String, Entry>,
+    poisoned: Option<String>,
 }
 
 impl std::fmt::Debug for Store {
@@ -204,6 +210,7 @@ impl Store {
             keys: Keys::derive(&dk),
             generation: 0,
             secrets: BTreeMap::new(),
+            poisoned: None,
         };
         let bytes = store.encode(0)?;
         fsio::replace(dir, STORE_FILE, &bytes, false)
@@ -253,6 +260,7 @@ impl Store {
             keys,
             generation,
             secrets,
+            poisoned: None,
         })
     }
 
@@ -323,11 +331,19 @@ impl Store {
     /// Applies a batch (`rm` of several names, `import`) in order and writes
     /// the store once: all of it commits or none of it. The changes share
     /// the new generation.
+    ///
+    /// A write can fail after the new file was renamed into place (the
+    /// directory `fsync`). Then the old file is put back, so what is on disk
+    /// matches memory and the change does not appear at the next start. If
+    /// that is not possible the store is poisoned ([`StoreError::Poisoned`]).
     pub fn apply_all(
         &mut self,
         ms: &[Mutation],
         now: SystemTime,
     ) -> Result<Vec<Change>, StoreError> {
+        if let Some(why) = &self.poisoned {
+            return Err(StoreError::Poisoned(why.clone()));
+        }
         let mut next = self.secrets.clone();
         let mut changes = Vec::with_capacity(ms.len());
         let generation = self.generation + 1;
@@ -346,7 +362,10 @@ impl Store {
         if changes.is_empty() {
             return Ok(changes);
         }
-        self.write(generation, &next)?;
+        if let Err(e) = self.write(generation, &next) {
+            self.undo_write(generation, &e);
+            return Err(e);
+        }
         self.secrets = next;
         self.generation = generation;
         Ok(changes)
@@ -384,10 +403,57 @@ impl Store {
         self.apply(&Mutation::Rm { name }, now)
     }
 
+    /// After a failed write of generation `generation`: if the new file is
+    /// in place anyway, put the old one back.
+    fn undo_write(&mut self, generation: u64, cause: &StoreError) {
+        let path = self.dir.join(STORE_FILE);
+        let on_disk = std::fs::read(&path)
+            .map_err(StoreError::io(&path))
+            .and_then(|b| decode(&self.keys, &b));
+        match on_disk {
+            Ok((g, _)) if g == self.generation => {}
+            Ok((g, _)) if g == generation => {
+                let restored = self.restore_prev();
+                if let Err(e) = restored {
+                    self.poisoned = Some(format!(
+                        "a write failed after the new store was in place ({cause}), and \
+                         restoring the previous one failed: {e}"
+                    ));
+                }
+            }
+            Ok((g, _)) => {
+                self.poisoned = Some(format!(
+                    "after a failed write ({cause}) the store on disk is generation {g}, \
+                     memory has {}",
+                    self.generation
+                ));
+            }
+            Err(e) => {
+                self.poisoned = Some(format!(
+                    "after a failed write ({cause}) the store could not be read back: {e}"
+                ));
+            }
+        }
+    }
+
+    /// Whether changes are refused, and why.
+    pub fn poisoned(&self) -> Option<&str> {
+        self.poisoned.as_deref()
+    }
+
     /// Puts `store.v1.prev` back as the store, on disk and in memory. `cnd`
     /// calls this when the audit record for a mutation cannot be written
-    /// (audit.md, "Writes").
+    /// (audit.md, "Writes"). If it fails, the store is poisoned: memory and
+    /// disk may disagree, so later changes are refused.
     pub fn rollback(&mut self) -> Result<(), StoreError> {
+        let r = self.restore_prev();
+        if let Err(e) = &r {
+            self.poisoned = Some(format!("rolling back a change failed: {e}"));
+        }
+        r
+    }
+
+    fn restore_prev(&mut self) -> Result<(), StoreError> {
         let prev = self.dir.join(STORE_PREV_FILE);
         let bytes = std::fs::read(&prev).map_err(StoreError::io(&prev))?;
         let (generation, secrets) = decode(&self.keys, &bytes)?;

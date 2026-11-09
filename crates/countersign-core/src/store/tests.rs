@@ -296,7 +296,8 @@ fn prev_holds_the_last_generation_and_rollback_restores_it() {
 #[test]
 fn a_failed_write_leaves_disk_and_memory_unchanged() {
     use fsio::{FAIL_AT, Step};
-    for step in [Step::WriteTmp, Step::LinkPrev, Step::Rename] {
+    // SyncDir fails after the new file is in place: the old one goes back.
+    for step in [Step::WriteTmp, Step::LinkPrev, Step::Rename, Step::SyncDir] {
         let (_d, mk, mut s, _) = new_store();
         s.add(meta("a"), val("value-one-1"), t(1)).unwrap();
         FAIL_AT.with(|f| f.set(Some(step)));
@@ -311,10 +312,24 @@ fn a_failed_write_leaves_disk_and_memory_unchanged() {
             b"value-one-1",
             "{step:?}"
         );
+        assert_eq!(Store::open(s.dir(), &mk).unwrap().generation(), 1);
+        assert!(s.poisoned().is_none());
         // The next write succeeds.
         s.set("a", val("value-three"), t(3)).unwrap();
         assert_eq!(Store::open(s.dir(), &mk).unwrap().generation(), 2);
     }
+}
+
+#[test]
+fn a_failed_rollback_refuses_later_changes() {
+    let (_d, _mk, mut s, _) = new_store();
+    s.add(meta("a"), val("value-one-1"), t(1)).unwrap();
+    std::fs::remove_file(s.dir().join(STORE_PREV_FILE)).unwrap();
+    assert!(s.rollback().is_err());
+    assert!(s.poisoned().is_some());
+    let e = s.set("a", val("value-two-2"), t(2)).unwrap_err();
+    assert!(matches!(e, StoreError::Poisoned(_)), "{e:?}");
+    assert_eq!(e.code(), countersign_proto::ErrorCode::Internal);
 }
 
 #[test]

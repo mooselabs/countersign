@@ -394,12 +394,11 @@ impl Conn {
         let mut out = Vec::new();
         // Every stream is audited, also one the client abandons: hit counts
         // are how probing shows up (design.md section 8).
-        let record = |bytes_in, bytes_out, hits: &countersign_hide::Hits| {
+        let record = |bytes_in, hits: &countersign_hide::Hits| {
             self.d.lock().record(
                 Some(&sref),
                 &Event::Hide {
                     bytes_in,
-                    bytes_out,
                     hits: hits.clone(),
                     patterns: redactor.patterns() as u64,
                 },
@@ -414,7 +413,7 @@ impl Conn {
                         let mut rest = Vec::new();
                         let hits = stream.finish(&mut rest);
                         zeroize::Zeroize::zeroize(&mut rest);
-                        record(bytes_in, bytes_out, &hits);
+                        record(bytes_in, &hits);
                         let _ = frames::write_message(w, id, &Response::Error(body)).await;
                         return Err(());
                     }
@@ -429,7 +428,7 @@ impl Conn {
                         if sent.is_err() {
                             let hits = stream.finish(&mut out);
                             zeroize::Zeroize::zeroize(&mut out);
-                            record(bytes_in, bytes_out, &hits);
+                            record(bytes_in, &hits);
                             return Err(());
                         }
                     }
@@ -439,7 +438,7 @@ impl Conn {
                     bytes_out += out.len() as u64;
                     let sent = frames::write_stream(w, &out).await;
                     zeroize::Zeroize::zeroize(&mut out);
-                    record(bytes_in, bytes_out, &hits);
+                    record(bytes_in, &hits);
                     sent.map_err(|_| ())?;
                     let summary = Response::HideSummary {
                         bytes_in,
@@ -455,7 +454,7 @@ impl Conn {
                 _ => {
                     let hits = stream.finish(&mut out);
                     zeroize::Zeroize::zeroize(&mut out);
-                    record(bytes_in, bytes_out, &hits);
+                    record(bytes_in, &hits);
                     return Err(());
                 }
             }
