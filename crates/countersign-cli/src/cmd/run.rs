@@ -4,7 +4,9 @@
 //! Exit codes follow `env(1)`: the child's code; 128+N when a signal killed
 //! it; 125 when `cn` failed before starting it; 126 when the command could
 //! not be executed; 127 when it was not found. Every error this module
-//! returns becomes 125 in `main`.
+//! returns becomes 125 in `main`. If the child has exited but a process it
+//! started still holds its stdout or stderr, a SIGTERM, SIGHUP, SIGQUIT or
+//! SIGINT to `cn` ends it with 128+N without waiting for that process.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -12,6 +14,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
 use countersign_hide::{Builder, Hits, Redactor, Secret};
@@ -29,6 +32,10 @@ use crate::output::{Ctx, clean_line};
 /// Signals forwarded to the child. SIGINT is caught and dropped: the child
 /// gets it from the terminal, and `cn` keeps scrubbing until the child exits.
 const FORWARDED: [i32; 6] = [SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2, SIGWINCH];
+
+/// Signals that end `cn` (exit 128+N) when they arrive after the child exited
+/// while something it started still holds its stdout or stderr open.
+const TERMINATING: [i32; 4] = [SIGTERM, SIGHUP, SIGQUIT, SIGINT];
 
 /// Exit code when the command was found but could not be executed.
 pub const EXIT_CANNOT_EXECUTE: i32 = 126;
@@ -119,26 +126,80 @@ pub fn run(ctx: &Ctx, args: &RunArgs) -> Result<i32, CnError> {
         }
     };
 
-    let forwarder = Forwarder::start(&child);
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let (status, hits) = std::thread::scope(|s| {
-        let out = s.spawn(|| stdout.map(|r| pump(r, io::stdout(), &redactor)));
-        let err = s.spawn(|| stderr.map(|r| pump(r, io::stderr(), &redactor)));
-        let status = child.wait();
-        let mut hits = out.join().ok().flatten().unwrap_or_default();
-        for (name, n) in err.join().ok().flatten().unwrap_or_default() {
-            *hits.entry(name).or_insert(0) += n;
+    // Pump threads are detached rather than scoped: a background process the
+    // child started can hold the pipes open long after the child exits, and
+    // a terminating signal must then end cn without waiting for it.
+    let redactor = Arc::new(redactor);
+    let (tx, rx) = mpsc::channel();
+    let mut pumps = 0;
+    if let Some(r) = child.stdout.take() {
+        spawn_pump(r, io::stdout(), &redactor, &tx);
+        pumps += 1;
+    }
+    if let Some(r) = child.stderr.take() {
+        spawn_pump(r, io::stderr(), &redactor, &tx);
+        pumps += 1;
+    }
+    let forwarder = Forwarder::start(&child, tx);
+    let status = child.wait();
+
+    let mut hits = Hits::new();
+    let mut stopped_by = None;
+    while pumps > 0 {
+        match rx.recv() {
+            Ok(Event::Pumped(h)) => {
+                for (name, n) in h {
+                    *hits.entry(name).or_insert(0) += n;
+                }
+                pumps -= 1;
+            }
+            Ok(Event::Stop(sig)) => {
+                stopped_by = Some(sig);
+                break;
+            }
+            // Only if every sender is gone, which a running pump prevents.
+            Err(_) => break,
         }
-        (status, hits)
-    });
+    }
     if let Some(f) = forwarder {
         f.stop();
     }
     let status = status.map_err(|e| CnError::internal(format!("waiting for the child: {e}")))?;
-    let (code, exit, signal) = exit_code(status);
+    let (mut code, exit, signal) = exit_code(status);
+    if let Some(sig) = stopped_by {
+        // The child is gone but something it started still holds its output.
+        // That output is dropped unread when cn exits: it is never written
+        // unscrubbed, because cn's own stdout and stderr were never handed on.
+        ctx.info(&format!(
+            "cn: stopped by signal {sig} after the command exited; output still \
+             coming from processes it started is discarded"
+        ));
+        code = 128 + sig;
+    }
     finish(ctx, &mut client, &run_id, exit, signal, started, hits);
     Ok(code)
+}
+
+/// What the pump threads and the signal forwarder tell `run`.
+enum Event {
+    /// One output stream reached its end; its hits.
+    Pumped(Hits),
+    /// A terminating signal arrived after the child exited.
+    Stop(i32),
+}
+
+fn spawn_pump(
+    src: impl Read + Send + 'static,
+    dst: impl Write + Send + 'static,
+    redactor: &Arc<Redactor>,
+    tx: &mpsc::Sender<Event>,
+) {
+    let redactor = Arc::clone(redactor);
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let hits = pump(src, dst, &redactor);
+        let _ = tx.send(Event::Pumped(hits));
+    });
 }
 
 /// Checks the daemon issued exactly the variables asked for, and decodes.
@@ -260,25 +321,41 @@ fn finish(
 }
 
 /// Forwards signals to the child through a pidfd, so a reused pid can never
-/// receive one.
+/// receive one. Once the child has exited, a terminating signal (SIGTERM,
+/// SIGHUP, SIGQUIT, and SIGINT, which is otherwise left to the terminal)
+/// has no child to go to, and ends `cn` instead.
 struct Forwarder {
     handle: signal_hook::iterator::Handle,
     thread: std::thread::JoinHandle<()>,
 }
 
 impl Forwarder {
-    fn start(child: &std::process::Child) -> Option<Self> {
+    fn start(child: &std::process::Child, tx: mpsc::Sender<Event>) -> Option<Self> {
         let pid = rustix::process::Pid::from_child(child);
         let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).ok()?;
         let mut signals = Signals::new(FORWARDED.iter().copied().chain([SIGINT])).ok()?;
         let handle = signals.handle();
         let thread = std::thread::spawn(move || {
             for sig in signals.forever() {
+                let terminating = TERMINATING.contains(&sig);
+                // Check first, then send: a signal sent to an exited child
+                // that is not yet reaped succeeds and would be lost.
+                if terminating && exited(&pidfd) {
+                    let _ = tx.send(Event::Stop(sig));
+                    continue;
+                }
                 if sig == SIGINT {
                     continue;
                 }
-                if let Some(sig) = rustix::process::Signal::from_named_raw(sig) {
-                    let _ = rustix::process::pidfd_send_signal(&pidfd, sig);
+                let Some(signal) = rustix::process::Signal::from_named_raw(sig) else {
+                    continue;
+                };
+                if let Err(rustix::io::Errno::SRCH) =
+                    rustix::process::pidfd_send_signal(&pidfd, signal)
+                {
+                    if terminating {
+                        let _ = tx.send(Event::Stop(sig));
+                    }
                 }
             }
         });
@@ -288,6 +365,17 @@ impl Forwarder {
     fn stop(self) {
         self.handle.close();
         let _ = self.thread.join();
+    }
+}
+
+/// True once the child has exited, reaped or not. Does not reap it.
+fn exited(pidfd: &rustix::fd::OwnedFd) -> bool {
+    use rustix::process::{WaitId, WaitIdOptions, waitid};
+    let options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
+    match waitid(WaitId::PidFd(rustix::fd::AsFd::as_fd(pidfd)), options) {
+        Ok(status) => status.is_some(),
+        // ECHILD: already reaped by `run`.
+        Err(_) => true,
     }
 }
 
