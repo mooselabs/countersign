@@ -41,7 +41,7 @@ jobs:
       - name: shellcheck
         run: |
           shellcheck --version | head -n 2
-          shellcheck packaging/*.sh packaging/tests/*.sh
+          shellcheck packaging/*.sh packaging/lib/*.sh packaging/tests/*.sh
       - name: install.sh and uninstall.sh dry-run plans
         run: bash packaging/tests/dry-run.sh
 

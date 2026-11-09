@@ -37,6 +37,11 @@ LimitCORE=0
 # mlockall needs no capability while the limit allows it, and
 # @system-service below includes @memlock.
 LimitMEMLOCK=infinity
+# Each connection holds its socket and the peer's pidfd, and each live
+# session its anchor's pidfd; [limits] caps both per uid at 128, for every
+# allowed uid. The default soft limit of 1024 descriptors is too tight for
+# that; this one is far above it.
+LimitNOFILE=65536
 
 # No privileges: cnd needs no capability at all.
 NoNewPrivileges=yes
