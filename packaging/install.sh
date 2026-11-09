@@ -1,18 +1,20 @@
 #!/bin/bash
 # Install countersign on this machine. See packaging/README.md.
 #
-# Build first, as yourself (never as root):
-#   cargo build --release --locked
-# Then, from a terminal you opened yourself:
+# Usually run by packaging/trusted-build.sh, which builds a commit in a
+# root-owned tree and runs that tree's install.sh. Run directly, from a
+# terminal you opened yourself:
 #   sudo packaging/install.sh [--factor password|touch|touch+password]
 #                             [--user NAME] [--bin-dir DIR] [--dry-run] [--force]
+#                             [--allow-user-tree]
 #
 #   --factor    what the polkit dialog asks for (default password):
 #                 password        your login password; PAM is not changed
 #                 touch           a security key touch only (pam_u2f)
 #                 touch+password  a key touch, then your password
-#               The touch factors change polkit's PAM stack, which every
-#               polkit prompt on the machine uses, not only countersign's.
+#               The touch factors change polkit's PAM stack for the
+#               developer only; every other user, root included, keeps the
+#               distribution's stack.
 #   --user      the developer who uses countersign (default: $SUDO_USER)
 #   --bin-dir   where cn and cnd were built (default: target/release)
 #   --dry-run   print every action and change nothing; needs no root
@@ -20,13 +22,21 @@
 #               config.toml.bak), a /etc/pam.d/polkit-1 countersign did not
 #               write (kept as polkit-1.countersign-bak), and an existing key
 #               enrolment
+#   --allow-user-tree
+#               install even though this script, the files next to it or the
+#               binaries could be changed by a user other than root (a
+#               developer's checkout). Without it, install.sh refuses: it
+#               runs as root, so whoever can change those files can run code
+#               as root.
 #
 # Every step is safe to repeat. Run it again to upgrade the binaries or to
 # change the factor.
 set -euo pipefail
 
-here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+here=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(dirname "$here")
+# shellcheck source-path=SCRIPTDIR source=lib/trusted-path.sh
+. "$here/lib/trusted-path.sh"
 
 # For tests only: with --dry-run, every system path is read below this prefix.
 R=${COUNTERSIGN_INSTALL_ROOT:-}
@@ -36,6 +46,7 @@ user=${SUDO_USER:-}
 bin_dir=$repo/target/release
 dry=0
 force=0
+allow_user_tree=0
 
 usage() {
     sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"
@@ -51,6 +62,7 @@ while [ $# -gt 0 ]; do
     --bin-dir=*) bin_dir=${1#*=}; shift ;;
     --dry-run) dry=1; shift ;;
     --force) force=1; shift ;;
+    --allow-user-tree) allow_user_tree=1; shift ;;
     -h | --help) usage; exit 0 ;;
     *) printf 'install.sh: unknown argument: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -192,14 +204,46 @@ note "polkit $pk_version"
 
 for bin in cn cnd; do
     [ -x "$bin_dir/$bin" ] ||
-        die "$bin_dir/$bin not found. Build first, as yourself and not as root: cargo build --release --locked"
+        die "$bin_dir/$bin not found. Build with packaging/trusted-build.sh, or as yourself (not as root) with cargo build --release --locked and then --allow-user-tree"
 done
+# From here on, the resolved directory: nothing can swap a symlink under it.
+bin_dir=$(realpath -e -- "$bin_dir")
 note "binaries in $bin_dir"
 [ -f "$config_src" ] || die "$config_src not found"
+
+# Everything this script installs or runs as root must be changeable by root
+# only. In a developer's checkout, anything running as the developer (an
+# agent included) could change a binary, a unit or this script, and so run
+# code as root at the next install.
+untrusted=
+for f in "${BASH_SOURCE[0]}" "$here/lib/trusted-path.sh" \
+    "$here/sysusers.d/countersign.conf" "$here/tmpfiles.d/countersign.conf" \
+    "$here/countersign.socket" "$here/countersign.service" \
+    "$here/computer.mooselabs.countersign.policy" "$config_src" \
+    "$bin_dir/cn" "$bin_dir/cnd"; do
+    untrusted=$(untrusted_reason "$f")
+    [ -z "$untrusted" ] || break
+done
+if [ -z "$untrusted" ]; then
+    note "source and binaries can be changed by root only"
+elif [ "$allow_user_tree" = 0 ]; then
+    die "refusing to install from files a user other than root can change: $untrusted. Anything running as that user, an agent included, could have changed what this script installs or runs as root. Build and install with packaging/trusted-build.sh (packaging/README.md, \"Install\"), or pass --allow-user-tree to accept that"
+else
+    say ""
+    say "  WARNING: --allow-user-tree: $untrusted."
+    say "  Anything running as that user, an agent included, could have changed this"
+    say "  script, the units, the policy or the binaries, and so runs code as root"
+    say "  through this install. packaging/trusted-build.sh avoids that. (While that"
+    say "  user can run sudo without a password, an agent running as them can become"
+    say "  root anyway, and this check protects nothing until that is removed.)"
+    say ""
+fi
 
 [ -n "$user" ] || die "no user: run through sudo, or pass --user NAME"
 id -u "$user" >/dev/null 2>&1 || die "no such user: $user"
 [ "$(id -u "$user")" != 0 ] || die "the developer must not be root; pass --user NAME"
+# The name goes into a PAM line and a pam_succeed_if value list (':' separated).
+[[ $user =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] || die "user name '$user' has characters this script does not put into a PAM stack"
 note "user $user"
 
 # Store and master key. Without root a dry run cannot look inside
@@ -281,13 +325,11 @@ current_step=binaries
 step "binaries"
 install_file "$bin_dir/cn" "$cn_dest" 0755
 install_file "$bin_dir/cnd" "$cnd_dest" 0755
-# The build directory belongs to your uid, so anything running as you could
-# have changed these files. Compare with what you built.
 if [ "$dry" = 1 ]; then
     note "sha256 of the files that would be installed:"
     sha256sum "$bin_dir/cn" "$bin_dir/cnd" | sed 's/^/    /'
 else
-    note "sha256 of the installed files (compare with your build):"
+    note "sha256 of the installed files:"
     sha256sum "$cn_dest" "$cnd_dest" | sed 's/^/    /'
 fi
 
@@ -347,26 +389,51 @@ u2f_line() {
         "$control" "$u2f_map" "$u2f_origin" "$u2f_origin"
 }
 
-# render_pam BASE: the countersign polkit-1 stack, built from BASE with its
-# auth lines replaced (touch) or preceded by pam_u2f (touch+password).
+# render_pam BASE: the countersign polkit-1 stack. It is BASE unchanged, with
+# two lines put before BASE's first auth line, so that only $user needs the
+# key and every other user authenticates exactly as BASE says. That matters
+# most for root: polkit's administrator prompts (pkexec, desktop settings,
+# package tools) authenticate as root on openSUSE, and root has no key.
+#
+#   auth [success=1 default=ignore] pam_succeed_if.so quiet user notin $user
+#     success: the user being authenticated is not $user. Jump over the one
+#       pam_u2f line to BASE's auth lines. A jump does not set the result of
+#       the auth stack, so BASE's lines alone decide, as without countersign.
+#     default=ignore: every other return (PAM_AUTH_ERR when the user is
+#       $user, and also any error) leaves the result unset and goes on to
+#       pam_u2f. An error can therefore only put a user in front of the key;
+#       it can never let $user skip it. ("user in $user" with a jump on
+#       failure would do the opposite.) quiet: no log line per prompt.
+#   touch: auth [success=done default=die] pam_u2f.so ...
+#     done: a key touch is enough; the stack returns success at once and
+#       BASE's lines do not run for $user.
+#     die: any other return, PAM_IGNORE included, fails the stack at once,
+#       so $user can never fall back to the password.
+#   touch+password: auth [success=ok default=die] pam_u2f.so ...
+#     ok: record the touch and go on to BASE's lines, which must pass too
+#       (their required pam_unix asks for the password).
+#     die: as above. Not "requisite", which is ignore=ignore: a PAM_IGNORE
+#       from pam_u2f would leave the password alone to decide.
+# pam_u2f's nouserok is not used: the first line, not the mapping file,
+# decides who needs a key.
 render_pam() {
-    local base=$1 first
+    local base=$1 control
     if [ "$factor" = touch ]; then
-        first=$(u2f_line '[success=done default=die]')
+        control='[success=done default=die]'
     else
-        first=$(u2f_line requisite)
+        control='[success=ok default=die]'
     fi
     printf '#%%PAM-1.0\n'
     printf '%s: written by countersign packaging/install.sh --factor %s\n' "$pam_marker" "$factor"
-    printf '# from %s. polkit uses this stack for EVERY prompt on this machine\n' "$base"
-    printf '# (pkexec, desktop admin dialogs), not only for countersign.\n'
+    printf '# from %s. polkit uses this stack for every prompt on this\n' "$base"
+    printf '# machine. Prompts that authenticate as %s need the security key;\n' "$user"
+    printf '# every other user (root, for administrator prompts) authenticates\n'
+    printf '# with the lines from %s as before.\n' "$base"
     printf '# Undo with packaging/uninstall.sh or install.sh --factor password.\n'
-    awk -v factor="$factor" -v first="$first" '
+    awk -v skip="$(printf 'auth       %-26s pam_succeed_if.so quiet user notin %s' '[success=1 default=ignore]' "$user")" \
+        -v key="$(u2f_line "$control")" '
         NR == 1 && /^#%PAM-1.0/ { next }
-        /^[[:space:]]*-?auth[[:space:]]/ {
-            if (!done) { print first; done = 1 }
-            if (factor == "touch") next
-        }
+        /^[[:space:]]*-?auth[[:space:]]/ && !done { print skip; print key; done = 1 }
         { print }
     ' "$R$base"
 }
@@ -393,9 +460,11 @@ if [ "$touch_factor" = 0 ]; then
     note "the countersign dialog asks for $user's login password (polkit's PAM stack is unchanged)"
 else
     say ""
-    say "  NOTE: polkit has one PAM stack for the whole machine. After this step EVERY"
-    say "  polkit prompt (pkexec, GNOME admin dialogs, package tools) asks for the same"
-    say "  factor as countersign: $factor."
+    say "  NOTE: polkit has one PAM stack for the whole machine. After this step every"
+    say "  polkit prompt that authenticates as $user (countersign's, and any other"
+    say "  action that asks for $user's own credentials) asks for: $factor."
+    say "  Prompts for other users are unchanged: administrator prompts still ask for"
+    say "  root's password."
     say ""
 
     if ! command -v pamu2fcfg >/dev/null; then
@@ -517,7 +586,7 @@ current_step="next steps"
 step "done"
 [ "$dry" = 0 ] || say "(dry run: nothing was changed)"
 [ "$touch_factor" = 0 ] ||
-    say "Every polkit prompt on this machine now asks for: $factor."
+    say "Every polkit prompt that authenticates as $user now asks for: $factor."
 say "Next:"
 n=1
 if [ "$relogin" = 1 ]; then
