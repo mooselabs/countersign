@@ -474,6 +474,11 @@ command or an agent's Bash tool, that is the transcript and the model
 provider, permanently. With `--json`, the value is in `data.value` (and
 `data.value_b64`).
 
+The value is written as its exact bytes, with no trailing newline, so
+`cn reveal NAME > file` or `$(cn reveal NAME)` gets the value and nothing
+else. Only when stdout is a terminal and the value does not already end in a
+newline does `cn` add one after it, so the shell prompt starts on a new line.
+
 | Flag | Meaning |
 | --- | --- |
 | `--clipboard` | Copy the value to the Wayland clipboard (`wl-copy`, cleared after 30s) instead of printing it. For a human in a terminal. The clipboard is readable by every process of the uid while the value is on it. |

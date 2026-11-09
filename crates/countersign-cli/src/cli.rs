@@ -16,8 +16,11 @@ pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (protocol 1)");
     name = "cn",
     version = VERSION,
     disable_help_subcommand = true,
-    after_help = "Docs: docs/cli.md. Exit codes: 0 ok, 2 usage, 3 daemon, 4 no grant, \
-                  5 denied, 6 pending, 7 expired, 8 unknown secret, 11 no session."
+    after_help = "Docs: docs/cli.md. Exit codes (cn run passes the child's through): \
+                  0 ok, 1 internal or doctor failed, 2 usage, 3 daemon, 4 no grant, \
+                  5 denied, 6 pending, 7 expired or not found, 8 unknown secret, \
+                  9 limit exceeded, 10 rate limited, 11 no session, 12 store sealed, \
+                  13 audit broken, 14 approval invalid or approver unavailable."
 )]
 pub struct Cli {
     /// Machine-readable output (one JSON object on stdout).
@@ -531,6 +534,21 @@ mod tests {
     #[test]
     fn the_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn the_help_footer_lists_every_exit_code() {
+        let footer = Cli::command()
+            .get_after_help()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let listed: Vec<&str> = footer
+            .split([':', ','])
+            .filter_map(|part| part.split_whitespace().next())
+            .filter(|word| word.chars().all(|c| c.is_ascii_digit()))
+            .collect();
+        let expected: Vec<String> = (0..=14).map(|n| n.to_string()).collect();
+        assert_eq!(listed, expected, "{footer}");
     }
 
     #[test]

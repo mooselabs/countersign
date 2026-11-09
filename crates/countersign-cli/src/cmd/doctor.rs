@@ -96,7 +96,7 @@ fn check_binary() -> Check {
         Err(_) => warn(
             "binary",
             "/usr/bin/cn is not installed",
-            "install countersign with packaging/install.sh",
+            "install countersign with packaging/trusted-build.sh (packaging/README.md)",
         ),
         Ok(m) if m.uid() != 0 || m.permissions().mode() & 0o022 != 0 => fail(
             "binary",
@@ -142,7 +142,7 @@ fn check_group() -> Check {
         return fail(
             "group",
             format!("the {SOCKET_GROUP} group does not exist"),
-            "install countersign with packaging/install.sh",
+            "install countersign with packaging/trusted-build.sh (packaging/README.md)",
         );
     };
     let uid = rustix::process::getuid().as_raw();

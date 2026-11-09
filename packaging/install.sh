@@ -264,7 +264,7 @@ else
 fi
 
 if [ "$store" = absent ] && [ "$dry" = 0 ] && [ ! -t 1 ]; then
-    die "cnd init prints the recovery phrase once, so run install.sh with its output on a terminal, not redirected and not as a Claude Code ! command (those have no terminal and the phrase would enter the transcript)"
+    die "cnd init prints the recovery phrase once, so run packaging/trusted-build.sh (packaging/README.md, \"Install\") with its output on a terminal, not redirected and not as a Claude Code ! command (those have no terminal and the phrase would enter the transcript)"
 fi
 
 touch_factor=0
@@ -291,7 +291,7 @@ if [ "$touch_factor" = 1 ]; then
     if [ "$force" = 1 ] || ! grep -q "^$user:" "$R$u2f_map" 2>/dev/null; then
         enrol=1
         if [ "$dry" = 0 ] && [ ! -t 0 ]; then
-            die "enrolling the security key needs a terminal (the key may ask for its PIN). Run install.sh from a terminal, not as a Claude Code ! command"
+            die "enrolling the security key needs a terminal (the key may ask for its PIN). Run packaging/trusted-build.sh (packaging/README.md, \"Install\") from a terminal, not as a Claude Code ! command"
         fi
     fi
 
