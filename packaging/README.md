@@ -6,8 +6,8 @@ store, and the approval factor you choose. `uninstall.sh` takes it out again.
 Both print every action, and `--dry-run` prints the plan without changing
 anything.
 
-countersign is in Phase 1 and has not been reviewed. Do not store real
-secrets in it yet.
+countersign is new software. Phase 1 has had one internal security and
+correctness review; see [docs/roadmap.md](../docs/roadmap.md).
 
 ## Requirements
 
@@ -179,17 +179,17 @@ For a touch factor the script also:
   An existing `/etc/pam.d/polkit-1` that countersign did not write is refused
   unless `--force`, which keeps it as `/etc/pam.d/polkit-1.countersign-bak`.
 
-**The polkit PAM stack is machine-wide.** polkit has one PAM service for every
-action, so after a touch install every polkit prompt that authenticates as
-you asks for your factor, countersign's and any other action that asks for
-your own credentials. Prompts that authenticate as another user are
-unchanged. On openSUSE the administrator identity is root, so `pkexec`,
-GNOME's administrator dialogs and package tools still ask for root's
-password. (If you are an administrator identity yourself, as members of
-`wheel` are on some distributions, those prompts ask for your factor.) Run
-`install.sh --factor password` to go back to your password. `sudo` uses its
-own PAM stack and is not affected, so a lost key does not lock you out of
-that way back.
+**The factor applies to you, for every polkit action.** polkit has one PAM
+service for every action, so after a touch install every polkit prompt that
+authenticates as you asks for your factor, countersign's and any other
+action that asks for your own credentials. Prompts that authenticate as
+another user, root included, keep the distribution's stack. On openSUSE the
+administrator identity is root, so `pkexec`, GNOME's administrator dialogs
+and package tools still ask for root's password. (If you are an
+administrator identity yourself, as members of `wheel` are on some
+distributions, those prompts ask for your factor.) Run `install.sh --factor
+password` to go back to your password. `sudo` uses its own PAM stack and is
+not affected, so a lost key does not lock you out of that way back.
 
 ## Memory and swap
 
@@ -205,8 +205,8 @@ have.
 With a touch factor, touch the key only while the countersign dialog is on
 screen: a touch approves whatever request is pending. If you do not touch it,
 GNOME retries every 30 seconds or so and the key keeps blinking; `cnd` closes
-the dialog itself after two minutes (`[approvers.polkit] timeout`), and the
-request expires.
+the dialog itself when the request lapses (`[grants] pending_expiry`, 5
+minutes by default, or sooner with `[approvers.polkit] timeout`).
 
 ## Recovery
 
@@ -215,8 +215,9 @@ or motherboard, a reinstall, or a store restored onto another machine.
 
 1. Restore `/var/lib/countersign` from your backup, owned by `countersign`,
    mode 0700.
-2. Run `sudo packaging/install.sh`. It sees a store without a master key
-   credential, creates a new credential and prints the recovery command.
+2. Install as above, through `trusted-build.sh`. `install.sh` sees a store
+   without a master key credential, creates a new credential and prints the
+   recovery command.
 3. Stop the daemon: `cnd recover` takes no lock against a running `cnd`.
 
    ```console
@@ -276,9 +277,9 @@ digest that the terminal printed.
    ```
 
 2. Add a dummy secret. A dialog opens: check that its code and digest match
-   the terminal and that it reads `ADD secret smoke-test: install smoke test
-   (value 16 to 63 bytes, from stdin, high entropy)`, then approve it with
-   your factor.
+   the terminal and that it reads `ADD secret smoke-test (value 16 to 63
+   bytes, from stdin, high entropy): description "install smoke test";
+   projects any`, then approve it with your factor.
 
    ```console
    $ printf %s 'smoke-0123456789abcdef' | /usr/bin/cn add smoke-test \
@@ -308,12 +309,12 @@ digest that the terminal printed.
    ```
 
 6. Revoke, then let a request expire. Do nothing when the dialog opens. After
-   2 minutes the dialog closes by itself and the command reports the request
-   expired (exit 7):
+   5 minutes (`[grants] pending_expiry`) the dialog closes by itself and the
+   command reports the request expired (exit 7):
 
    ```console
    $ cn revoke --all
-   $ cn request smoke-test --reason "expiry test" --wait 3m; echo "exit $?"
+   $ cn request smoke-test --reason "expiry test" --wait 6m; echo "exit $?"
    ```
 
 7. Cancel a dialog. Press Cancel; the command exits 5 (denied):

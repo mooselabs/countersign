@@ -133,7 +133,8 @@ acurast-rpc-bearer-token  -            Bearer token for the Acurast RPC endpoint
 - **Audit:** `list`, coalesced per session (the first call written at once,
   then one record per 10-minute window with a call count) so polling does not
   flood the log.
-- **Limits:** 60 calls per minute per session (`[limits] list_calls_per_minute`).
+- **Limits:** 60 calls per minute per session and 240 per uid
+  (`[limits] list_calls_per_minute`, `list_calls_per_minute_per_uid`).
 
 ## `cn show NAME`
 
@@ -199,9 +200,14 @@ approve a desktop dialog is open
 expires 2026-11-08T09:25:11Z (5m)
 ```
 
-One dialog stays open at most two minutes (the polkit approver's `timeout`),
-so a request nobody answers expires then, even though `expires` says five.
-There is no way to raise the dialog again; request again.
+The dialog stays open until the request lapses at `expires` (or sooner, if
+the polkit approver's `timeout` is set). There is no way to raise the dialog
+again; request again.
+
+At most two dialogs are open at once for a uid (`[limits]
+max_prompts_per_uid`). A further request waits its turn, and `approve` then
+reads `queued: its dialog opens when an earlier one is answered`. Its expiry
+still counts from when it was made.
 
 A request for secrets that an active grant of the same mode in this session
 already covers returns that grant and creates nothing:
@@ -217,8 +223,9 @@ How a request ends, as `--wait` reports it:
 | --- | --- | --- |
 | approved | 0 | `approved by polkit  grant g_4hx2 active until 09:51:40` |
 | denied | 5 | `request K7M-Q2X was denied by polkit`: the human pressed Cancel or failed to authenticate. |
-| denied by `cnd` | 5 | No dialog could be shown or answered: no graphical session, not Wayland under `require_wayland`, polkitd not running, a fault. The message carries the reason. Tell the human; do not retry blindly. |
-| expired | 7 | Nobody answered before the dialog closed or the request lapsed. |
+| approver unavailable | 14 | `request K7M-Q2X could not be shown to the human: ...`: no dialog could be shown, because there is no graphical session, it is not Wayland under `require_wayland`, polkitd is not running, or no authentication agent answers. Tell the human; do not retry blindly. |
+| denied by `cnd` | 5 | A fault or an invalid answer from the approver. The message carries the reason. Tell the human; do not retry blindly. |
+| expired | 7 | Nobody answered before the request lapsed. |
 | pending | 6 | `--wait` ran out first; the request is still open. |
 
 - **Run by:** agent.
@@ -227,9 +234,11 @@ How a request ends, as `--wait` reports it:
   digest and the canonical request). Then `request.approve`,
   `request.deny` or `request.expire` when it resolves.
 - **Limits:** at most 16 names per request; at most 3 pending requests and 30
-  requests an hour per session (`[limits]`). A denied request starts a 2-minute
-  cooldown for the same names in that session. Each is `rate_limited` (exit
-  10), except too many names (`limit_exceeded`, exit 9).
+  requests an hour per session, and 10 pending and 120 an hour per uid over
+  all its sessions (`[limits]`). A denied request starts a 2-minute cooldown
+  for the same names for the uid, in every session, also after the session
+  ends. Each is `rate_limited` (exit 10), except too many names
+  (`limit_exceeded`, exit 9).
 
 ## `cn approve CODE`
 
@@ -295,8 +304,10 @@ denied K7M-Q2X
 
 - **Run by:** human (to refuse) or agent (to withdraw).
 - **Approval:** none.
-- **Audit:** `request.deny` with approver `client` and the reason (cut to
-  2048 bytes). It does not record who denied.
+- **Audit:** `request.deny` with approver `client`, the reason (cut to 2048
+  bytes, with the request session's values redacted), and who denied: the
+  peer's uid, pid and `comm`, and whether it came from the request's own
+  session, another session, a terminal or no session.
 
 ## `cn grants`
 
@@ -444,10 +455,13 @@ $ tail -n 50 logs/clickhouse_rows.log | cn hide
   contain a secret: logs, `env`, config dumps, HTTP debug output, files a
   `cn run` child wrote.
 - **Approval:** none.
-- **Audit:** `hide` per stream, also one the client abandons: bytes in, bytes
-  out, hit counts per secret, number of patterns. Never the matched text.
-- **Limits:** 30 new streams per minute per session and 256 MiB per minute
-  (`[hide]`). Excess returns `rate_limited`.
+- **Audit:** `hide` per stream, also one the client abandons: bytes in, hit
+  counts per secret, number of patterns. Never the matched text, and not the
+  bytes out (with bytes in and the hits, it would give away the matched
+  values' lengths).
+- **Limits:** 30 new streams per minute per session and 256 MiB per minute;
+  120 streams and 1 GiB per minute per uid over all its sessions (`[hide]`).
+  Excess returns `rate_limited`.
 
 ## `cn reveal NAME`
 
@@ -522,9 +536,13 @@ added acurast-rpc-bearer-token
 ```
 
 The dialog reads `countersign request P2D-8TW, digest 7KMA-W41C: ADD secret
-acurast-rpc-bearer-token: Bearer token for the Acurast RPC endpoint (mainnet)
-(value 16 to 63 bytes, from the clipboard, high entropy). agent bash (pid
-40102) in ~/projects/moose.` The value's size is only a class (`under 16
+acurast-rpc-bearer-token (value 16 to 63 bytes, from the clipboard, high
+entropy): description "Bearer token for the Acurast RPC endpoint (mainnet)";
+usage "Only for scripts/acurast_*.py read calls. Never log request
+headers."; projects [~/projects/moose/*]. terminal, no agent session (shell
+bash, pid 40102); client-reported: cwd ~/projects/moose.` What `cnd` knows
+comes first, then the metadata the client sent; the description is cut at
+60 characters, the usage at 120. The value's size is only a class (`under 16
 bytes`, `16 to 63 bytes`, `64 to 1023 bytes`, `1 KiB or more`) and is never
 audited.
 
@@ -620,7 +638,9 @@ Moves existing plaintext secret files into the store. Each matching file
 becomes one secret; the name is the file name with `--strip-prefix` removed
 (default `.secret-`), so `.secret-typesafe-api-key` becomes
 `typesafe-api-key`. One trailing newline is stripped from each value. The
-whole batch is one `mutate` request, with no limit on its size. Restoring a
+whole batch is one `mutate` request of at most 20 secrets (`[limits]
+max_names_per_import`); a larger set is refused with `limit_exceeded` (exit
+9), so import it in parts. Restoring a
 backup with `--from BACKUP.age` is Phase 2.
 
 Metadata comes from, in order: `--metadata FILE` (TOML, below); an
@@ -738,8 +758,10 @@ SEQ    TIME      EVENT            DETAIL
 `cn audit verify` fetches the raw segments and recomputes the hash chain and
 checkpoint signatures locally, so the result does not depend on trusting
 `cnd`'s answer. It reports the record count, the checkpoints, the head hash
-and the last checkpoint, and exits 13 on any break. `--from SEQ` starts the
-check at a record; `--pubkey`, `--checkpoints` and `--dir` (root, reading the
+and the last checkpoint, and exits 13 on any break. Without `--from`, the log
+must start at seq 1: a log whose first segments were deleted fails (exit
+13). `--from SEQ` starts the check at a record, and the log must then start
+exactly there; `--pubkey`, `--checkpoints` and `--dir` (root, reading the
 files directly) are described in
 [audit.md](audit.md#verifying-cn-audit-verify).
 
@@ -804,16 +826,16 @@ All commands except `cn run` use this table. `cn run` uses the
 | 2 | `usage`, `no_tty`, `bad_request`, `secret_exists`, `not_in_this_version` | Bad arguments, a secret that already exists, a prompt was needed with no terminal, or a Phase 2 command. | Fix the command; use `--from-*` value sources. |
 | 3 | `daemon_unreachable`, `unsupported_version`, `unknown_request`, `forbidden_peer`, `bad_peer` | Cannot talk to a genuine `cnd` with a common protocol. | `cn doctor`. |
 | 4 | `grant_required` | No active grant for that secret and mode in this session. | `cn request`. |
-| 5 | `denied` | The request was denied: by the human (Cancel), or by `cnd` when no dialog could be shown or answered (the message says why). | Do not retry without asking the human. |
+| 5 | `denied` | The request was denied: by the human (Cancel), or by `cnd` after a fault or an invalid answer (the message says why). | Do not retry without asking the human. |
 | 6 | `pending` | `--wait` timed out; the request is still pending. | Ask the human to approve, then `cn grants`. |
 | 7 | `request_expired`, `request_not_found` | The code is unknown, already decided, or the request lapsed unanswered. | `cn request` again. |
 | 8 | `unknown_secret` | No secret by that name. | `cn list --all`. |
-| 9 | `limit_exceeded` | Refused by policy: TTL above max, too many names, reason too long, reveal disabled, another project under `cross_project = "deny"`. | Ask for less. |
-| 10 | `rate_limited` | A per-session limit: pending requests, requests per hour, deny cooldown, `list` calls, hide streams or bytes. | Wait. |
+| 9 | `limit_exceeded` | Refused by policy: TTL above max, too many names in a request or an import, reason too long, reveal disabled, another project under `cross_project = "deny"`. | Ask for less. |
+| 10 | `rate_limited` | A per-session or per-uid limit: pending requests, requests per hour, deny cooldown, `list` calls, hide streams or bytes, open connections, live sessions. | Wait. |
 | 11 | `no_session`, `session_dead` | The caller is not under a session anchor, or the anchor exited. | `cn session`; start the agent with `cn session exec`. |
 | 12 | `store_sealed` | Phase 2 (FIDO2 unlock). | |
 | 13 | `audit_broken` | `cn audit verify` found a break. | Investigate; do not ignore. |
-| 14 | `approval_invalid` | `cn` found the digest `cnd` reported does not match the request it sent. | `cn doctor`. |
+| 14 | `approval_invalid`, `approver_unavailable` | `cn` found the digest `cnd` reported does not match the request it sent; or no approver could show the request to the human (no graphical session, not Wayland, polkitd not running). | `cn doctor`; tell the human. |
 
 ## JSON output
 
@@ -939,7 +961,8 @@ from details `cnd` supplied. With the touch factor:
 ```text
 Authentication Required
   countersign request K7M-Q2X, digest 3QF8-ZK2M: USE clickhouse-password for 30m.
-  agent claude (pid 41210, label orchestrator) in ~/projects/moose/liskov-agent-orchestrator.
+  agent claude (pid 41210, registered by cn session exec); agent-reported: label orchestrator,
+  cwd ~/projects/moose/liskov-agent-orchestrator.
   Agent's reason: row counts for the weekly cost report via scripts/clickhouse_rows.py
   touch the device
 ```
@@ -1000,9 +1023,10 @@ SEQ    TIME      EVENT            DETAIL
 
 1. **`--wait` and agent tool timeouts.** Claude Code's Bash tool has a default
    timeout of about two minutes. A `--wait` longer than that is killed by the
-   harness while the request stays pending. The snippet says `--wait 100s`,
-   which with the two-minute dialog timeout covers most of a request's life.
-   Should `cn request` pick that itself when it detects an agent?
+   harness while the request stays pending. The snippet says `--wait 100s`;
+   the dialog stays open for the request's 5 minutes, so an approval after
+   that is seen with `cn grants`. Should `cn request` pick the wait itself
+   when it detects an agent?
 2. **Rejected `run` attempts in the audit.** [audit.md](audit.md) has no
    event for a `cn run` refused with `grant_required`. Is that worth a record
    (useful to see probing) or noise (coalesce per session)?
@@ -1011,8 +1035,9 @@ SEQ    TIME      EVENT            DETAIL
    be allowed to trigger that (prompt spam), or only a caller outside any
    agent session?
 4. **Exit code granularity.** Exit 5 covers a human's explicit deny, a
-   dismissed dialog and `cnd` finding no way to ask. Agents should treat all
-   the same and tell the human; the decision's `by` and `reason` say which.
+   dismissed dialog and a fault in `cnd`; `cnd` finding no way to ask is
+   exit 14. Agents should treat all the same and tell the human; the
+   decision's `by` and `reason` say which.
 5. **`--clipboard` on `reveal` and `add`.** The clipboard is readable by every
    process of the uid. It keeps the value out of the transcript, which is the
    main risk, but it is not private. Keep it, or require a real terminal for

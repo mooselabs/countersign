@@ -10,9 +10,11 @@ an audit log the agent cannot change.
 
 CLI `cn`, daemon `cnd`. Rust, Linux first. Apache-2.0.
 
-> **Status: Phase 1 implemented, under review** ([roadmap](docs/roadmap.md)).
-> The documents under [`docs/`](docs/) describe what it does. Phase 1 has not
-> been reviewed: do not store real secrets in it until it has.
+> **Status: Phase 1 implemented and reviewed** ([roadmap](docs/roadmap.md)).
+> The documents under [`docs/`](docs/) describe what it does. It is new
+> software. Phase 1 has had one internal security and correctness review;
+> see [docs/roadmap.md](docs/roadmap.md). Keep the recovery phrase safe: it
+> is the only way back into the store if the machine's key is lost.
 
 ## The problem
 
@@ -93,18 +95,28 @@ Containing that needs the agent in a sandbox or under a separate user.
 
 ## Install
 
-Linux 6.5 or later with systemd and polkit. Build as yourself, then install
-from a terminal you opened yourself:
+Linux 6.5 or later with systemd and polkit. `install.sh` runs as root, so it
+must not come from a tree an agent can change: install through
+`packaging/trusted-build.sh`, which clones a commit you name into a
+root-owned tree, builds it there with the distribution's Rust toolchain, and
+runs that tree's `install.sh`. From a terminal you opened yourself:
 
 ```sh
-cargo build --release --locked
-sudo packaging/install.sh --dry-run --factor touch   # read the plan first
-sudo packaging/install.sh --factor touch             # or password, touch+password
+sudo zypper install rust cargo git     # the distribution's toolchain, once (openSUSE)
+c=0123...                               # the full hash of a pushed commit
+sudo install -d -m 0755 /usr/local/src/countersign
+sudo env -i PATH=/usr/bin:/bin git clone -q --no-checkout \
+    https://github.com/mooselabs/countersign /usr/local/src/countersign/$c
+sudo env -i PATH=/usr/bin:/bin git -C /usr/local/src/countersign/$c checkout -q --detach $c
+sudo /usr/local/src/countersign/$c/packaging/trusted-build.sh --commit $c --factor touch --dry-run
+sudo /usr/local/src/countersign/$c/packaging/trusted-build.sh --commit $c --factor touch
 ```
 
-[packaging/README.md](packaging/README.md) explains what the script changes
-(including polkit's machine-wide PAM stack for the touch factors), the
-recovery phrase, uninstalling, and a smoke test to run afterwards. To set up
+`--factor` is `password` (the default), `touch` or `touch+password`.
+[packaging/README.md](packaging/README.md) explains each step, what the
+script changes (for the touch factors, the polkit PAM stack for you only;
+other users, root included, keep the distribution's), the recovery phrase,
+upgrading, uninstalling, and a smoke test to run afterwards. To set up
 agents, see [`integrations/`](integrations/) and
 [agent-integration.md](docs/agent-integration.md).
 

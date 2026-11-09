@@ -10,8 +10,9 @@ the agent runs them through `cn run`.
 
 This guide is for countersign Phase 1: every approval is a polkit dialog on
 your desktop ([packaging/README.md](../packaging/README.md#approval-factors)).
-Install countersign first and run the smoke test there. Phase 1 has not been
-reviewed: do not move real secrets into it until it has.
+Install countersign first and run the smoke test there. countersign is new
+software; Phase 1 has had one internal security and correctness review (see
+[docs/roadmap.md](../docs/roadmap.md)). Keep the recovery phrase safe.
 
 ## 1. Inventory
 
@@ -91,7 +92,9 @@ imported 3 secrets; removed 3 source file(s)
 
 Check that the dialog shows the same request code and digest, and
 `IMPORT 3 secrets: ...` with the names you expect, before you approve. The
-dialog closes after two minutes; if it does, run the import again. Delete
+dialog closes when the request lapses (5 minutes); if it does, run the import
+again. One import takes at most 20 secrets (`[limits]
+max_names_per_import`); import a larger set in parts. Delete
 `countersign-import.toml` afterwards or keep it out of git; it holds no
 values, but it is not useful once imported.
 

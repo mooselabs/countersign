@@ -59,14 +59,19 @@ kernel attests (peer credentials, pidfd).
 | `/usr/share/polkit-1/actions/computer.mooselabs.countersign.policy` | root 0644 | The three polkit actions ([approvers.md](approvers.md#actions)). |
 | `/etc/countersign/config.toml` | root 0644 | Policy: approvers, TTL limits, matchers, allowed users. Not writable by the agent; `cnd` refuses a config that is not root-owned or is writable by group or others. `cnd --config PATH` overrides the path. |
 | `/etc/countersign/u2f_mappings` | root 0644 | Touch factors only: the `pam_u2f` key enrolment, origin `pam://countersign`. Root-owned so the agent cannot add a key. |
-| `/etc/pam.d/polkit-1` | root 0644 | Touch factors only: polkit's PAM stack with `pam_u2f`, written by the installer from the distribution's `/usr/lib/pam.d/polkit-1`. Machine-wide. |
+| `/etc/pam.d/polkit-1` | root 0644 | Touch factors only: polkit's PAM stack with `pam_u2f`, written by the installer from the distribution's `/usr/lib/pam.d/polkit-1`. The key applies to the developer only: a `pam_succeed_if` line skips it for every other user, root included. |
 | `/etc/systemd/system/polkit-agent-helper@.service.d/countersign-hidraw.conf` | root 0644 | Touch factors only: lets polkit's sandboxed PAM helper open the key. |
 | `/etc/credstore.encrypted/countersign-mk` | root 0600 | Master key, 32 random bytes sealed with `systemd-creds` (TPM2 if present, else host key) by the installer. |
 | `/var/lib/countersign/` | countersign 0700 | `store.v1`, `store.v1.prev`, `keyslots.json`, `audit/`. `$STATE_DIRECTORY` or `cnd --state-dir PATH` overrides the path. |
 | `/run/countersign/` | root 0755 | Holds the socket. Root-owned, so no other process can replace the socket. |
 | `/run/countersign/cnd.sock` | countersign:countersign-users 0660 | IPC socket. |
 
-[`packaging/install.sh`](../packaging/install.sh) installs all of it; see
+[`packaging/install.sh`](../packaging/install.sh) installs all of it. It runs
+as root, so the owner runs it through
+[`packaging/trusted-build.sh`](../packaging/trusted-build.sh), which clones a
+named commit into a root-owned tree and builds it there with the
+distribution's toolchain; `install.sh` refuses a tree or binaries another
+user can change unless `--allow-user-tree` (decision 20). See
 [packaging/README.md](../packaging/README.md).
 
 ### Fixed user, not DynamicUser
@@ -124,8 +129,11 @@ files are the reference, and each directive carries a comment. In short:
   (tmpfiles).
 
 `cnd` also calls `prctl(PR_SET_DUMPABLE, 0)` first thing, and zeroizes value
-buffers after use. It locks its memory when the memlock limit allows; see the
-unit for the limit it runs under.
+buffers after use. The unit sets `LimitMEMLOCK=infinity`, so `cnd` locks all
+of its memory, now and later (`mlockall` with `MCL_CURRENT`, `MCL_FUTURE` and
+`MCL_ONFAULT`). Under a finite limit it locks only what is mapped at start,
+and says so in the journal. `cn run`, its children and the shell are not
+locked; swap should be encrypted ([packaging/README.md](../packaging/README.md#memory-and-swap)).
 
 `cnd` holds **no capabilities**. That has a consequence: `/proc/<pid>/exe`,
 `/proc/<pid>/cwd` and `/proc/<pid>/environ` of the developer's processes are
@@ -171,7 +179,7 @@ export  = "polkit"
 [approvers.polkit]
 type = "polkit"
 subject = "process"              # the session anchor; "session" once polkit#699 is fixed
-timeout = "2m"                   # one dialog stays open at most this long
+# timeout = "2m"                 # no default: a dialog stays until the request lapses
 
 [hide]
 max_streams_per_minute = 30
@@ -306,8 +314,8 @@ kind 0x02 = stream data (raw bytes), max 64 KiB, only inside a hide stream
 
 ### Handshake and versioning
 
-The first frame from the client must be `hello`; anything else closes the
-connection. `cnd` then checks the peer's uid (`forbidden_peer`, audited as
+The first frame from the client must be `hello`, within 5 seconds; anything
+else closes the connection. `cnd` then checks the peer's uid (`forbidden_peer`, audited as
 `peer.reject`) and the protocol (`unsupported_version`), and answers.
 
 ```json
@@ -327,6 +335,14 @@ first 4096 bytes of the cwd, both as untrusted text.
 Each request carries an `id`; the response echoes it. One request is in flight
 per connection, except that a `run` connection stays open until `run_finish`
 and a `hide` connection carries stream frames.
+
+A uid may hold at most `[limits] max_connections_per_uid` connections (128)
+and `max_sessions_per_uid` live sessions (128); past either, `cnd` answers
+`rate_limited`. A connection that sends nothing for `[limits] idle_timeout`
+(10 minutes) is closed, unless a `cn run` child or a `cn hide` stream is
+using it. A connection whose process has exited is closed before its next
+request is handled, so a connection handed to another process does not
+outlive its owner.
 
 Protocol rules: unknown fields are ignored; unknown `type` values return
 `unknown_request`; a breaking change increments the protocol number, and
@@ -364,8 +380,11 @@ fields ending `_seconds`.
 The request view is the canonical request (section 6) plus `state`
 (`pending`, `approved`, `denied`, `expired`), `digest`, `digest_short`, the
 chain's approvers, and once decided a `decision`: when, by whom, why, and the
-grant it created or the number of grants a store change revoked. A decided
-request stays findable by its code for `pending_expiry`.
+grant it created or the number of grants a store change revoked. A request
+that ended without a decision because no approver could run is `denied`,
+with `decision.error = "approver_unavailable"`. A pending request whose
+dialog waits for earlier ones of the same uid carries `queued: true`. A
+decided request stays findable by its code for `pending_expiry`.
 
 ### Errors
 
@@ -382,13 +401,14 @@ request stays findable by its code for `pending_expiry`.
 | `unknown_secret` | Name not in store. |
 | `grant_required` | No active grant covering name and mode. |
 | `request_expired`, `request_not_found` | Bad, stale or already decided code. |
-| `rate_limited` | A per-session limit: pending requests, requests per hour, deny cooldown, `list` calls, hide streams or bytes. |
-| `limit_exceeded` | TTL above its maximum, too many names, reason too long, reveal disabled, another project under `cross_project = "deny"`. |
+| `rate_limited` | A per-session or per-uid limit: pending requests, requests per hour, deny cooldown, `list` calls, hide streams or bytes, connections, sessions. |
+| `limit_exceeded` | TTL above its maximum, too many names (per request, or per `import`), reason too long, reveal disabled, another project under `cross_project = "deny"`. |
 | `bad_request` | Invalid arguments: a bad name or metadata, a value too large, a `revoke` without exactly one selector. |
 | `secret_exists` | `add` or `import` of a name already in the store. |
 | `unknown_request` | The request `type` is not known, or not in this version. |
 | `internal` | Server fault; details only in the daemon log. |
-| `approval_invalid`, `approver_unavailable`, `store_sealed` | Defined for Phase 2; `cnd` does not send them in Phase 1. |
+| `approver_unavailable` | Not an error response: a request that no approver could run is denied with `decision.error = "approver_unavailable"`, which `cn` reports with this code. |
+| `approval_invalid`, `store_sealed` | Defined for Phase 2; `cnd` does not send them in Phase 1. |
 
 ## 5. Sessions
 
@@ -513,9 +533,9 @@ How the chain's result ends a request ([approvers.md](approvers.md#chaining)):
 | Chain result | Request | Notes |
 | --- | --- | --- |
 | Approved | approved | The grant becomes active, or the store change commits. |
-| Denied (the human pressed Cancel, or failed to authenticate) | denied | The secrets go into deny cooldown for the session. |
-| Timeout (the request expired, or the polkit dialog's own `timeout`, 2 minutes by default) | expired | `request.expire`. |
-| Unavailable, fault or invalid answer | denied, by `cnd` | The reason is in the decision and the audit log (`request.deny` with approver `cnd`). No deny cooldown. |
+| Denied (the human pressed Cancel, or failed to authenticate) | denied | The secrets go into deny cooldown for the uid, in every session. |
+| Timeout (the request expired, or the polkit dialog's own `timeout`, unset by default) | expired | `request.expire`. |
+| Unavailable, fault or invalid answer | denied, by `cnd` | The reason is in the decision and the audit log (`request.deny` with approver `cnd`). No deny cooldown. When no approver could run, the decision says `approver_unavailable`. |
 | Cancelled (`cn deny`, expiry, anchor exit) | as the canceller set it | |
 
 Phase 1 has no way to raise a dialog again for the same request. After a
@@ -526,10 +546,14 @@ timeout or an unavailable approver, the agent requests again.
 | Use grant TTL | 1h | `default_ttl`; at most `max_ttl` (8h), above which a request is refused |
 | Reveal grant TTL | `min(default_ttl, max_reveal_ttl)`, 10m; 1 use | `max_reveal_ttl`, `max_reveal_uses`; `allow_reveal = false` refuses reveal |
 | Pending request lifetime | 5m | `pending_expiry` |
-| Names per request | 16 | `[limits] max_names_per_request`; may be lowered, not raised. `import` is not limited. |
+| Names per request | 16 | `[limits] max_names_per_request`; may be lowered, not raised. `import` has its own limit, below. |
 | Pending requests per session | 3 | `[limits] max_pending_requests` |
+| Pending requests per uid | 10 | `[limits] max_pending_requests_per_uid` |
 | Requests per session per hour | 30 | `[limits] requests_per_hour` |
-| Deny cooldown for the same secrets | 2m | `[limits] deny_cooldown` |
+| Requests per uid per hour | 120 | `[limits] requests_per_hour_per_uid` |
+| Dialogs open at once per uid | 2 | `[limits] max_prompts_per_uid`; later requests wait in order (`queued` in the request view), and their expiry counts from creation |
+| Deny cooldown for the same secrets, per uid in every session | 2m | `[limits] deny_cooldown` |
+| Secrets per `import` | 20 | `[limits] max_names_per_import` |
 | Reason | 2048 bytes | fixed |
 
 With `[audit] redact_agent_text` (the default), the reason passes through the
@@ -697,7 +721,11 @@ The carry is therefore never longer than `L - 1` bytes.
 ### Rate limiting
 
 Per session: `max_streams_per_minute` new hide streams (default 30) and a
-byte budget, `max_bytes_per_minute` (default 256 MiB). Excess returns
+byte budget, `max_bytes_per_minute` (default 256 MiB). Per uid, over all its
+sessions: `max_streams_per_minute_per_uid` (120) and
+`max_bytes_per_minute_per_uid` (1 GiB). An agent can open a new session,
+or an `h_` session from a shell outside its tree, to get a fresh
+per-session budget; the per-uid budget bounds that. Excess returns
 `rate_limited` and ends the stream. Every stream is audited with hit counts,
 so repeated probing is visible.
 
@@ -705,17 +733,24 @@ so repeated probing is visible.
 
 | Command | Approval kind | `operation` (signed) | The dialog shows |
 | --- | --- | --- | --- |
-| `cn add NAME` | `mutate` | `add NAME` | `ADD secret NAME: description (value 16 to 63 bytes, from the clipboard, high entropy)` |
+| `cn add NAME` | `mutate` | `add NAME` | `ADD secret NAME (value 16 to 63 bytes, from the clipboard, high entropy): description "..."; usage "..."; projects [~/p]; tags [db]` |
 | `cn set NAME` | `mutate` | `set NAME` | `SET a new value for NAME (16 to 63 bytes, from stdin); grants for it are revoked` |
-| `cn edit NAME` | `mutate` | `edit NAME` | `EDIT NAME: changes usage, projects` |
+| `cn edit NAME` | `mutate` | `edit NAME` | `EDIT NAME: usage "old" -> "new"; projects [~/a] -> [~/a, ~/b]` |
 | `cn rm NAME...` | `mutate` | `rm a b` | `REMOVE 2 secrets: a, b` |
-| `cn import` | `mutate` | `import a b c` | `IMPORT 3 secrets: a, b, c` |
+| `cn import` | `mutate` | `import a b c` | `IMPORT 3 secrets: a, b, c` (at most `[limits] max_names_per_import`, 20) |
 | `cn export` | `export` | Phase 2 | |
 
 The value's size is shown only as a class (`under 16 bytes`, `16 to 63
 bytes`, `64 to 1023 bytes`, `1 KiB or more`), and never reaches the audit
-log. The dialog also shows the session the change came from (section 5,
-human sessions). A store change carries no reason.
+log. `add` shows what `cnd` knows first (size class, source, the high entropy
+flag), then the metadata the client sent. `edit` shows each changed field as
+old -> new; a long usage is shown as its new text with a cut marker, and a
+change to the high entropy flag says what it means for `cn hide`. Each
+agent-supplied part is bounded (60 characters, a new usage 120, 5 projects
+or tags) before the whole operation (600), so the part `cnd` writes is never
+the one cut. The dialog also shows the session the change came from (section
+5, human sessions): an agent anchor, or `terminal, no agent session (shell
+bash, pid N)`. A store change carries no reason.
 
 The value travels with the `add`/`set` request and is held by `cnd` with the
 pending request, so an approval applies to the exact value submitted; nothing

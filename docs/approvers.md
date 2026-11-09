@@ -185,10 +185,10 @@ export = { all_of = ["polkit", "desk-key"] }
 | Chain result | Request | Audit |
 | --- | --- | --- |
 | Approved | approved: the grant becomes active, or the store change commits | `request.approve` per approving member |
-| Denied | denied; the secrets go into deny cooldown for the session | `request.deny` per denying member |
+| Denied | denied; the secrets go into deny cooldown for the uid, in every session | `request.deny` per denying member |
 | `Timeout` | expired | `request.expire` |
 | `Cancelled` | as `cnd` set it when it cancelled (`cn deny`, expiry, the anchor's exit) | |
-| `Unavailable`, `Invalid`, `Internal` | denied by `cnd`, with the reason; no deny cooldown | `request.deny` with approver `cnd` and `evidence.error` |
+| `Unavailable`, `Invalid`, `Internal` | denied by `cnd`, with the reason; no deny cooldown. When no approver could run, the decision carries `error: approver_unavailable` (`cn` exit 14). | `request.deny` with approver `cnd` and `evidence.error` |
 
 Phase 1 has no way to raise a dialog again for the same request. After a
 timeout or an unavailable approver, the agent requests again.
@@ -262,7 +262,7 @@ as a fallback and not as the default.
 | The agent ptraces gnome-shell. | gnome-shell is not a descendant of the agent; Yama `ptrace_scope=1` refuses. |
 | The agent synthesizes a click or keystrokes in the dialog. | Not possible on Wayland. On X11 it is. `cn doctor` warns in an X11 session, and the polkit adapter refuses unless the uid's logind graphical session is Wayland (`require_wayland = true`, the default). |
 | The agent installs a GNOME Shell extension that rewrites the dialog. | Takes effect after the next login or shell restart. Lock user extensions off through the system dconf database (below), or accept the residual risk. |
-| The agent spams requests until one is approved by habit. | Per-session limits on pending requests and request rate; cooldown after a deny; the dialog names the session and shows the agent's reason as the agent's. |
+| The agent spams requests until one is approved by habit. | Limits on pending requests and request rate, per session and per uid, so a new session does not reset them; at most two dialogs open at once per uid (`[limits] max_prompts_per_uid`), the rest wait their turn; a cooldown after a deny, for the uid in every session; the dialog says how the session was found and shows the agent's reason as the agent's. |
 | A polkit rule or a `*_keep` default makes later checks pass without a prompt. | Writing either needs root. Phase 1 does not detect it: `cnd` logs polkitd's version at start but does not test the actions, and `cn doctor` does not read the policy or the rules. Check the installed policy and `/etc/polkit-1/rules.d/` yourself. |
 
 ### Cross-checking codes and digests
@@ -384,7 +384,7 @@ org.freedesktop.PolicyKit1.Authority.CheckAuthorization(
                        "digest": "3QF8-ZK2M",
                        "secrets": "clickhouse-password",
                        "ttl": "30m",
-                       "session": "agent claude (pid 41210, label orchestrator) in ~/projects/moose/liskov-agent-orchestrator",
+                       "session": "agent claude (pid 41210, registered by cn session exec); agent-reported: label orchestrator, cwd ~/projects/moose/liskov-agent-orchestrator",
                        "reason": "row counts for the weekly cost report via ...",
                        "operation": "none"},
     flags           = 0x1,           # AllowUserInteraction
@@ -396,7 +396,8 @@ The dialog then reads:
 
 ```text
 countersign request K7M-Q2X, digest 3QF8-ZK2M: USE clickhouse-password for 30m.
-agent claude (pid 41210, label orchestrator) in ~/projects/moose/liskov-agent-orchestrator.
+agent claude (pid 41210, registered by cn session exec); agent-reported: label
+orchestrator, cwd ~/projects/moose/liskov-agent-orchestrator.
 Agent's reason: row counts for the weekly cost report via ...
 ```
 
@@ -426,9 +427,16 @@ Agent's reason: row counts for the weekly cost report via ...
 - **Details.** The adapter always sets every key the messages use: `code`,
   `digest`, `secrets`, `ttl`, `session`, `reason` and `operation`. An empty
   value is sent as "none", so the dialog never shows a raw `$(key)`.
-  `session` reads like `agent claude (pid 41210, label x) in ~/projects/x`;
-  the label and cwd in it are agent-supplied. For a store change made from a
-  terminal outside any session, it names that terminal's shell. Keys
+  `session` first says how `cnd` found the session, from what it read
+  itself, then what the client reported, marked as such:
+  - `agent claude (pid 41210, registered by cn session exec); agent-reported: label x, cwd ~/p`
+    for an anchor started with `cn session exec`;
+  - `agent claude (pid 41210, matched comm = "claude"); agent-reported: cwd ~/p`
+    for an anchor found by a `[sessions] matchers` entry;
+  - `terminal, no agent session (shell bash, pid 3001); client-reported: cwd ~/p`
+    for a store change made from a terminal outside any session.
+
+  The label and cwd are left out when the client sent none. Keys
   beginning `polkit.` are reserved by polkit and are never set. Only an
   action owner may pass details at all (spike finding 3), so an agent cannot
   write this text.
@@ -441,8 +449,14 @@ Agent's reason: row counts for the weekly cost report via ...
   become one space; combining marks are cut to two per base character. Then
   each field is length-limited, counting characters: reason 300, operation
   300, each secret name 64, the cwd 120 with the middle elided (the home
-  directory shown as `~`), the label 40, the anchor's `comm` 32, and the
-  secret list 10 names then "and N more".
+  directory shown as `~`), the label 40, the anchor's `comm` 32, the matcher
+  48, and the secret list 10 names then "and N more". The `operation` of a
+  store change is limited to 600 characters, and the agent-supplied parts in
+  it are bounded first, so the text `cnd` writes is never the part cut: a
+  description or one side of a usage change 60, a new usage 120, and 5
+  projects or tags then "and N more". `edit` shows each changed field as
+  old -> new; `add` shows the value's size class, its source and the high
+  entropy flag first, then the description, usage, projects and tags.
 - **Result.** `is_authorized = true` -> `Approved`.
   `details["polkit.dismissed"] = "true"` (the human pressed Cancel) ->
   `Denied`, or `Unavailable` when the approver has `on_dismiss = "ignore"`
@@ -451,10 +465,12 @@ Agent's reason: row counts for the weekly cost report via ...
   that arrives after the request expired counts as `Timeout`. polkitd not
   on the bus is `Unavailable`; polkitd refusing `cnd` as a caller (the policy
   is missing or names another owner) is `Internal`.
-- **Timeout.** One dialog stays open at most `timeout` (default `"2m"`),
-  even when the request would live longer; then the adapter withdraws it and
-  returns `Timeout`, and the request expires. With the defaults a request is
-  answered within two minutes or not at all.
+- **Timeout.** A dialog stays open until the request lapses (`[grants]
+  pending_expiry`, 5 minutes by default, counted from when the request was
+  made, also while it waits its turn behind other dialogs). `timeout` has no
+  default; set, it closes the dialog sooner, and the request lapses at
+  whichever comes first. Then the adapter withdraws the dialog and returns
+  `Timeout`, and the request expires.
 - **Cancellation.** When the request expires, is denied by `cn deny`, its
   anchor exits, or another `any_of` member decides, `cnd` calls
   `CancelCheckAuthorization` and the dialog closes. Each call has its own
@@ -478,7 +494,18 @@ dialog asks for is chosen at install (decision 19), with
 | --- | --- | --- |
 | `password` (default) | The user's password. | The distribution's, unchanged. |
 | `touch` | A security key touch, nothing else. No key, no approval. | `auth [success=done default=die] pam_u2f.so authfile=/etc/countersign/u2f_mappings origin=pam://countersign appid=pam://countersign cue` |
-| `touch+password` | A touch, then the password. | `auth requisite pam_u2f.so ...` (same arguments), then the distribution's auth lines. |
+| `touch+password` | A touch, then the password. | `auth [success=ok default=die] pam_u2f.so ...` (same arguments), then the distribution's auth lines. |
+
+For both touch factors, the `pam_u2f` line is preceded by one that skips it
+for every user except the developer:
+
+```text
+auth  [success=1 default=ignore]  pam_succeed_if.so quiet user notin <developer>
+```
+
+Any error in that line leads to the key, never past it. The distribution's
+auth lines stay as they are after the two new ones; with `touch`, the
+`pam_u2f` line ends the stack for the developer.
 
 There is no click-only factor: polkit has no confirm-only mode
 ([polkit#463](https://github.com/polkit-org/polkit/issues/463)), and with the
@@ -501,9 +528,11 @@ Points that matter for the touch factors:
   drop-in with `DevicePolicy=auto`, `DeviceAllow=char-hidraw rw` and
   `PrivateDevices=no`, as polkit-agent-helper(8) asks of PAM modules that
   need hardware.
-- **This changes every polkit prompt on the machine** (`pkexec`,
-  NetworkManager, systemd, package tools). polkit has no per-action PAM
-  service. The installer says so before it makes the change.
+- **This changes the developer's polkit prompts only, for every action**
+  (`pkexec`, NetworkManager, systemd, package tools, when they authenticate
+  as the developer). polkit has no per-action PAM service. Other users, root
+  included, keep the distribution's stack, so on openSUSE administrator
+  prompts still ask for root's password.
 - Touch only while the countersign dialog is showing: a touch approves
   whatever request is pending.
 
@@ -682,13 +711,13 @@ stdin, then closes stdin:
   "expires_at": "2026-11-08T09:25:11Z",
   "canonical_b64": "<JCS bytes, base64>",
   "display": {
-    "session": "Agent session \"orchestrator\" (claude, pid 41210)",
+    "session": "agent claude (pid 41210, registered by cn session exec); agent-reported: label orchestrator, cwd ~/projects/moose/liskov-agent-orchestrator",
     "secrets": ["clickhouse-password"],
     "mode": "use",
     "ttl_seconds": 1800,
     "cwd": "~/projects/moose/liskov-agent-orchestrator",
     "reason": "row counts for the weekly cost report via scripts/clickhouse_rows.py",
-    "agent_supplied": ["reason", "cwd"]
+    "agent_supplied": ["reason", "cwd", "label"]
   }
 }
 ```
@@ -765,8 +794,8 @@ subject = "process"
 
 Setup, in order:
 
-1. `sudo packaging/install.sh --factor touch` from a terminal you opened
-   yourself ([packaging/README.md](../packaging/README.md)).
+1. Install through `packaging/trusted-build.sh --factor touch`, from a
+   terminal you opened yourself ([packaging/README.md](../packaging/README.md#install)).
 2. Optionally lock user GNOME Shell extensions off ([above](#locking-out-user-gnome-shell-extensions-optional)).
 3. `/usr/bin/cn doctor` from a terminal you opened yourself.
 4. Start agents with `cn session exec -- claude`, so the dialog can name the

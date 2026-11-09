@@ -56,9 +56,9 @@ Event-specific fields:
 | `use.start` | `run_id`, `secrets`, `env`, `argv0`, `argc`, `cwd`, `pid` |
 | `use.end` | `run_id`, `status` (`exited`/`signaled`/`client_lost`), `exit`, `signal`, `duration_ms`, `hits` |
 | `reveal` | `secret`, `grant_id`, `uses_left` |
-| `hide` | `bytes_in`, `bytes_out`, `hits` (name → count), `patterns` (the number of patterns: values and their encodings) |
+| `hide` | `bytes_in`, `hits` (name → count), `patterns` (the number of patterns: values and their encodings). No `bytes_out`: with `bytes_in` and the hits it would give away the matched values' lengths. |
 | `store.add` / `store.set` / `store.edit` / `store.rm` | `secret`, `request_id`, `fields_changed`, `value_changed` (bool), `generation`; `store.add` and `store.edit` also carry `metadata` (the new non-secret metadata) |
-| `import` | `request_id`, `count`, after the batch's `store.add` records |
+| `import` | `request_id`, `count`, after the batch's `store.add` records, in the same write |
 | `keyslot.add` | `slot`, `credential_id`, `request_id`. Written by `cnd recover`. |
 | `peer.reject` | `uid`, `pid`, `code` |
 | `checkpoint` | `upto_seq`, `upto_hash`, `host`, `sig` |
@@ -69,14 +69,18 @@ Phase 2 adds `export` (`request_id`, `count`, `recipient`), `unlock` (`slot`,
 
 `evidence` is `{adapter, at, detail}`. For polkit, `detail` is `{action_id,
 subject, is_authorized, dismissed, duration_ms}`. A `request.deny` with
-approver `client` is a `cn deny`, and its evidence is `{reason}`. A
+approver `client` is a `cn deny`, and its evidence is `{reason, peer: {uid,
+pid, comm}, from, session}`: who ran it, and whether `from` its request's
+own session (`own_session`), another agent session (`other_session`), a
+terminal outside any session (`terminal`) or no session (`no_session`). A
 `request.deny` with approver `cnd` means no decision was possible (an
 unavailable approver, a fault, an approval that could not be recorded), and
 its evidence is `{error}`.
 
 `digest` is the request digest (design.md, section 6). It is a hash of request
-metadata, never of a value. `reason` is the agent's text after the session's
-hide set has redacted it.
+metadata, never of a value. `reason`, a `cn deny` reason and the session
+labels are the client's text after the session's hide set has redacted it
+(`[audit] redact_agent_text`).
 
 ### Examples
 
@@ -89,7 +93,7 @@ Lines are shown wrapped here; on disk each is one line.
 {"v":1,"seq":216,"ts":"2026-11-08T09:21:02.118870Z","boot":"5e1c9a07","event":"use.start","session":{"id":"s_7k2mq9d4x1ha","anchor_pid":41210,"anchor_comm":"claude","registered":true,"labels":{}},"run_id":"u_8d1e…","secrets":["clickhouse-prod"],"env":["CLICKHOUSE_PROD"],"argv0":"./scripts/drift.py","argc":3,"cwd":"/home/patrick/projects/x","pid":41377,"prev":"c4a0…","hash":"0e93…"}
 {"v":1,"seq":217,"ts":"2026-11-08T09:21:47.902551Z","boot":"5e1c9a07","event":"use.end","session":{"id":"s_7k2mq9d4x1ha","anchor_pid":41210,"anchor_comm":"claude","registered":true,"labels":{}},"run_id":"u_8d1e…","status":"exited","exit":0,"signal":null,"duration_ms":45784,"hits":{},"prev":"0e93…","hash":"5f21…"}
 {"v":1,"seq":220,"ts":"2026-11-08T09:30:12.000417Z","boot":"5e1c9a07","event":"reveal","session":{"id":"s_7k2mq9d4x1ha","anchor_pid":41210,"anchor_comm":"claude","registered":true,"labels":{}},"secret":"github-token","grant_id":"g_9a10…","uses_left":0,"prev":"1b3d…","hash":"e8c7…"}
-{"v":1,"seq":221,"ts":"2026-11-08T09:31:05.230980Z","boot":"5e1c9a07","event":"hide","session":{"id":"s_7k2mq9d4x1ha","anchor_pid":41210,"anchor_comm":"claude","registered":true,"labels":{}},"bytes_in":18234,"bytes_out":18190,"hits":{"github-token":2},"patterns":96,"prev":"e8c7…","hash":"44b2…"}
+{"v":1,"seq":221,"ts":"2026-11-08T09:31:05.230980Z","boot":"5e1c9a07","event":"hide","session":{"id":"s_7k2mq9d4x1ha","anchor_pid":41210,"anchor_comm":"claude","registered":true,"labels":{}},"bytes_in":18234,"hits":{"github-token":2},"patterns":96,"prev":"e8c7…","hash":"44b2…"}
 {"v":1,"seq":230,"ts":"2026-11-08T10:02:44.771201Z","boot":"5e1c9a07","event":"store.set","session":{"id":"h_0k4d2m8x1p7q","anchor_pid":40102,"anchor_comm":"bash","registered":false,"labels":{}},"secret":"clickhouse-prod","request_id":"r_z0p1…","fields_changed":["value","rotated"],"value_changed":true,"generation":43,"prev":"9a6f…","hash":"b3e0…"}
 {"v":1,"seq":1000,"ts":"2026-11-08T14:00:00.000981Z","boot":"5e1c9a07","event":"checkpoint","session":null,"upto_seq":999,"upto_hash":"d71a…","host":"4f1c2a9e…","sig":"ed25519:Mq3…","prev":"d71a…","hash":"6c08…"}
 ```
@@ -123,7 +127,13 @@ record_n.prev = hash_{n-1}
 
 Writes: `cnd` serializes the record, computes the hash, appends one line with
 `write(2)` on an `O_APPEND` descriptor, and `fdatasync`s before replying to the
-client. An action whose audit write fails is not performed: a request whose
+client. The records of one store change (its `store.*` records, and `import`)
+go in one write and one sync: all of them are in the log, or none. A write
+that fails part way (a full disk, a file size limit) is cut off again, so a
+later record never follows a fragment; if the cut fails, the log refuses
+every later write until `cnd` restarts. A checkpoint that fails after its
+record was written does not make that record fail; it is retried on the next
+append and by the timer. An action whose audit write fails is not performed: a request whose
 `request.create` cannot be written is not created; for `run` and `reveal` the
 value is not returned; for a store change the store rename happens before the
 audit write, so on audit failure `cnd` restores `store.v1.prev` and the
@@ -173,6 +183,10 @@ Phase 2 adds `cn audit checkpoints` and `cn audit pubkey` for this, and a
   whichever comes first. Closing writes a `checkpoint`; the new segment begins
   with `segment.open`, whose `prev` is the last hash of the old segment. The
   chain runs unbroken across segments.
+- A crash during rotation is recovered at the next open: a new segment that
+  is empty or has a torn `segment.open` is removed, and the next append
+  rotates again. A `segment.open` whose write failed is written by the next
+  append.
 - Phase 1 keeps every segment. `[audit] retention` is parsed and ignored with
   a warning; pruning (with a `prune` record that becomes the verifier's
   starting anchor) is Phase 2.
@@ -227,7 +241,9 @@ SEQ  TIME      SESSION         EVENT            DETAIL
 them in `cn`, not in `cnd`:
 
 1. Recompute every `hash`, check JCS form, `prev` linkage and `seq`
-   contiguity from `seq` 1, or from `--from SEQ`.
+   contiguity. The log must start at `seq` 1, or exactly at `--from SEQ`: a
+   log whose first segments were deleted fails, rather than verifying from
+   wherever it now starts.
 2. Verify every checkpoint signature against the public key given with
    `--pubkey FILE`, or the `checkpoint.pub` that `cnd` serves if none is
    given.
@@ -259,7 +275,7 @@ which re-verifies FIDO2 approvals, is Phase 2.
 | Root edits a record and does not recompute | Detected | Hash mismatch. |
 | Root rewrites history and recomputes the chain | **Not detected locally** | Root can read MK, unwrap DK, derive AK, re-sign checkpoints. |
 | Root rewrites history before an exported checkpoint | Detected | The exported `upto_hash` no longer matches. |
-| Root truncates the tail after the last export | **Not detected** | Nothing off-box covers those records. |
+| Root truncates the tail after the last export | **Not detected** | Nothing off-box covers those records. `cn audit verify` checks the records it is given; it cannot tell that later ones existed. |
 | Root deletes the whole log and the public key | Only with off-box copies | The exported public key and checkpoints show a log existed and what its head was. |
 
 The chain gives integrity against everything below root. Against root, it

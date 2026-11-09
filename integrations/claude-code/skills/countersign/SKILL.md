@@ -31,7 +31,8 @@ and `cn run` puts the value into the environment of the command you run.
    - The reason is shown to the human, labelled as yours. Name the script and
      what it does with the secret.
    - Ask for `--mode reveal` only when the human asked to see the value.
-   - `--wait 100s` stays under the Bash tool's two-minute timeout.
+   - `--wait 100s` stays under the Bash tool's two-minute timeout. The
+       dialog stays open longer (5 minutes); exit 6 means it is still open.
 5. **Ask the human, in one line**, with the code and digest from the output:
    "Please approve countersign request K7M-Q2X (digest 3QF8-ZK2M) in the
    desktop dialog." If the request is still pending (exit 6), wait for their
@@ -58,18 +59,21 @@ type anything in the chat to approve. GNOME shows, for example:
 ```text
 Authentication Required
 countersign request K7M-Q2X, digest 3QF8-ZK2M: USE clickhouse-password for 30m.
-agent claude (pid 41210) in ~/projects/x. Agent's reason: row counts for the cost report
+agent claude (pid 41210, registered by cn session exec); agent-reported: cwd ~/projects/x.
+Agent's reason: row counts for the cost report
 ```
 
 They compare the code and digest with your message, then touch their
 security key or type their password, depending on how countersign was
 installed. Cancel denies the request (exit 5). If they do nothing, the
-dialog closes after two minutes and the request expires (exit 7 when you
-were waiting); it cannot be raised again, so request again if still needed.
+dialog closes when the request lapses (5 minutes) and the request expires
+(exit 7 when you were waiting); it cannot be raised again, so request again
+if still needed. At most two dialogs are open at once; a further request
+waits its turn (`approve queued: ...`).
 
 If `cnd` cannot show a dialog at all (no graphical session, not Wayland,
-polkit not running), the request ends at once, denied by `cnd`, with the
-reason in the message (exit 5). Tell the human the reason.
+polkit not running), the request ends at once with the reason in the
+message (exit 14). Tell the human the reason.
 
 `cn approve CODE` only shows the request for cross-checking and waits for
 the dialog's answer; approving happens in the dialog. Do not run it
@@ -80,12 +84,13 @@ yourself.
 | Exit | Meaning | Do |
 | --- | --- | --- |
 | 4 | `grant_required` | Go to step 4. |
-| 5 | `denied` | Stop. Tell the human, with the message (a denial by `cnd` says why no dialog could be shown). Do not look for another way to get the value. |
+| 5 | `denied` | Stop. Tell the human, with the message. Do not look for another way to get the value. |
 | 6 | `pending` | Ask the human to approve (step 5). |
 | 7 | `request_expired` | Request again if still needed. |
 | 8 | `unknown_secret` | `cn list --all`; it may be scoped to another project. |
 | 10 | `rate_limited` | Too many pending or recent requests, or the same secrets were denied a moment ago. Wait, and ask the human. |
 | 11 | `no_session` | Tell the human; they should start you with `cn session exec -- claude`. |
+| 14 | `approver_unavailable` | No dialog could be shown. Stop and tell the human, with the message. |
 | 125 from `cn run` | `cn` failed before running the command | Read the error code on stderr. |
 
 ## Never

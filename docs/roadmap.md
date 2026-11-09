@@ -14,13 +14,17 @@ ends with something the owner uses daily, not a demo.
   codes.
 - Resolve the blocking open questions below before Phase 1 code.
 
-## Phase 1: replaces `.secret-*` files on one machine (implemented, under review)
+## Phase 1: replaces `.secret-*` files on one machine (implemented, reviewed)
 
 Done when the owner has deleted every `.secret-*` file from the liskov
 workspace and its scripts use `cn run`. Decisions 14 to 19 set its scope.
 The code is written and tested end to end against the `insecure-auto`
-approver and a fake polkit authority; it is being reviewed before it holds
-real secrets.
+approver and a fake polkit authority. It has had one internal security and
+correctness review (2026-11-09) of the daemon, the store, the approver and
+the packaging; the fixes are merged (per-uid limits and a dialog queue,
+honest dialog text, whole audit and store writes after failures, `cn run`
+signals, a per-user PAM stack, and a trusted build and install path). It is
+new software.
 
 1. `cnd`: socket activation, peer credentials through `SO_PEERPIDFD`
    (Linux 6.5+), handshake, sessions (launcher registration first, then

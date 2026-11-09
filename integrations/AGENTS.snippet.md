@@ -26,9 +26,9 @@ through `cn`.
 - Never run `cn add`, `set`, `edit`, `rm`, `import` or `export`. Ask the
   human. You may draft descriptions and usage text for them.
 - Exit 4 (no grant) or 7 (expired): request again. Exit 6 (still pending):
-  ask the human to approve, then check `cn grants`. Exit 5 (denied): stop and
-  ask the human, passing on the message (it says when no dialog could be
-  shown); do not look for another way to get the value. Exit 11 (no
+  ask the human to approve, then check `cn grants`. Exit 5 (denied) or 14
+  (no dialog could be shown): stop and ask the human, passing on the
+  message; do not look for another way to get the value. Exit 11 (no
   session): ask the human to start you with `cn session exec`.
 - Use `--json` when you parse `cn` output. Run `cn revoke --all` when the task
   is done.
