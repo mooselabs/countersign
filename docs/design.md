@@ -100,7 +100,8 @@ files are the reference, and each directive carries a comment. In short:
 
 - The socket listens on `/run/countersign/cnd.sock`, `countersign:countersign-users`
   0660, and is the unit that gets enabled. The service has no `[Install]`
-  section; it starts on the first connection (`Type=notify`).
+  section; it starts on the first connection. `Type=notify-reload`:
+  `systemctl reload countersign` sends SIGHUP and `cnd` re-reads its config.
 - `cnd` runs as `countersign` with no capabilities, `NoNewPrivileges=yes`,
   `ProtectSystem=strict` (only `StateDirectory=countersign` is writable),
   `ProtectHome=yes`, `PrivateDevices=yes`, `PrivateTmp=yes`,

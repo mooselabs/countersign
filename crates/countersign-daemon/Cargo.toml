@@ -12,11 +12,34 @@ authors.workspace = true
 name = "cnd"
 path = "src/main.rs"
 
+[features]
+# End-to-end test mode (docs/decisions.md, decision 17): the insecure-auto
+# approver, a master key from a plain file, a socket path on the command
+# line, and cnd running as its clients' uid. Debug builds only: a release
+# build with this feature fails to compile.
+insecure-test = ["countersign-core/insecure-test", "countersign-approve/insecure-test"]
+
 [dependencies]
 countersign-proto.workspace = true
 countersign-core.workspace = true
 countersign-approve.workspace = true
 countersign-hide.workspace = true
+base64.workspace = true
+clap.workspace = true
+glob.workspace = true
+nix.workspace = true
+rustix.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+zbus.workspace = true
+zvariant.workspace = true
 
 [lints]
 workspace = true

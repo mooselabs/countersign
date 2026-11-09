@@ -8,7 +8,10 @@ Requires=countersign.socket
 After=countersign.socket
 
 [Service]
-Type=notify
+# cnd sends READY=1 once it serves, and on SIGHUP (systemctl reload) reloads
+# /etc/countersign/config.toml, sending RELOADING=1 then READY=1. A config
+# that does not load leaves the previous one in force (see the journal).
+Type=notify-reload
 ExecStart=/usr/libexec/countersign/cnd
 User=countersign
 Group=countersign
@@ -26,6 +29,10 @@ LoadCredentialEncrypted=countersign-mk
 
 UMask=0077
 LimitCORE=0
+# LimitMEMLOCK stays at systemd's default (8 MiB). cnd then locks no memory
+# rather than risk failed allocations (mlockall with MCL_FUTURE would fail
+# any mapping past the limit). To keep values out of swap, a drop-in with
+# LimitMEMLOCK=infinity makes cnd lock all of its memory.
 
 # No privileges: cnd needs no capability at all.
 NoNewPrivileges=yes
