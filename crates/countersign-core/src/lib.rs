@@ -18,3 +18,5 @@ pub mod grants;
 pub mod sessions;
 pub mod store;
 pub mod time;
+
+pub use encoding::random_id;

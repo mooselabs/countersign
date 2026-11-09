@@ -259,6 +259,14 @@ impl PolkitApprover {
             _ = tokio::time::sleep_until(deadline) => return Err(ApproverError::Timeout),
             conn = self.connection() => conn?,
         };
+        if self.config.require_wayland {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(ApproverError::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => return Err(ApproverError::Timeout),
+                checked = require_wayland(&conn, req) => checked?,
+            }
+        }
         let proxy = authority(&conn).await.map_err(|e| self.map_error(&e))?;
         let id = cancellation_id(req);
         let mut guard = CancelGuard {
@@ -361,6 +369,66 @@ impl DaemonApprover for PolkitApprover {
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<Outcome, ApproverError>> {
         Box::pin(self.run(req, cancel))
+    }
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.login1.Manager",
+    default_service = "org.freedesktop.login1",
+    default_path = "/org/freedesktop/login1",
+    gen_blocking = false
+)]
+trait Logind {
+    fn get_session(&self, session_id: &str) -> zbus::Result<zvariant::OwnedObjectPath>;
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.login1.Session",
+    default_service = "org.freedesktop.login1",
+    gen_blocking = false
+)]
+trait LoginSession {
+    #[zbus(property, name = "Type")]
+    fn session_type(&self) -> zbus::Result<String>;
+}
+
+/// `require_wayland`: the anchor's login session must be a Wayland one. On
+/// X11 any client of the display, the agent included, can send input to
+/// the dialog. Without a login session or an answer from logind, polkit is
+/// unavailable rather than trusted.
+async fn require_wayland(
+    conn: &zbus::Connection,
+    req: &ApprovalRequest,
+) -> Result<(), ApproverError> {
+    let Some(id) = req.session().logind_session.as_deref() else {
+        return Err(ApproverError::Unavailable(
+            "require_wayland: the agent is not in a login session".into(),
+        ));
+    };
+    let unavailable =
+        |e: zbus::Error| ApproverError::Unavailable(format!("require_wayland: logind: {e}"));
+    let path = LogindProxy::new(conn)
+        .await
+        .map_err(unavailable)?
+        .get_session(id)
+        .await
+        .map_err(unavailable)?;
+    let ty = LoginSessionProxy::builder(conn)
+        .path(path)
+        .map_err(unavailable)?
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+        .map_err(unavailable)?
+        .session_type()
+        .await
+        .map_err(unavailable)?;
+    if ty == "wayland" {
+        Ok(())
+    } else {
+        Err(ApproverError::Unavailable(format!(
+            "require_wayland: login session {id} is {ty:?}, not wayland"
+        )))
     }
 }
 

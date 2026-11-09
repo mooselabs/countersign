@@ -218,7 +218,7 @@ pub struct Change {
 }
 
 /// The metadata fields that differ between `a` and `b`.
-pub(crate) fn meta_diff(a: &SecretMeta, b: &SecretMeta) -> Vec<&'static str> {
+pub fn meta_diff(a: &SecretMeta, b: &SecretMeta) -> Vec<&'static str> {
     let mut v = Vec::new();
     if a.description != b.description {
         v.push("description");

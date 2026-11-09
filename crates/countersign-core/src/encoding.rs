@@ -34,8 +34,9 @@ pub(crate) fn crockford_value(c: u8) -> Option<u8> {
     CROCKFORD.iter().position(|&x| x == c).map(|p| p as u8)
 }
 
-/// A random id: `prefix` followed by `n` lower-case Crockford characters.
-pub(crate) fn random_id(prefix: &str, n: usize) -> String {
+/// A random id: `prefix` followed by `n` lower-case Crockford characters
+/// (5 random bits each). Request, grant and run ids use it.
+pub fn random_id(prefix: &str, n: usize) -> String {
     let bytes = random_vec(n.div_ceil(8) * 5);
     let mut s = crockford(&bytes).to_ascii_lowercase();
     s.truncate(n);

@@ -261,6 +261,8 @@ impl Fixture {
             PolkitConfig {
                 subject,
                 on_dismiss,
+                // The private bus has no logind; require_wayland has its own test.
+                require_wayland: false,
                 ..PolkitConfig::default()
             },
             Bus::Address(self.bus.address.clone()),
@@ -607,7 +609,10 @@ async fn missing_polkitd_is_unavailable() {
     };
     let approver = PolkitApprover::new(
         "polkit",
-        PolkitConfig::default(),
+        PolkitConfig {
+            require_wayland: false,
+            ..PolkitConfig::default()
+        },
         Bus::Address(bus.address.clone()),
     );
     let err = approver
@@ -791,4 +796,27 @@ fn dialog_digest_matches_what_cn_approve_computes() {
     assert_eq!(details["digest"], cn_digest.short());
     assert_eq!(req.digest(), &cn_digest.0);
     assert_eq!(cn_digest.short(), "04DY-AGEE");
+}
+
+/// With `require_wayland`, a bus with no logind (so no session type) makes
+/// polkit unavailable, and no check reaches polkitd.
+#[tokio::test(flavor = "multi_thread")]
+async fn require_wayland_without_logind_is_unavailable() {
+    let Some(fx) = Fixture::start(Reply::Result(true, false, &[])).await else {
+        return;
+    };
+    let approver = PolkitApprover::new(
+        "polkit",
+        PolkitConfig::default(),
+        Bus::Address(fx.bus.address.clone()),
+    );
+    let err = approver
+        .present(&use_request(MINUTE), CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ApproverError::Unavailable(why) if why.contains("require_wayland")),
+        "{err:?}"
+    );
+    assert!(fx.with(|s| s.calls.is_empty()));
 }

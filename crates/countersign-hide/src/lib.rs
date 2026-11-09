@@ -267,6 +267,11 @@ impl Redactor {
         (out, hits)
     }
 
+    /// Number of patterns (values and their encodings) in the matcher.
+    pub fn patterns(&self) -> usize {
+        self.matcher.patterns_len()
+    }
+
     /// Secrets left out because their value is shorter than the minimum.
     pub fn skipped(&self) -> &[String] {
         &self.skipped

@@ -36,7 +36,7 @@ use zeroize::Zeroizing;
 pub use keys::{KdfParams, MasterKey};
 pub use model::{
     Change, MAX_DESCRIPTION_CHARS, MAX_USAGE_BYTES, MAX_VALUE_LEN, Mutation, SecretInfo,
-    SecretValue, check_meta, check_value, default_env, valid_name,
+    SecretValue, check_meta, check_value, default_env, meta_diff, valid_name,
 };
 pub use phrase::{PhraseError, RecoveryPhrase};
 
