@@ -1,6 +1,6 @@
 [package]
 name = "countersign-approve"
-description = "Approver adapters (FIDO2, polkit, command) for countersign"
+description = "Approver adapters (polkit, and later FIDO2 and command) for countersign"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,8 +8,23 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# Adds the `insecure-auto` approver for end-to-end tests. Debug builds only:
+# a release build with this feature fails to compile.
+insecure-test = []
+
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio-util.workspace = true
+zbus.workspace = true
+zvariant.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync", "test-util"] }
 
 [lints]
 workspace = true
