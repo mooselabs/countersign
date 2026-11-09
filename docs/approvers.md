@@ -536,7 +536,7 @@ against an enrolled public key.
 
 ### Enrollment
 
-`cn approver enroll --name desk-key` (see [cli.md](cli.md#cn-approver-enroll-phase-2)):
+`/usr/bin/cn approver enroll --name desk-key [--uv required|preferred|discouraged] [--out FILE]`:
 
 1. `cn` gets an enrollment nonce from `cnd`.
 2. `authenticatorMakeCredential` with:
@@ -552,7 +552,9 @@ against an enrolled public key.
 3. `cn` writes `desk-key.approver.toml`: name, credential id, COSE public key,
    algorithm, AAGUID, uv policy, attestation statement (format, signature,
    certificate chain), the enrollment nonce, and the time.
-4. Root installs it into `/etc/countersign/approvers.d/` and reloads `cnd`.
+4. Root installs it into `/etc/countersign/approvers.d/` and reloads `cnd`
+   (`sudo install -o root -g root -m 0644 desk-key.approver.toml
+   /etc/countersign/approvers.d/`, then `sudo systemctl reload countersign`).
 5. On load, `cnd` verifies the attestation signature and chain against the
    configured roots (default: the Yubico FIDO root CA) and, optionally, an
    AAGUID allowlist. A software authenticator, including one a shadowed `cn`
@@ -630,6 +632,18 @@ SUBSYSTEM=="hidraw", ENV{ID_FIDO_TOKEN}=="1", GROUP="countersign", MODE="0660", 
 
 The unit then sets `PrivateDevices=no` and `DeviceAllow=char-hidraw rw`.
 `TAG+="uaccess"` keeps the seat user's access, so `cn approve` still works.
+
+### Store unlock
+
+A `fido2` key slot wraps the data key with `KEK = HKDF(hmac-secret(salt),
+"countersign/kek/v1")`. A `cnd` whose only usable slot is `fido2` starts
+sealed and answers `store_sealed` until `/usr/bin/cn unlock`: `cn` gets the
+slot's credential id and salt from `cnd`, asks the key for its `hmac-secret`
+output (touch required), and sends it to `cnd`, which unwraps the data key.
+With `[unlock] fido2_side = "daemon"`, `cnd` talks to the key itself and
+`cn unlock` only triggers it. `cn unlock --enroll` adds a `fido2` slot for the
+inserted key, under a `mutate` approval. The audit log records `unlock`,
+`store.unseal` and `keyslot.add`.
 
 ### Library choice (open)
 

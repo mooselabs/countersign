@@ -10,9 +10,9 @@ an audit log the agent cannot change.
 
 CLI `cn`, daemon `cnd`. Rust, Linux first. Apache-2.0.
 
-> **Status: Phase 1 in progress** ([roadmap](docs/roadmap.md)). The documents
-> under [`docs/`](docs/) are the spec. Phase 1 has not been reviewed: do not
-> store real secrets in it until it has.
+> **Status: Phase 1 implemented, under review** ([roadmap](docs/roadmap.md)).
+> The documents under [`docs/`](docs/) describe what it does. Phase 1 has not
+> been reviewed: do not store real secrets in it until it has.
 
 ## The problem
 
@@ -82,7 +82,7 @@ Containing that needs the agent in a sandbox or under a separate user.
 | --- | --- |
 | [threat-model.md](docs/threat-model.md) | What is defended, what is not, and why |
 | [design.md](docs/design.md) | Daemon, store, sessions, grants, IPC, `run`, `hide` |
-| [approvers.md](docs/approvers.md) | Approver adapters: FIDO2/YubiKey, polkit, command |
+| [approvers.md](docs/approvers.md) | Approvers: polkit (Phase 1); FIDO2 and command (Phase 2) |
 | [audit.md](docs/audit.md) | Audit log format, hash chain, verification |
 | [cli.md](docs/cli.md) | `cn` command reference |
 | [agent-integration.md](docs/agent-integration.md) | Instructions for agents, hooks, migrating from `.secret-*` files |
