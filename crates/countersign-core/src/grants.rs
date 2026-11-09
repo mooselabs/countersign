@@ -49,9 +49,14 @@ pub struct Policy {
     pub max_names_per_request: usize,
     /// Pending requests per session.
     pub max_pending_requests: usize,
+    /// Pending requests per uid, over all its sessions.
+    pub max_pending_requests_per_uid: usize,
     /// Requests per session per hour.
     pub requests_per_hour: u32,
-    /// After a deny, the same secrets are refused this long in that session.
+    /// Requests per uid per hour, over all its sessions.
+    pub requests_per_hour_per_uid: u32,
+    /// After a deny, the same secrets are refused this long for that uid,
+    /// in every session (a new session does not escape it).
     pub deny_cooldown: Duration,
 }
 
@@ -67,7 +72,9 @@ impl Policy {
             pending_expiry: c.grants.pending_expiry,
             max_names_per_request: c.limits.max_names_per_request,
             max_pending_requests: c.limits.max_pending_requests,
+            max_pending_requests_per_uid: c.limits.max_pending_requests_per_uid,
             requests_per_hour: c.limits.requests_per_hour,
+            requests_per_hour_per_uid: c.limits.requests_per_hour_per_uid,
             deny_cooldown: c.limits.deny_cooldown,
         }
     }
@@ -182,6 +189,8 @@ pub struct PendingRequest {
     pub code: RequestCode,
     /// The session that asked.
     pub session: String,
+    /// The uid of the session's anchor.
+    pub uid: u32,
     /// What it asks for.
     pub kind: RequestKind,
     /// Agent-supplied reason (untrusted).
@@ -253,7 +262,8 @@ pub struct Grants {
     ended: HashMap<RequestCode, (Ended, SystemTime)>,
     grants: BTreeMap<String, Grant>,
     recent: HashMap<String, VecDeque<SystemTime>>,
-    cooldown: HashMap<(String, String), SystemTime>,
+    recent_uid: HashMap<u32, VecDeque<SystemTime>>,
+    cooldown: HashMap<(u32, String), SystemTime>,
 }
 
 impl std::fmt::Debug for Grants {
@@ -283,6 +293,7 @@ impl Grants {
             ended: HashMap::new(),
             grants: BTreeMap::new(),
             recent: HashMap::new(),
+            recent_uid: HashMap::new(),
             cooldown: HashMap::new(),
         }
     }
@@ -298,7 +309,8 @@ impl Grants {
         self.policy = policy;
     }
 
-    /// Creates a grant request. `known` says whether a secret exists;
+    /// Creates a grant request for `session`, whose anchor runs as `uid`.
+    /// `known` says whether a secret exists;
     /// `digest` computes the canonical request digest from the new request
     /// (whose `digest` field is still zero).
     ///
@@ -306,10 +318,11 @@ impl Grants {
     /// (`unknown_secret`), too many names, a TTL above the limit, reveal
     /// when disabled, an over-long reason (`limit_exceeded`), and too many
     /// pending or recent requests or a secret in deny cooldown
-    /// (`rate_limited`).
+    /// (`rate_limited`). Rate limits count per session and per uid.
     pub fn request_grant(
         &mut self,
         session: &Session,
+        uid: u32,
         ask: GrantAsk<'_>,
         known: impl Fn(&str) -> bool,
         digest: impl FnOnce(&PendingRequest) -> [u8; 32],
@@ -371,7 +384,7 @@ impl Grants {
             ));
         }
         let kind = RequestKind::Grant { names, mode, ttl };
-        self.create(&session.id, kind, reason, digest)
+        self.create(&session.id, uid, kind, reason, digest)
     }
 
     /// Creates a mutation request. Check it against the store first
@@ -379,6 +392,7 @@ impl Grants {
     pub fn request_mutation(
         &mut self,
         session: &Session,
+        uid: u32,
         mutations: Vec<Mutation>,
         reason: &str,
         digest: impl FnOnce(&PendingRequest) -> [u8; 32],
@@ -391,6 +405,7 @@ impl Grants {
         }
         self.create(
             &session.id,
+            uid,
             RequestKind::Mutation(mutations),
             reason,
             digest,
@@ -400,6 +415,7 @@ impl Grants {
     fn create(
         &mut self,
         session: &str,
+        uid: u32,
         kind: RequestKind,
         reason: &str,
         digest: impl FnOnce(&PendingRequest) -> [u8; 32],
@@ -422,18 +438,37 @@ impl Grants {
                 format!("{pending} requests are already pending in this session"),
             ));
         }
-        let hour = Duration::from_secs(3600);
-        let recent = self.recent.entry(session.to_owned()).or_default();
-        while recent
-            .front()
-            .is_some_and(|t| now.duration_since(*t).unwrap_or_default() >= hour)
-        {
-            recent.pop_front();
+        let pending_uid = self.pending.values().filter(|r| r.uid == uid).count();
+        if pending_uid >= self.policy.max_pending_requests_per_uid {
+            return Err(GrantError::new(
+                ErrorCode::RateLimited,
+                format!("{pending_uid} requests of this user are already pending"),
+            ));
         }
-        if recent.len() >= self.policy.requests_per_hour as usize {
+        let hour = Duration::from_secs(3600);
+        let fresh = |q: &mut VecDeque<SystemTime>| {
+            while q
+                .front()
+                .is_some_and(|t| now.duration_since(*t).unwrap_or_default() >= hour)
+            {
+                q.pop_front();
+            }
+            q.len()
+        };
+        if fresh(self.recent.entry(session.to_owned()).or_default())
+            >= self.policy.requests_per_hour as usize
+        {
             return Err(GrantError::new(
                 ErrorCode::RateLimited,
                 "too many requests in the last hour",
+            ));
+        }
+        if fresh(self.recent_uid.entry(uid).or_default())
+            >= self.policy.requests_per_hour_per_uid as usize
+        {
+            return Err(GrantError::new(
+                ErrorCode::RateLimited,
+                "too many requests from this user in the last hour",
             ));
         }
         let cooling: Vec<String> = kind
@@ -441,7 +476,7 @@ impl Grants {
             .into_iter()
             .filter(|n| {
                 self.cooldown
-                    .get(&(session.to_owned(), n.clone()))
+                    .get(&(uid, n.clone()))
                     .is_some_and(|until| now < *until)
             })
             .collect();
@@ -463,6 +498,7 @@ impl Grants {
             id: random_id("r_", 26),
             code,
             session: session.to_owned(),
+            uid,
             kind,
             reason: reason.to_owned(),
             nonce: random_array(),
@@ -475,6 +511,7 @@ impl Grants {
             .entry(session.to_owned())
             .or_default()
             .push_back(now);
+        self.recent_uid.entry(uid).or_default().push_back(now);
         self.by_code.insert(code, req.id.clone());
         let id = req.id.clone();
         Ok(self.pending.entry(id).or_insert(req))
@@ -574,12 +611,12 @@ impl Grants {
     }
 
     /// Denies a pending request. Its secrets go into deny cooldown for the
-    /// session.
+    /// uid, in every session.
     pub fn deny(&mut self, request_id: &str) -> Result<PendingRequest, GrantError> {
         let r = self.take(request_id, Ended::Denied)?;
         let until = self.clock.now() + self.policy.deny_cooldown;
         for n in r.kind.names() {
-            self.cooldown.insert((r.session.clone(), n), until);
+            self.cooldown.insert((r.uid, n), until);
         }
         Ok(r)
     }
@@ -717,8 +754,9 @@ impl Grants {
             .filter_map(|id| self.take(id, Ended::Expired).ok())
             .collect();
         let grants = self.remove_grants(|g| g.session == session);
+        // The session's own count goes with it; the uid's counts and deny
+        // cooldowns stay, so ending a session does not reset them.
         self.recent.remove(session);
-        self.cooldown.retain(|(s, _), _| s != session);
         Expired { requests, grants }
     }
 
@@ -741,6 +779,11 @@ impl Grants {
         self.ended
             .retain(|_, (_, at)| now.duration_since(*at).unwrap_or_default() < keep);
         self.cooldown.retain(|_, until| now < *until);
+        let hour = Duration::from_secs(3600);
+        self.recent_uid.retain(|_, q| {
+            q.back()
+                .is_some_and(|t| now.duration_since(*t).unwrap_or_default() < hour)
+        });
         Expired { requests, grants }
     }
 

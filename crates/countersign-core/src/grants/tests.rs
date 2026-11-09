@@ -74,7 +74,7 @@ impl T {
     ) -> Result<String, GrantError> {
         let n = names(n);
         self.g
-            .request_grant(s, ask(&n, mode, ttl), known, digest)
+            .request_grant(s, 1000, ask(&n, mode, ttl), known, digest)
             .map(|r| r.id.clone())
     }
 
@@ -240,7 +240,7 @@ fn limits_give_the_matching_error_codes() {
     let many: Vec<String> = (0..17).map(|i| format!("s{i}")).collect();
     let all_known = |_: &str| true;
     let e =
-        t.g.request_grant(&s, ask(&many, Mode::Use, None), all_known, digest)
+        t.g.request_grant(&s, 1000, ask(&many, Mode::Use, None), all_known, digest)
             .unwrap_err();
     assert_eq!(e.code, ErrorCode::LimitExceeded);
 
@@ -251,7 +251,9 @@ fn limits_give_the_matching_error_codes() {
         ..ask(&n, Mode::Use, None)
     };
     assert_eq!(
-        t.g.request_grant(&s, a, known, digest).unwrap_err().code,
+        t.g.request_grant(&s, 1000, a, known, digest)
+            .unwrap_err()
+            .code,
         ErrorCode::LimitExceeded
     );
 
@@ -276,7 +278,7 @@ fn human_sessions_cannot_hold_grants_but_can_mutate() {
         value: SecretValue::new(b"new-value-1".to_vec()),
     };
     let id =
-        t.g.request_mutation(&h, vec![m.clone()], "rotate", digest)
+        t.g.request_mutation(&h, 1000, vec![m.clone()], "rotate", digest)
             .unwrap()
             .id
             .clone();
@@ -395,7 +397,9 @@ fn revoke_one_all_by_secret_and_by_session_end() {
 fn codes_are_unique_among_pending_requests() {
     let p = Policy {
         max_pending_requests: 10_000,
+        max_pending_requests_per_uid: 10_000,
         requests_per_hour: 10_000,
+        requests_per_hour_per_uid: 10_000,
         ..Policy::default()
     };
     let clock = Arc::new(ManualClock::new(start()));
@@ -405,7 +409,7 @@ fn codes_are_unique_among_pending_requests() {
     for i in 0..2000 {
         let s = agent(&format!("s_{i}"));
         let r = g
-            .request_grant(&s, ask(&n, Mode::Use, None), known, digest)
+            .request_grant(&s, 1000, ask(&n, Mode::Use, None), known, digest)
             .unwrap();
         assert!(codes.insert(r.code), "duplicate code");
     }
@@ -416,7 +420,7 @@ fn the_digest_function_sees_the_final_request() {
     let mut t = setup();
     let n = names(&["db"]);
     let r =
-        t.g.request_grant(&agent("s_1"), ask(&n, Mode::Use, None), known, |r| {
+        t.g.request_grant(&agent("s_1"), 1000, ask(&n, Mode::Use, None), known, |r| {
             assert_eq!(r.digest, [0; 32]);
             let mut d = [0; 32];
             d[..8].copy_from_slice(
@@ -431,4 +435,62 @@ fn the_digest_function_sees_the_final_request() {
         })
         .unwrap();
     assert_eq!(r.digest[8..], r.nonce[..24]);
+}
+
+#[test]
+fn new_sessions_do_not_escape_the_per_uid_limits() {
+    let mut t = setup();
+    // Ten pending per uid, however many sessions ask.
+    let mut ok = 0;
+    for i in 0..20 {
+        if t.request(&agent(&format!("s_{i}")), &["db"], Mode::Use, None)
+            .is_ok()
+        {
+            ok += 1;
+        }
+    }
+    assert_eq!(ok, 10);
+    let e = t
+        .request(&agent("s_new"), &["db"], Mode::Use, None)
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::RateLimited);
+    // Another uid is not affected.
+    let n = names(&["db"]);
+    assert!(
+        t.g.request_grant(
+            &agent("s_other"),
+            1001,
+            ask(&n, Mode::Use, None),
+            known,
+            digest
+        )
+        .is_ok()
+    );
+
+    // A deny cools the secret down for the uid, in every session.
+    let mut t = setup();
+    let id = t.request(&agent("s_1"), &["a"], Mode::Use, None).unwrap();
+    t.g.deny(&id).unwrap();
+    t.g.end_session("s_1");
+    let e = t
+        .request(&agent("s_2"), &["a"], Mode::Use, None)
+        .unwrap_err();
+    assert_eq!((e.code, e.names), (ErrorCode::RateLimited, names(&["a"])));
+    t.clock.advance(Duration::from_secs(120));
+    assert!(t.request(&agent("s_2"), &["a"], Mode::Use, None).is_ok());
+
+    // 120 requests per uid per hour, spread over sessions of 30 each.
+    let mut t = setup();
+    let mut made = 0;
+    for i in 0..200 {
+        let s = agent(&format!("s_{}", i / 30));
+        if let Ok(id) = t.request(&s, &["db"], Mode::Use, None) {
+            t.g.approve(&id).unwrap();
+            made += 1;
+        }
+    }
+    assert_eq!(made, 120);
+    t.clock.advance(Duration::from_secs(3600));
+    t.g.sweep();
+    assert!(t.request(&agent("s_99"), &["db"], Mode::Use, None).is_ok());
 }

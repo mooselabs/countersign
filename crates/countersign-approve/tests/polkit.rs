@@ -898,3 +898,45 @@ async fn require_wayland_reads_the_display_session_from_logind() {
         }
     }
 }
+
+/// With no `timeout` set the dialog stays until the request lapses; a
+/// configured `timeout` only shortens it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_dialog_lasts_until_the_request_lapses() {
+    let Some(fx) = Fixture::start(Reply::Hang).await else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let err = fx
+        .default_approver()
+        .present(
+            &use_request(Duration::from_millis(1500)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err, ApproverError::Timeout);
+    assert!(
+        started.elapsed() >= Duration::from_millis(1400),
+        "{:?}",
+        started.elapsed()
+    );
+
+    let short = PolkitApprover::new(
+        "polkit",
+        PolkitConfig {
+            require_wayland: false,
+            timeout: Some(Duration::from_millis(200)),
+            ..PolkitConfig::default()
+        },
+        Bus::Address(fx.bus.address.clone()),
+    );
+    let started = std::time::Instant::now();
+    let err = short
+        .present(&use_request(MINUTE), CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(err, ApproverError::Timeout);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    fx.with(|s| assert_eq!(s.cancels.len(), 2));
+}

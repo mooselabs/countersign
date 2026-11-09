@@ -497,6 +497,7 @@ impl Daemon {
             .grants
             .request_grant(
                 a.session,
+                a.uid,
                 ask,
                 |n| st.store.contains(n),
                 |p| digest_of(&self.canonical(a.session, a.cwd, p, None)),
@@ -644,7 +645,7 @@ impl Daemon {
         let canonical_op = operation.clone();
         let p = st
             .grants
-            .request_mutation(a.session, ms, "", |p| {
+            .request_mutation(a.session, a.uid, ms, "", |p| {
                 digest_of(&self.canonical(a.session, a.cwd, p, Some(canonical_op)))
             })
             .map_err(|e| e.to_body())?
