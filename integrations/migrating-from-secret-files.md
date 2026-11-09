@@ -65,21 +65,35 @@ You run the import. With `--metadata` it needs no prompt, so it also works as
 a Claude Code `!` command; the approval is the countersign dialog, which lists
 the names being added.
 
+First look at what it would do; this creates no request:
+
 ```console
-! /usr/bin/cn import --glob '.secret-*' --metadata countersign-import.toml --shred --wait
-importing 3 secrets from /home/patrick/projects/moose/liskov-agent-orchestrator
-  clickhouse-password        from .secret-clickhouse-password        (0644, never tracked)
-  typesafe-api-key           from .secret-typesafe-api-key           (0644, never tracked)
-  acurast-rpc-bearer-token   from .secret-acurast-rpc-bearer-token   (0644, never tracked)
-request W3J-9QA pending  mutate: add 3 secrets
-digest  A71C-HH2P
-approve a desktop dialog is open
-added 3 secrets; shredded 3 files
+! /usr/bin/cn import --glob '.secret-*' --metadata countersign-import.toml --dry-run
+NAME                      BYTES  WARNINGS        SOURCE
+acurast-rpc-bearer-token  41     world-readable  /home/patrick/projects/moose/liskov-agent-orchestrator/.secret-acurast-rpc-bearer-token
+clickhouse-password       24     world-readable  /home/patrick/projects/moose/liskov-agent-orchestrator/.secret-clickhouse-password
+typesafe-api-key          40     world-readable  /home/patrick/projects/moose/liskov-agent-orchestrator/.secret-typesafe-api-key
 ```
 
-Check that the dialog shows the same request code and digest before you
-approve. Delete `countersign-import.toml` afterwards or keep it out of git;
-it holds no values, but it is not useful once imported.
+Then import:
+
+```console
+! /usr/bin/cn import --glob '.secret-*' --metadata countersign-import.toml --shred --wait
+cn: warning: /home/patrick/projects/moose/liskov-agent-orchestrator/.secret-clickhouse-password is world-readable; rotate clickhouse-password after importing
+cn: warning: /home/patrick/projects/moose/liskov-agent-orchestrator/.secret-typesafe-api-key is world-readable; rotate typesafe-api-key after importing
+cn: warning: /home/patrick/projects/moose/liskov-agent-orchestrator/.secret-acurast-rpc-bearer-token is world-readable; rotate acurast-rpc-bearer-token after importing
+request W3J-9QA pending  mutate: import acurast-rpc-bearer-token clickhouse-password typesafe-api-key
+digest  A71C-HH2P
+approve a desktop dialog is open
+expires 2026-11-08T09:40:02Z (5m)
+imported 3 secrets; removed 3 source file(s)
+```
+
+Check that the dialog shows the same request code and digest, and
+`IMPORT 3 secrets: ...` with the names you expect, before you approve. The
+dialog closes after two minutes; if it does, run the import again. Delete
+`countersign-import.toml` afterwards or keep it out of git; it holds no
+values, but it is not useful once imported.
 
 ## 4. Change the scripts
 
@@ -176,7 +190,8 @@ Things to check in each script:
 - Optionally install the Claude Code guard hook from
   [docs/agent-integration.md](../docs/agent-integration.md#claude-code-hooks-defence-in-depth),
   which blocks any command that mentions `.secret-`.
-- `cn doctor` reports leftover `.secret-*` files and placeholder descriptions.
+- `cn doctor` reports leftover `.secret-*` files in the directory you run it
+  from.
 
 ## 7. Rotate
 
@@ -190,15 +205,16 @@ Importing does not un-disclose anything. Rotate every value that was:
 
   ```console
   $ cat ~/.claude/projects/*/*.jsonl | cn hide --stats > /dev/null
-  hits: typesafe-api-key 4
+  cn hide: 48213021 bytes in, 48212998 out, hits: typesafe-api-key=4
   ```
 
-  This only matches secrets marked high-entropy and secrets granted to the
-  current session (to check `clickhouse-password`, request a use grant for it
-  first).
+  From a terminal outside any agent session this matches only secrets
+  marked high-entropy. To check a low-entropy one such as
+  `clickhouse-password`, run it inside a session that holds a use grant for
+  it.
 
-`--from-file` on `cn add` and `cn set`, and `cn import --shred`, overwrite and
-unlink, which does not erase data on btrfs (copy-on-write, and snapshots), on
+`--from-file` on `cn add` and `cn set` (with `--wait`), and
+`cn import --shred`, overwrite and unlink, which does not erase data on btrfs (copy-on-write, and snapshots), on
 SSDs, or in backups. Check whether snapper or a backup tool captures the
 project directory. Treat the old values as disclosed and rotate, approving
 each change in the dialog:

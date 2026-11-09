@@ -1,14 +1,16 @@
 # `cn` command reference
 
 `cn` is the countersign client. It talks to `cnd` over
-`/run/countersign/cnd.sock`, runs commands with secrets injected, and (in
-Phase 2) performs the client side of FIDO2 approvals. It never holds state of
-its own: secrets, grants, sessions and the audit log all live in `cnd`.
+`/run/countersign/cnd.sock` and runs commands with secrets injected. It never
+holds state of its own: secrets, grants, sessions and the audit log all live
+in `cnd`.
 
 **Phase 1** (decision 14): polkit is the only approver. Every approval is the
-desktop dialog `cnd` raises; `cn approve` only prints the pending request so
-the human can cross-check it. `cn unlock`, `cn approver enroll` and the FIDO2
-path of `cn approve` are Phase 2.
+desktop dialog `cnd` raises; `cn approve` only shows the pending request so
+the human can cross-check it, and waits for the dialog's answer.
+`cn export`, `cn import --from`, `cn unlock`, `cn approver`, `cn sudo`,
+`cn audit checkpoints`, `cn audit pubkey` and `cn audit verify --approvals`
+are Phase 2: they exit 2 with `not_in_this_version`.
 
 This document covers every command, the global options, the exit codes, the
 `--json` output convention that agents parse, and a worked session. The
@@ -25,12 +27,14 @@ mechanisms behind the commands are in [design.md](design.md); approvers are in
 - **Request codes** are six Crockford base32 characters shown as `K7M-Q2X`.
   Input is case-insensitive, the dash is optional, and `O` reads as `0` and
   `I`/`L` as `1`. A code is a handle, not a credential.
-- **Short digest** is the first 8 Crockford base32 characters of the request digest,
-  shown as `3QF8-ZK2M`. It appears in `cn request`, `cn approve` and every
-  daemon-rendered display, so the human can compare them.
+- **Short digest** is the first 8 Crockford base32 characters of the request
+  digest, shown as `3QF8-ZK2M`. It appears in `cn request`, `cn approve` and
+  the polkit dialog, so the human can compare them.
 - **Session.** Every call is attributed by `cnd` to a session, resolved from
   the kernel's view of the caller's process ancestry (see `cn session`). The
-  session is not something the caller can name or choose.
+  session is not something the caller can name or choose. Outside any agent
+  session (a terminal the human opened), `cnd` uses a pseudo-session for the
+  calling shell: it may change the store and read, never hold grants.
 - **Who runs it.** "Agent" means the command is meant to be run from the
   agent's Bash tool. "Human" means the developer runs it, either in a separate
   terminal or as a Claude Code `!` command. A `!` command runs as the same uid,
@@ -38,19 +42,19 @@ mechanisms behind the commands are in [design.md](design.md); approvers are in
   human can type there. Nothing in this table is a security boundary; the
   approvers are.
 - **Absolute path for humans.** Documentation tells humans to type
-  `/usr/bin/cn` for `approve`, `unlock`, `add`, `set`, `edit`, `rm`, `import`,
-  `export` and `approver enroll`. This defeats a `cn` planted earlier on `PATH`. It does
-  not defeat a shell function named `/usr/bin/cn` or a tampered harness; see
+  `/usr/bin/cn` for `approve`, `add`, `set`, `edit`, `rm` and `import`. This
+  defeats a `cn` planted earlier on `PATH`. It does not defeat a shell
+  function named `/usr/bin/cn` or a tampered harness; see
   [approvers.md](approvers.md#the-trusted-display-problem).
 
 ## Summary
 
 | Command | Typically run by | Approval | Audit event(s) |
 | --- | --- | --- | --- |
-| `cn list` | agent | no (configurable) | `list` (coalesced) |
-| `cn show NAME` | agent | no (follows `list`) | `list` (coalesced) |
-| `cn request` | agent | creates one | `request.create` |
-| `cn approve CODE` | human | Phase 1: no, prints the request; the dialog is the approval. Phase 2 (FIDO2): is one | Phase 2: `request.approve` or `request.approve_fail` |
+| `cn list` | agent | no | `list` (coalesced) |
+| `cn show NAME` | agent | no | `list` (coalesced) |
+| `cn request` | agent | creates one | `request.create`, then the decision |
+| `cn approve CODE` | human | no: it shows the request; the dialog is the approval | none |
 | `cn deny CODE` | human or agent | no | `request.deny` |
 | `cn grants` | agent or human | no | none |
 | `cn revoke` | human or agent | no | `grant.revoke` |
@@ -60,16 +64,14 @@ mechanisms behind the commands are in [design.md](design.md); approvers are in
 | `cn add NAME` | human | `mutate` | `request.create`, `request.approve`, `store.add` |
 | `cn set NAME` | human | `mutate` | `request.create`, `request.approve`, `store.set` |
 | `cn edit NAME` | human | `mutate` | `request.create`, `request.approve`, `store.edit` |
-| `cn rm NAME` | human | `mutate` | `request.create`, `request.approve`, `store.rm` |
+| `cn rm NAME...` | human | `mutate` (one for all) | `request.create`, `request.approve`, `store.rm` per secret |
 | `cn import` | human | `mutate` (one for the batch) | `request.create`, `request.approve`, `store.add` per secret, `import` |
-| `cn export` | human | `export` | `request.create`, `request.approve`, `export` |
 | `cn session` | agent or human | no | none |
 | `cn session exec` | human | no | `session.start` |
 | `cn audit` | agent or human | no | none |
 | `cn audit verify` | human | no | none |
-| `cn unlock` (Phase 2) | human | FIDO2 touch | `unlock` |
-| `cn approver enroll` (Phase 2) | human | root installs the result | `config.load` when `cnd` loads it |
 | `cn doctor` | human or agent | no | none |
+| `cn export`, `cn unlock`, `cn approver`, `cn sudo` | Phase 2 | | |
 
 ## Global options
 
@@ -77,19 +79,20 @@ mechanisms behind the commands are in [design.md](design.md); approvers are in
 | --- | --- |
 | `--json` | Machine-readable output; see [JSON output](#json-output). |
 | `--socket PATH` | Debug builds only, for tests: socket path, also `COUNTERSIGN_SOCKET`. A release build always uses `/run/countersign/cnd.sock`. |
-| `--no-color` | No ANSI colour. Colour is also off when stdout is not a terminal. |
+| `--no-color` | Accepted; `cn` prints no colour. |
 | `-q`, `--quiet` | Suppress informational lines on stderr. |
 | `-h`, `--help` | Help for the command. |
-| `--version` | Print `cn` version and the protocol versions it speaks. |
+| `--version` | Print `cn` version and the protocol it speaks. |
 
 Before sending anything, `cn` checks the server end of the socket with
-`SO_PEERCRED` and refuses to talk to a peer that is not running as the
-`countersign` system user. A release build only ever connects to
+`SO_PEERCRED` and refuses (`bad_peer`) to talk to a peer that is not running
+as the `countersign` system user. A release build only ever connects to
 `/run/countersign/cnd.sock`, so a fake daemon on another path cannot feed it
-a request to display.
+a request to display. A debug build with a socket override also accepts a
+daemon running as the caller's own uid.
 
-`cn` strips every `COUNTERSIGN_*` variable from the environment of any child
-it starts.
+`cn` sets itself non-dumpable before it touches a value, and strips every
+`COUNTERSIGN_*` variable from the environment of any child it starts.
 
 ---
 
@@ -99,18 +102,19 @@ it starts.
 cn list [--all] [--long] [--json]
 ```
 
-Lists secrets visible to the current session: name, one-line description,
-usage prose, project scope and the session's grant state for each. Never
+Lists secrets visible to the current session: name, grant state and
+one-line description; with `--long`, the usage prose under each. Never
 values, never value lengths.
 
 By default only secrets whose `projects` globs match the session's reported
-cwd are shown, plus secrets with no `projects` (available everywhere). Project
-scope is organizational, not a security boundary.
+cwd (or one of its parents) are shown, plus secrets with no `projects`
+(available everywhere). `[list] default_scope = "all"` changes the default.
+Project scope is organizational, not a security boundary.
 
 | Flag | Meaning |
 | --- | --- |
-| `--all` | Include secrets scoped to other projects. They are marked `other project`; requesting one is allowed but flagged in the approval display. |
-| `--long`, `-l` | Print the full usage prose for each secret (default prints the first line). |
+| `--all` | Include secrets scoped to other projects. They are marked `(other project)`; requesting one is allowed (with `[grants] cross_project = "flag"`, the default) and marked in the dialog. |
+| `--long`, `-l` | Print the full usage prose under each secret. |
 
 ```console
 $ cn list
@@ -121,10 +125,15 @@ acurast-rpc-bearer-token  -            Bearer token for the Acurast RPC endpoint
 ```
 
 - **Run by:** agent, at the start of any task that may need a credential.
-- **Approval:** none by default. `[approval] list_requires_approval = true`
-  makes `list` and `show` need a `use`-level approval once per session.
-- **Audit:** `list`, coalesced per session (one record per 10 minutes with a
-  call count) so polling does not flood the log.
+- **Approval:** none. (`[approval] list_requires_approval` is not in this
+  version; `cnd` warns and ignores it.)
+- **JSON:** every secret's full metadata, usage included, its default
+  variable, whether it is in this project, this session's grant and its last
+  use.
+- **Audit:** `list`, coalesced per session (the first call written at once,
+  then one record per 10-minute window with a call count) so polling does not
+  flood the log.
+- **Limits:** 60 calls per minute per session (`[limits] list_calls_per_minute`).
 
 ## `cn show NAME`
 
@@ -132,10 +141,11 @@ acurast-rpc-bearer-token  -            Bearer token for the Acurast RPC endpoint
 cn show NAME [--json]
 ```
 
-Prints one secret's metadata: description, full usage prose, projects, tags,
-`high_entropy`, created / updated / rotated times, the time of its last use
-and by which session, and this session's grants for it. Never the value or
-its length.
+Prints one secret's metadata: description, projects, tags, `high_entropy`,
+default variable, created / updated / rotated times, the time of its last use
+and by which session, the full usage prose, and this session's grant for it.
+Never the value or its length. The last use is kept in `cnd`'s memory, so it
+reads `never` after a restart.
 
 ```console
 $ cn show clickhouse-password
@@ -143,6 +153,9 @@ name          clickhouse-password
 description   ClickHouse analytics, read-only user `reporter`
 projects      ~/projects/moose/*
 high_entropy  no   (not redacted by `cn hide` unless granted)
+env           CLICKHOUSE_PASSWORD
+created       2026-10-02T11:40:00Z
+updated       2026-10-02T11:40:00Z
 rotated       2026-10-02T11:40:00Z
 last use      2026-11-08T09:31:12Z  session s_7k2mq9d4x1ha  argv0 python3
 usage
@@ -164,22 +177,19 @@ cn request NAME... --reason TEXT [--ttl DUR] [--mode use|reveal] [--wait[=DUR]] 
 
 Creates a pending request for one or more secrets and prints its code and
 short digest. The request is bound to the caller's session: when approved, the
-grant applies only to processes descending from that session's anchor.
+grant applies only to processes descending from that session's anchor. It
+needs an agent session; from a plain terminal it fails with `no_session`.
 
 | Flag | Meaning |
 | --- | --- |
-| `--reason TEXT` | Required. What will be run and why. Shown to the human labelled as agent-supplied, escaped and truncated to 300 characters. Passed through the redaction engine before it is stored or displayed. |
-| `--ttl DUR` | Grant lifetime, counted from approval. Default `[grants] default_ttl` (1h) for `use`, `max_reveal_ttl` (10m) for `reveal`. Above `max_ttl` (8h) or `max_reveal_ttl` (10m) is refused with `limit_exceeded`, not silently capped. |
+| `--reason TEXT` | Required. What will be run and why; at most 2048 bytes. Any value of a secret in the session's hide set is replaced with `[countersign:NAME]` before anything else sees it. The dialog shows it labelled as the agent's, escaped and cut to 300 characters. |
+| `--ttl DUR` | Grant lifetime, counted from approval. Default `[grants] default_ttl` (1h) for `use`, and the smaller of that and `max_reveal_ttl` (10m) for `reveal`. Above `max_ttl` (8h) or `max_reveal_ttl` is refused with `limit_exceeded`, not silently capped. |
 | `--mode use` | Default. Values may be injected by `cn run`. |
-| `--mode reveal` | Values may be printed by `cn reveal`. Single use by default. Needs the `reveal` approval chain, which is usually stricter. |
-| `--wait[=DUR]` | Block until the request is approved, denied or expires, up to `DUR` (default: the request's pending lifetime, 5m). Without `--wait`, return as soon as the request is created. |
+| `--mode reveal` | Values may be printed by `cn reveal`. Single use by default. Uses the `reveal` chain and its own polkit action. |
+| `--wait[=DUR]` | Block until the request is approved, denied or expires, up to `DUR` (default: until the request lapses). Without `--wait`, return as soon as the request is created. |
 
-When the configured chain includes a daemon-driven approver (polkit), `cnd`
-raises the dialog as soon as the request is created; the human answers it on
-the desktop. In Phase 2, when it includes a client-driven approver (FIDO2),
-the human must run `/usr/bin/cn approve CODE`. The output says which. With the default chains
-([approvers.md](approvers.md#recommended-default-for-the-owner)) a `use`
-request raises the polkit dialog only:
+`cnd` raises the dialog as soon as the request is created; the human answers
+it on the desktop:
 
 ```console
 $ cn request clickhouse-password --ttl 30m --reason "row counts for the weekly cost report via scripts/clickhouse_rows.py"
@@ -189,100 +199,83 @@ approve a desktop dialog is open
 expires 2026-11-08T09:25:11Z (5m)
 ```
 
-When the chain has a client-driven member (Phase 2), the `approve` line names
-the command instead: `approve the human runs:  ! /usr/bin/cn approve K7M-Q2X`.
+One dialog stays open at most two minutes (the polkit approver's `timeout`),
+so a request nobody answers expires then, even though `expires` says five.
+There is no way to raise the dialog again; request again.
 
-A request for a secret that already has an active grant of the same or wider
-mode in this session returns the existing grant and creates nothing.
+A request for secrets that an active grant of the same mode in this session
+already covers returns that grant and creates nothing:
+
+```console
+$ cn request clickhouse-password --reason "..."
+granted already  g_4hx2 use clickhouse-password, 27m left
+```
+
+How a request ends, as `--wait` reports it:
+
+| Outcome | Exit | Meaning |
+| --- | --- | --- |
+| approved | 0 | `approved by polkit  grant g_4hx2 active until 09:51:40` |
+| denied | 5 | `request K7M-Q2X was denied by polkit`: the human pressed Cancel or failed to authenticate. |
+| denied by `cnd` | 5 | No dialog could be shown or answered: no graphical session, not Wayland under `require_wayland`, polkitd not running, a fault. The message carries the reason. Tell the human; do not retry blindly. |
+| expired | 7 | Nobody answered before the dialog closed or the request lapsed. |
+| pending | 6 | `--wait` ran out first; the request is still open. |
 
 - **Run by:** agent.
 - **Approval:** this command creates the thing to be approved.
-- **Audit:** `request.create` (secrets, mode, ttl, reason, session, anchor,
-  digest). Further: `request.approve`/`request.deny`/`request.expire` when it
-  resolves.
-- **Limits:** at most 16 names per request; at most 3 pending requests per
-  session; per-session request rate (`[limits]`). A denied request starts a
-  cooldown for the same names in that session.
+- **Audit:** `request.create` (secrets, mode, ttl, reason, cwd, session,
+  digest and the canonical request). Then `request.approve`,
+  `request.deny` or `request.expire` when it resolves.
+- **Limits:** at most 16 names per request; at most 3 pending requests and 30
+  requests an hour per session (`[limits]`). A denied request starts a 2-minute
+  cooldown for the same names in that session. Each is `rate_limited` (exit
+  10), except too many names (`limit_exceeded`, exit 9).
 
 ## `cn approve CODE`
 
 ```text
-/usr/bin/cn approve CODE [--approver NAME] [--timeout DUR] [--json]
+/usr/bin/cn approve CODE [--timeout DUR] [--json]
 ```
 
-**Phase 1.** Fetches the pending request from `cnd` and prints it: code,
-session and anchor, reported cwd, secrets, mode, TTL, the agent's reason and
-the short digest. It approves nothing. The approval is the polkit dialog, and
-the printout lets the human cross-check what the dialog shows. In Phase 1 the
-`--approver` and `--timeout` flags below do not apply.
+Fetches the request from `cnd`, recomputes its digest from the canonical
+request and refuses if it differs, prints it, and waits up to `--timeout`
+(default 60s) for the decision. It approves nothing: the approval is the
+polkit dialog, and the printout lets the human cross-check what the dialog
+shows. It does not raise a dialog that was dismissed or timed out.
 
 ```console
 ! /usr/bin/cn approve K7M-Q2X
 countersign request K7M-Q2X
   session   s_7k2mq9d4x1ha  anchor claude pid 41210 (registered by cn session exec)
   cwd       /home/patrick/projects/moose/liskov-agent-orchestrator   (reported, untrusted)
-  secrets   clickhouse-password   (this project)
+  secrets   clickhouse-password
   mode      use
-  ttl       30m  (max 8h)
+  ttl       30m
   reason    (agent-supplied) row counts for the weekly cost report via scripts/clickhouse_rows.py
   digest    3QF8-ZK2M
-approve in the desktop dialog
+  state     pending
+Approve it in the desktop dialog. Check that the dialog shows request K7M-Q2X and digest 3QF8-ZK2M.
+To refuse, cancel the dialog or run: cn deny K7M-Q2X
+approved by polkit  grant g_4hx2 active until 09:51:40
 ```
 
-**Phase 2.** Fetches the pending request from `cnd`, prints it, and runs the
-client side of the approval chain:
+`--approver NAME` exists for Phase 2: with a daemon-driven approver it is a
+usage error, and a FIDO2 approver is `not_in_this_version`.
 
-- For a **client-driven** approver (FIDO2): computes the canonical digest from
-  the request `cnd` returned, checks it equals the digest `cnd` reports, asks
-  the security key for an assertion with that digest as `clientDataHash` and
-  user presence required, and sends the assertion to `cnd`, which verifies it
-  against the enrolled public key.
-- For a **daemon-driven** approver (polkit): asks `cnd` to raise (or re-raise)
-  the dialog, then waits for the result. Useful after a dialog was dismissed by
-  accident.
-
-There is no "press y to confirm" step. A `!` command has no TTY, and the touch
-or the dialog is the confirmation. To refuse, do not touch the key (the
-approval times out) or run `cn deny CODE`.
-
-| Flag | Meaning |
-| --- | --- |
-| `--approver NAME` | Use this approver instance from the chain (e.g. `desk-key` in `all_of = ["polkit", "desk-key"]`). Default: the first client-driven approver in the chain, else trigger the daemon-driven one. |
-| `--timeout DUR` | How long to wait for the touch. Default 60s. |
-
-With a chain whose client-driven member is the `desk-key` FIDO2 approver:
-
-```console
-! /usr/bin/cn approve K7M-Q2X
-countersign request K7M-Q2X
-  session   s_7k2mq9d4x1ha  anchor claude pid 41210 (registered by cn session exec)
-  cwd       /home/patrick/projects/moose/liskov-agent-orchestrator   (reported, untrusted)
-  secrets   clickhouse-password   (this project)
-  mode      use
-  ttl       30m  (max 8h)
-  reason    (agent-supplied) row counts for the weekly cost report via scripts/clickhouse_rows.py
-  digest    3QF8-ZK2M
-Touch the security key "desk-key" to approve, or wait 60s to let it lapse.
-approved by fido2:desk-key  grant g_4hx2 active until 09:51:40
-```
-
-`cn approve` sets `PR_SET_DUMPABLE=0`, refuses to run when its `TracerPid` is
-non-zero, and is statically linked so `LD_PRELOAD` has no effect. None of this
-protects against a replaced binary or shell function; that is the trusted
+`cn approve` refuses to run when its `TracerPid` is non-zero. That does not
+protect against a replaced binary or shell function; that is the trusted
 display problem, covered in [approvers.md](approvers.md).
 
-- **Run by:** human. An agent can run it too; in Phase 1 it only prints, and
-  in Phase 2 it reaches the key prompt and stops, because it cannot touch the
-  key. The Claude Code hook examples in
-  [agent-integration.md](agent-integration.md) stop confused agents from
-  trying.
-- **Approval:** Phase 1: none, the dialog is the approval. Phase 2 (FIDO2):
-  this is the approval.
-- **Audit:** Phase 2: `request.approve` with the approver's evidence (for FIDO2:
-  credential id, flags, signature counter, the signature and authenticator
-  data, so the approval can be re-verified later). A failed verification
-  writes `request.approve_fail` and counts toward the per-session
-  approval-attempt limit.
+- **Run by:** human. An agent can run it too; it only prints and waits. The
+  Claude Code hook examples in [agent-integration.md](agent-integration.md)
+  stop confused agents from trying.
+- **Approval:** none; the dialog is the approval.
+- **Audit:** none.
+
+In Phase 2, with a `fido2` approver in the chain, `cn approve` also asks the
+security key for an assertion over the digest and sends it to `cnd`, which
+verifies it against the enrolled public key; that is then the approval, and
+is audited as `request.approve` (or `request.approve_fail`).
 
 ## `cn deny CODE`
 
@@ -290,9 +283,10 @@ display problem, covered in [approvers.md](approvers.md).
 cn deny CODE [--reason TEXT] [--json]
 ```
 
-Denies a pending request. Anyone allowed on the socket can deny any pending
-request: denial only removes privilege. The agent can use it to withdraw its
-own request.
+Denies a pending request and closes its dialog. Anyone allowed on the socket
+can deny any pending request: denial only removes privilege. The agent can use
+it to withdraw its own request. A request already decided is
+`request_not_found`, one that lapsed `request_expired` (both exit 7).
 
 ```console
 $ cn deny K7M-Q2X --reason "wrong secret, wanted the sandbox key"
@@ -301,8 +295,8 @@ denied K7M-Q2X
 
 - **Run by:** human (to refuse) or agent (to withdraw).
 - **Approval:** none.
-- **Audit:** `request.deny` with who denied (session or "outside any
-  session") and the reason.
+- **Audit:** `request.deny` with approver `client` and the reason (cut to
+  2048 bytes). It does not record who denied.
 
 ## `cn grants`
 
@@ -311,17 +305,18 @@ cn grants [--all-sessions] [--json]
 ```
 
 Lists active grants for the current session: grant id, secrets, mode, time
-left, which approver approved it, and use count.
+left, which approver approved it, and how many values were issued under it
+(and reveals left, for a reveal grant).
 
 ```console
 $ cn grants
-GRANT   SECRETS               MODE  LEFT  APPROVED BY       USES
-g_4hx2  clickhouse-password   use   27m   polkit            2
+GRANT   SECRETS               MODE  LEFT  APPROVED BY  USES
+g_4hx2  clickhouse-password   use   27m   polkit       2
 ```
 
 | Flag | Meaning |
 | --- | --- |
-| `--all-sessions` | Show active grants in every live session of the caller's uid, with each session's anchor. For the human's overview. |
+| `--all-sessions` | Show active grants in every live session of the caller's uid, with each grant's session. For the human's overview. |
 
 - **Run by:** agent (to check what it already has) or human.
 - **Approval:** none.
@@ -332,11 +327,13 @@ g_4hx2  clickhouse-password   use   27m   polkit            2
 ```text
 cn revoke GRANT_ID...
 cn revoke --secret NAME
-cn revoke --all [--all-sessions]
+cn revoke --all
 ```
 
-Ends grants before their TTL. A running `cn run` child keeps the values it was
-started with; no new values are issued under a revoked grant.
+Each form takes `--all-sessions` to act on every live session of the caller's
+uid. Ends grants before their TTL. A running `cn run` child keeps the values
+it was started with; no new values are issued under a revoked grant. Grant
+ids that match nothing in scope are `grant_required` (exit 4).
 
 ```console
 $ cn revoke --all
@@ -356,13 +353,14 @@ cn run --use NAME[=ENVVAR]... [--json] -- COMMAND [ARG...]
 Fetches values for the named secrets from `cnd`, starts `COMMAND` with each
 value in its environment, and copies the child's stdout and stderr through a
 redaction engine that replaces each value, and its base64, URL-encoded,
-JSON-escaped and hex forms, with `[countersign:NAME]`. Stdin is passed through.
-The exit status is the child's.
+JSON-escaped and hex forms, with `[countersign:NAME]`. The engine also covers
+the session's other `use`-granted secrets. Stdin is passed through. The exit
+status is the child's.
 
 | Flag | Meaning |
 | --- | --- |
 | `--use NAME` | Inject `NAME` as its default variable (`clickhouse-password` -> `CLICKHOUSE_PASSWORD`). Repeatable. |
-| `--use NAME=ENVVAR` | Inject `NAME` as `ENVVAR`. |
+| `--use NAME=ENVVAR` | Inject `NAME` as `ENVVAR`. A `COUNTERSIGN_*` variable is refused. |
 
 ```console
 $ cn run --use clickhouse-password -- python3 scripts/clickhouse_rows.py --since 7d
@@ -383,6 +381,8 @@ What it does not do:
   are issued.
 - The child sees pipes, not a terminal, on stdout and stderr. Some programs
   turn off colour or change buffering.
+- Values in `cn`'s own copy of the child environment and in the redaction
+  patterns are not zeroized.
 
 Do not pass a value as an argument (`--password "$CLICKHOUSE_PASSWORD"`
 expanded by an outer shell): argv is world-readable in `/proc/<pid>/cmdline`
@@ -394,10 +394,10 @@ and appears in the transcript. Let the child read the variable, or use
   session. Without one, `cn run` exits 125 with `grant_required` before
   starting anything.
 - **Audit:** `use.start` written by `cnd` when values are issued (secrets,
-  argv0, argument count, reported cwd, pid, session); `use.end` reported by
-  `cn` (exit code or signal, duration, per-secret hit counts in the scrubbed
-  output). `use.end` is client-reported and marked so; if `cn` dies, `cnd`
-  writes `use.end` with `status: "client_lost"`.
+  variables, argv0, argument count, reported cwd, pid, session); `use.end`
+  reported by `cn` (exit code or signal, duration, per-secret hit counts in
+  the scrubbed output). If `cn` dies, `cnd` writes `use.end` with
+  `status: "client_lost"`.
 
 Exit codes for `run` follow `env(1)`, not the general table:
 
@@ -405,7 +405,7 @@ Exit codes for `run` follow `env(1)`, not the general table:
 | --- | --- |
 | child's code | Child exited normally. |
 | 128 + N | Child killed by signal N. |
-| 125 | `cn` failed before or while starting the child (no grant, daemon unreachable, bad `--use`). The error code is on stderr, as JSON with `--json`. |
+| 125 | `cn` failed before or while starting the child (bad arguments, no grant, daemon unreachable, bad `--use`). The error code is on stderr, as JSON with `--json`. |
 | 126 | Command found but not executable. |
 | 127 | Command not found. |
 
@@ -425,12 +425,14 @@ match is pending.
 
 The default pattern set is every secret granted to the current session plus
 every secret marked `high_entropy`. A low-entropy secret that is not granted is
-never matched, so `cn hide` cannot confirm guesses of a short password.
+never matched, so `cn hide` cannot confirm guesses of a short password. From
+a terminal outside any agent session, nothing is granted, so only
+high-entropy secrets are matched.
 
 | Flag | Meaning |
 | --- | --- |
 | `--secret NAME` | Also match `NAME`. Allowed only for secrets with an active grant in this session (otherwise it would be a guessing oracle); refused with `grant_required`. |
-| `--stats` | At EOF print per-secret hit counts to stderr. |
+| `--stats` | At EOF print byte counts and per-secret hit counts to stderr: `cn hide: 14336 bytes in, 14310 out, hits: clickhouse-password=1`. |
 
 ```console
 $ tail -n 50 logs/clickhouse_rows.log | cn hide
@@ -442,10 +444,10 @@ $ tail -n 50 logs/clickhouse_rows.log | cn hide
   contain a secret: logs, `env`, config dumps, HTTP debug output, files a
   `cn run` child wrote.
 - **Approval:** none.
-- **Audit:** `hide` per stream: bytes in, bytes out, hit counts per secret.
-  Never the matched text.
-- **Limits:** 30 new streams per minute per session and a byte budget
-  (default 256 MiB/min). Excess returns `rate_limited`.
+- **Audit:** `hide` per stream, also one the client abandons: bytes in, bytes
+  out, hit counts per secret, number of patterns. Never the matched text.
+- **Limits:** 30 new streams per minute per session and 256 MiB per minute
+  (`[hide]`). Excess returns `rate_limited`.
 
 ## `cn reveal NAME`
 
@@ -455,7 +457,8 @@ cn reveal NAME [--clipboard] [--json]
 
 Prints the raw value. This puts the value wherever stdout goes: in a `!`
 command or an agent's Bash tool, that is the transcript and the model
-provider, permanently.
+provider, permanently. With `--json`, the value is in `data.value` (and
+`data.value_b64`).
 
 | Flag | Meaning |
 | --- | --- |
@@ -467,12 +470,13 @@ copied typesafe-api-key to the clipboard; clears in 30s
 ```
 
 - **Run by:** human, or an agent only when the human has asked for the raw
-  value in the conversation.
+  value in the conversation. It needs an agent session, because grants
+  belong to one.
 - **Approval:** needs an active `reveal` grant (`cn request NAME --mode
   reveal`), approved through the `reveal` chain. A reveal grant is consumed
-  after one reveal by default.
-- **Audit:** `reveal` (secret, session, grant, reveals left). Shown
-  highlighted in `cn audit`.
+  after one reveal by default (`[grants] max_reveal_uses`).
+- **Audit:** `reveal` (secret, session, grant, reveals left), and
+  `grant.expire` with `by: "uses"` when the last reveal is used.
 
 ## `cn add NAME`
 
@@ -492,15 +496,18 @@ Value sources, in order of preference:
 | --- | --- |
 | (none) | No-echo prompt. Needs a real terminal; refused with `no_tty` in a `!` command. |
 | `--from-clipboard` | Reads the Wayland clipboard (`wl-paste`) and clears it after reading. Works in a `!` command. |
-| `--from-file PATH` | Reads the file; after the store commit, overwrites and unlinks it. Overwriting does not erase data on copy-on-write filesystems (btrfs) or SSDs. |
+| `--from-file PATH` | Reads the file; one trailing newline is stripped. With `--wait`, once the change is approved, `cn` overwrites and unlinks it; without, it keeps the file and says so. Overwriting does not erase data on copy-on-write filesystems (btrfs) or SSDs. |
 | `--from-stdin` | Reads stdin to EOF. One trailing newline is stripped. |
+
+The value must be 1 byte to 64 KiB.
 
 | Flag | Meaning |
 | --- | --- |
 | `--description TEXT` | Required. One line, at most 200 characters. |
 | `--usage TEXT`, `--usage-file PATH` | How agents should use this secret in this project. At most 4 KiB. |
-| `--project GLOB` | Repeatable. Matched against the session's reported cwd. Empty means everywhere. |
-| `--high-entropy`, `--low-entropy` | Whether `cn hide` matches this secret even when it is not granted. `cn add` estimates entropy and suggests one; you must choose if the estimate is ambiguous. Values shorter than 8 bytes are never matched and `cn add` warns. |
+| `--project GLOB` | Repeatable. Matched against the session's reported cwd and its parents; `~` is your home. Empty means everywhere. |
+| `--tag TAG` | Repeatable. Free-form. |
+| `--high-entropy`, `--low-entropy` | Whether `cn hide` matches this secret even when it is not granted. Without either, `cn add` estimates the value's entropy: 80 bits or more is high, under 50 is low, and in between it refuses and asks you to choose. Values shorter than 8 bytes are never matched and `cn add` warns. |
 
 ```console
 $ /usr/bin/cn add acurast-rpc-bearer-token --from-clipboard \
@@ -510,15 +517,24 @@ $ /usr/bin/cn add acurast-rpc-bearer-token --from-clipboard \
 request P2D-8TW pending  mutate: add acurast-rpc-bearer-token
 digest  7KMA-W41C
 approve a desktop dialog is open
+expires 2026-11-08T09:40:02Z (5m)
 added acurast-rpc-bearer-token
 ```
 
-- **Run by:** human. Run it from a terminal outside any agent session where
-  possible, so the approval display does not say "initiated in agent session".
-- **Approval:** `mutate` chain. The display shows the name, description,
-  usage, projects, `high_entropy`, the value's length class, the value source,
-  and the initiating session.
-- **Audit:** `request.create`, `request.approve`, then `store.add` (metadata only).
+The dialog reads `countersign request P2D-8TW, digest 7KMA-W41C: ADD secret
+acurast-rpc-bearer-token: Bearer token for the Acurast RPC endpoint (mainnet)
+(value 16 to 63 bytes, from the clipboard, high entropy). agent bash (pid
+40102) in ~/projects/moose.` The value's size is only a class (`under 16
+bytes`, `16 to 63 bytes`, `64 to 1023 bytes`, `1 KiB or more`) and is never
+audited.
+
+- **Run by:** human, from a terminal outside any agent session where
+  possible: the dialog then names that terminal's shell, not the agent.
+- **Approval:** `mutate` chain.
+- **Audit:** `request.create` (operation `add NAME`, no reason),
+  `request.approve`, then `store.add` (metadata only).
+- **Errors:** `secret_exists` (exit 2) for a name already in the store;
+  `bad_request` (exit 2) for invalid metadata or value.
 
 ## `cn set NAME`
 
@@ -526,22 +542,28 @@ added acurast-rpc-bearer-token
 /usr/bin/cn set NAME [--from-clipboard | --from-file PATH | --from-stdin] [--wait[=DUR]] [--json]
 ```
 
-Replaces a secret's value (rotation). Value sources as for `cn add`. Existing
-grants for `NAME` are revoked when the new value is committed.
+Replaces a secret's value (rotation). Value sources as for `cn add`. Every
+grant for `NAME` is revoked when the new value is committed.
 
 ```console
 $ /usr/bin/cn set typesafe-api-key --from-clipboard --wait
-request R9C-2HF pending  mutate: set typesafe-api-key (value changes)
+request R9C-2HF pending  mutate: set typesafe-api-key
 digest  M2QX-7Z0D
 approve a desktop dialog is open
+expires 2026-11-08T09:45:10Z (5m)
 set typesafe-api-key; 1 grant revoked
 ```
 
+The dialog reads `... SET a new value for typesafe-api-key (16 to 63 bytes,
+from the clipboard); grants for it are revoked. ...`
+
 - **Run by:** human.
 - **Approval:** `mutate`. An agent swapping a DSN to point at its own host is
-  an exfiltration path, so the display says plainly when the change was
-  initiated inside an agent session. Deny any `set` you did not start.
-- **Audit:** `request.create`, `request.approve`, `store.set` (no value, no hash of value).
+  an exfiltration path. The dialog names the session the change came from:
+  deny any `set` you did not start.
+- **Audit:** `request.create`, `request.approve`, `store.set` (no value, no
+  hash or length of value), `grant.revoke` with `by: "store_change"` per
+  revoked grant.
 
 ## `cn edit NAME`
 
@@ -554,7 +576,7 @@ set typesafe-api-key; 1 grant revoked
 
 Changes metadata, not the value. With no flags and a real terminal, opens
 `$EDITOR` on a TOML rendering of the metadata; without a terminal it refuses
-with `no_tty`.
+with `no_tty`. Grants are kept.
 
 Usage prose steers every later agent session, so a change to it is a change
 to agent behaviour. An agent may draft new prose and show it to the human; the
@@ -562,26 +584,29 @@ human applies it.
 
 ```console
 $ /usr/bin/cn edit clickhouse-password --usage-file /tmp/ch-usage.txt --wait
-request T4N-6KB pending  mutate: edit clickhouse-password (usage: 3 lines changed)
+request T4N-6KB pending  mutate: edit clickhouse-password
 ...
 edited clickhouse-password
 ```
 
 - **Run by:** human.
-- **Approval:** `mutate`. The display shows a diff of every changed field.
+- **Approval:** `mutate`. The dialog names the changed fields
+  (`EDIT clickhouse-password: changes usage`).
 - **Audit:** `store.edit` with the list of changed fields and the new
   metadata (metadata is not secret).
 
-## `cn rm NAME`
+## `cn rm NAME...`
 
 ```text
 /usr/bin/cn rm NAME... [--wait[=DUR]] [--json]
 ```
 
-Removes secrets. Active grants for them are revoked on commit.
+Removes secrets, with one approval for all of them. Every grant for them is
+revoked on commit.
 
 - **Run by:** human.
-- **Approval:** `mutate`; the display lists names and descriptions.
+- **Approval:** `mutate`; the dialog lists the names (`REMOVE 2 secrets: a,
+  b`, ten names then "and N more").
 - **Audit:** `store.rm` per secret.
 
 ## `cn import`
@@ -589,18 +614,20 @@ Removes secrets. Active grants for them are revoked on commit.
 ```text
 /usr/bin/cn import --glob GLOB [--dir DIR] [--metadata FILE] [--strip-prefix PREFIX]
                    [--shred | --keep] [--dry-run] [--wait[=DUR]] [--json]
-/usr/bin/cn import --from BACKUP.age [--wait[=DUR]]
 ```
 
 Moves existing plaintext secret files into the store. Each matching file
 becomes one secret; the name is the file name with `--strip-prefix` removed
 (default `.secret-`), so `.secret-typesafe-api-key` becomes
-`typesafe-api-key`. The whole batch is one `mutate` request.
+`typesafe-api-key`. One trailing newline is stripped from each value. The
+whole batch is one `mutate` request, with no limit on its size. Restoring a
+backup with `--from BACKUP.age` is Phase 2.
 
 Metadata comes from, in order: `--metadata FILE` (TOML, below); an
 interactive prompt per file in a real terminal; or, with neither, a
-placeholder description `imported from <path>` and empty usage, which
-`cn doctor` then reports until edited.
+placeholder description `imported from <path>` and empty usage. Without an
+entropy class in the metadata, `cn` uses its estimate, and low entropy when
+the estimate is unsure.
 
 ```toml
 # countersign-import.toml  (no values in this file)
@@ -622,8 +649,8 @@ high_entropy = false
 | Flag | Meaning |
 | --- | --- |
 | `--glob GLOB` | Files to import, relative to `--dir` (default: cwd). |
-| `--metadata FILE` | Descriptions, usage, projects and entropy class per secret name. Lets a `!` command import without prompts. An agent may draft this file. |
-| `--shred` | After a successful commit, overwrite and unlink each source file. Default asks in a real terminal and keeps without one. |
+| `--metadata FILE` | Description, usage, projects, tags and entropy class per secret name. Lets a `!` command import without prompts. An agent may draft this file. |
+| `--shred` | Once the import is approved, overwrite and unlink each source file. Without `--shred` or `--keep`, `cn` asks in a real terminal and keeps the files without one. Needs `--wait` to see the approval. |
 | `--keep` | Leave the source files. |
 | `--dry-run` | Print what would be imported (names, sizes, git-tracked status), touch nothing, create no request. |
 
@@ -634,25 +661,11 @@ ever in a readable file should be rotated after import; see
 
 - **Run by:** human. `cn` reads the files as the developer's uid, so it also
   works in a `!` command with `--metadata`.
-- **Approval:** one `mutate` approval listing every name to be added.
+- **Approval:** one `mutate` approval; the dialog lists the names
+  (`IMPORT 3 secrets: ...`).
 - **Audit:** `request.create`, `request.approve`, `store.add` per secret, and
   one `import` record for the batch. Shredding happens in `cn` and is not
   audited.
-
-## `cn export`
-
-```text
-/usr/bin/cn export --recipient AGE_RECIPIENT [--wait[=DUR]] > backup.age
-```
-
-Writes the whole store, values included, encrypted to an age recipient the
-human controls ([design.md](design.md#backup-and-export)). Restore with
-`cn import --from backup.age`.
-
-- **Run by:** human.
-- **Approval:** `export` chain. The display shows the recipient and the number
-  of secrets.
-- **Audit:** `request.create`, `request.approve`, `export` (count, recipient).
 
 ## `cn session`
 
@@ -664,7 +677,8 @@ cn session exec [--label TEXT] -- COMMAND [ARG...]
 `cn session` prints what `cnd` believes the caller's session is: session id,
 anchor pid, comm, start time, how the anchor was found (registered by the
 launcher, or a matcher), the process chain from the caller to the anchor,
-untrusted labels, and the number of active grants.
+the reported cwd, untrusted labels, and the number of active grants. Outside
+an agent session it fails with `no_session` (exit 11).
 
 ```console
 $ cn session
@@ -679,7 +693,8 @@ grants    1 active
 `cn session exec` registers the calling process as a session anchor and then
 `exec`s `COMMAND`, which keeps the pid and start time, so the agent process
 is the anchor. This is the recommended way to start an agent: it works for any
-agent and does not depend on matching process names.
+agent and does not depend on matching process names. The label is shown in
+the dialog.
 
 ```console
 $ cn session exec --label orchestrator -- claude
@@ -691,125 +706,55 @@ session with no grants.
 - **Run by:** `cn session`: agent or human, to debug `no_session`.
   `cn session exec`: human, when starting the agent (or a shell alias).
 - **Approval:** none.
-- **Audit:** `session.start` for `exec`; `session.end` when the anchor
-  exits. `cn session` itself is not audited.
+- **Audit:** `session.start` when `cnd` first sees a session; `session.end`
+  when the anchor exits. `cn session` itself is not audited.
 
 ## `cn audit`
 
 ```text
 cn audit [--current | --session ID] [--secret NAME] [--event KIND]...
-         [--since TIME|DUR] [--until TIME] [--limit N] [--follow] [--json]
-cn audit verify [--from SEQ] [--approvals] [--pubkey FILE] [--checkpoints FILE]
-                [--dir DIR] [--json]
-cn audit checkpoints [--since TIME|DUR]
-cn audit pubkey
+         [--since TIME|DUR] [--until TIME|DUR] [--limit N] [--follow] [--json]
+cn audit verify [--from SEQ] [--pubkey FILE] [--checkpoints FILE] [--dir DIR] [--json]
 ```
 
-`cn audit` reads the log through `cnd` (the agent cannot open the file). Times
-accept RFC 3339 or a duration back from now (`--since 2h`). `--follow` streams
-new records. With `--json`, output is JSON Lines, one record per line, in the
-format defined in [audit.md](audit.md); this is the one command whose `--json`
-output is not a single envelope object.
+`cn audit` reads the log through `cnd` (the agent cannot open the file). It
+prints the newest `--limit` matching records (default 50, at most 1000), in
+order. Times accept RFC 3339 or a duration back from now (`--since 2h`).
+`--follow` keeps printing new records. Without `--current` or `--session`, a
+SESSION column is added. With `--json`, output is JSON Lines, one record per
+line, in the format defined in [audit.md](audit.md); this is the one command
+whose `--json` output is not a single envelope object.
 
 ```console
 $ cn audit --current --since 1h
-SEQ    TIME      EVENT       DETAIL
-18331  09:20:11  request.create   K7M-Q2X use clickhouse-password 30m "row counts for the weekly..."
-18332  09:21:40  request.approve  K7M-Q2X polkit -> g_4hx2
-18333  09:22:03  use.start        g_4hx2 clickhouse-password argv0=python3 pid=41502
-18334  09:22:09  use.end          exit=0 6.1s hits={}
-18335  09:23:30  hide             14 KiB in, hits={clickhouse-password:1}
+SEQ    TIME      EVENT            DETAIL
+18331  09:20:11  request.create   K7M-Q2X use clickhouse-password 30m "row counts for the weekly cost report..."
+18332  09:21:40  request.approve  r_9w1k... polkit -> g_4hx2
+18333  09:22:03  use.start        u_8d1e... clickhouse-password argv0=python3 pid=41502
+18334  09:22:09  use.end          u_8d1e... exited exit=0 signal=null 6100ms hits={}
+18335  09:23:30  hide             14336 B in, hits={clickhouse-password:1}
 ```
 
 `cn audit verify` fetches the raw segments and recomputes the hash chain and
 checkpoint signatures locally, so the result does not depend on trusting
-`cnd`'s answer. It reports the record count, the head hash and the last
-checkpoint, and exits 13 on any break. `--approvals` also re-verifies each
-FIDO2 approval's signature over its recorded canonical request, using the
-public keys in `/etc/countersign/approvers.d/`. `--pubkey`, `--checkpoints`
-and `--dir` (root, reading the files directly) are described in
-[audit.md](audit.md#verifying-cn-audit-verify). `cn audit checkpoints` prints
-checkpoint records for off-box export; `cn audit pubkey` prints the checkpoint
-public key.
+`cnd`'s answer. It reports the record count, the checkpoints, the head hash
+and the last checkpoint, and exits 13 on any break. `--from SEQ` starts the
+check at a record; `--pubkey`, `--checkpoints` and `--dir` (root, reading the
+files directly) are described in
+[audit.md](audit.md#verifying-cn-audit-verify).
 
 ```console
 $ cn audit verify
-chain ok: 18335 records, 19 checkpoints, head 9c1e4f..., last checkpoint 2026-11-08T09:00:00Z
+chain ok: 18335 records (1..18335), 19 checkpoints (19 signatures verified), head 9c1e4f02a..., last checkpoint 2026-11-08T09:00:00.000412Z
 ```
 
 Verification proves the log was not altered by anyone without the checkpoint
 key. It does not detect a rewrite by root or `cnd` itself unless checkpoints
-were also exported (journald or a remote sink) and are compared.
+were also exported (`cn audit --event checkpoint --json`) and are compared.
 
 - **Run by:** human or agent (read-only).
 - **Approval:** none.
 - **Audit:** none.
-
-## `cn unlock` (Phase 2)
-
-```text
-/usr/bin/cn unlock [--timeout DUR] [--json]
-/usr/bin/cn unlock --enroll [--wait[=DUR]]
-```
-
-Unseals the store when `cnd` is configured with a `fido2` key slot and started
-sealed (every other command returns `store_sealed` until then). `cn` gets the
-slot's credential id and salt from `cnd`, asks the key for its `hmac-secret`
-output (touch required), and sends the output to `cnd`, which derives the
-key-encryption key and unwraps the master key. When `[unlock] fido2_side =
-"daemon"` is set, `cnd` talks to the key itself and `cn unlock` only triggers
-it, so the `hmac-secret` output never enters the developer's uid.
-
-`--enroll` adds a `fido2` key slot for the inserted key. It requires an
-unsealed store and a `mutate` approval.
-
-- **Run by:** human, after boot when the store uses a FIDO2 slot.
-- **Approval:** the touch. `--enroll` needs `mutate`.
-- **Audit:** `unlock` (slot, result) and `store.unseal` on success; `--enroll`
-  writes `keyslot.add`.
-
-## `cn approver enroll` (Phase 2)
-
-```text
-/usr/bin/cn approver enroll --name NAME [--uv required|preferred|discouraged] [--out FILE]
-cn approver list [--json]
-```
-
-Registers a FIDO2 credential (a YubiKey) as an approver. Enrollment has two
-steps, because approver policy is root-owned and the agent must not be able to
-add a key of its own:
-
-1. `cn approver enroll` creates a non-discoverable credential on the key
-   (touch, and PIN when `--uv required`) with relying party id `countersign`,
-   and writes a record with the credential id, COSE public key, AAGUID and the
-   attestation statement to `FILE` (default `./NAME.approver.toml`).
-2. Root installs the record and reloads the daemon:
-
-```console
-$ /usr/bin/cn approver enroll --name desk-key
-Touch the security key to create the countersign credential...
-wrote desk-key.approver.toml  (YubiKey 5 Series, AAGUID cb69481e-8ff7-4039-93ec-0a2729a154a8)
-install with:
-  sudo install -o root -g root -m 0644 desk-key.approver.toml /etc/countersign/approvers.d/
-  sudo systemctl reload countersign
-
-$ sudo install -o root -g root -m 0644 desk-key.approver.toml /etc/countersign/approvers.d/
-$ sudo systemctl reload countersign
-```
-
-On load, `cnd` verifies the attestation statement against the trusted roots in
-config (default: the Yubico FIDO root). A record produced by a software
-authenticator, for example by a shadowed `cn`, fails this check and is not
-loaded. `attestation = "none"` in config turns the check off for keys without
-usable attestation, at the cost of that protection.
-
-Run enrollment from a real terminal: `sudo` needs one for its password prompt.
-
-- **Run by:** human.
-- **Approval:** writing to `/etc/countersign/approvers.d/` needs root; that is
-  the approval.
-- **Audit:** `config.load`, whose approver summary lists each record (name,
-  credential id, AAGUID, attestation result) as loaded or rejected.
 
 ## `cn doctor`
 
@@ -819,20 +764,23 @@ Run enrollment from a real terminal: `sudo` needs one for its password prompt.
 
 Checks the installation and the current environment and prints one line per
 check: `ok`, `warn` or `fail`, with a fix for each non-`ok` result. Exit 0 when
-there are no failures, 1 otherwise.
+there are no failures, 1 otherwise (`doctor_failed`).
 
 | Check | `fail` / `warn` when |
 | --- | --- |
-| Binary | `/usr/bin/cn` is not root-owned 0755, or the running binary is not `/usr/bin/cn`. |
-| PATH shadowing | `command -v cn` in a login shell resolves to anything other than `/usr/bin/cn`; any `cn` in a `PATH` directory writable by the user; any `alias cn`, `cn()` or `/usr/bin/cn()` definition in `~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.zshrc`, `~/.config/fish/` or Claude Code's shell snapshot files. |
-| Daemon | Socket missing or unreachable; peer not running as `countersign`; protocol version mismatch; caller's uid not allowed; caller not in `countersign-users`. |
-| Permissions | `/etc/countersign/` or `config.toml` writable by non-root; `approvers.d/` records not root-owned; `command` adapter executables or their parent directories writable by non-root; `/var/lib/countersign` not `countersign` 0700 (checked through `cnd`). |
-| Store | Sealed; no portable key slot; secrets with placeholder descriptions; values shorter than 8 bytes. |
-| Approvers | Chain names an approver that is not configured; polkit action not installed or set to `yes` or `*_keep`; no polkit agent registered for the graphical session; `pam_u2f` not in the `polkit-1` PAM stack when the config says it should be; `pam_u2f` `authfile` writable by the user; no FIDO2 credential loaded when the chain needs one; enrolled key not present. |
-| Session | `cn session` resolves to `no_session` from the current shell; the anchor was found by a matcher rather than `cn session exec` (info). |
-| Environment | X11 session (polkit dialog input can be synthesized); `kernel.yama.ptrace_scope` is 0; `/proc` not mounted `hidepid`. Informational. |
-| Leftovers | `.secret-*` or similarly named files in the cwd or the git repository, tracked files matching them, or matches in git history. |
-| Audit | Chain head not verified in the last 24h (runs a verify). |
+| `binary` | `/usr/bin/cn` is missing, not root-owned, or group- or world-writable; or the running binary is not `/usr/bin/cn`. |
+| `kernel` | Linux older than 6.5. |
+| `group` | The `countersign-users` group is missing, you are not in it, or this login session predates joining it. |
+| `daemon` | Socket missing or unreachable; peer not running as `countersign`; protocol mismatch; uid not allowed. |
+| `session` | No session anchor above this shell (a warning in a plain terminal); notes when the anchor was found by a matcher rather than `cn session exec`. |
+| `polkit` | No polkit authentication agent (such as gnome-shell) among your processes. |
+| `x11` | An X11 session: any client can synthesize input to the dialog. |
+| `ptrace` | `kernel.yama.ptrace_scope` is 0. |
+| `leftovers` | `.secret-*` files in the current directory. |
+
+Phase 1 does not check `PATH` shadowing, file permissions under `/etc`, the
+polkit policy and PAM stack, GNOME Shell extensions, the store, the audit
+chain, or the paths from your uid to root; it says so in its last line.
 
 A shadowed `cn doctor` can report anything. Run it as `/usr/bin/cn doctor` from
 a terminal you opened yourself, not only from inside an agent session.
@@ -852,20 +800,20 @@ All commands except `cn run` use this table. `cn run` uses the
 | Exit | `error.code` | Meaning | Usual next step |
 | --- | --- | --- | --- |
 | 0 | — | Success. For `cn request` without `--wait`: request created and pending. | |
-| 1 | `internal` | Unexpected failure; details in the daemon log. | Report it. |
+| 1 | `internal`, `doctor_failed` | Unexpected failure; details in the daemon log. Or `cn doctor` found a failure. | Report it. |
 | 2 | `usage`, `no_tty`, `bad_request`, `secret_exists`, `not_in_this_version` | Bad arguments, a secret that already exists, a prompt was needed with no terminal, or a Phase 2 command. | Fix the command; use `--from-*` value sources. |
 | 3 | `daemon_unreachable`, `unsupported_version`, `unknown_request`, `forbidden_peer`, `bad_peer` | Cannot talk to a genuine `cnd` with a common protocol. | `cn doctor`. |
 | 4 | `grant_required` | No active grant for that secret and mode in this session. | `cn request`. |
-| 5 | `denied` | The request was denied (by a human, an approver, or a dismissed dialog). | Do not retry without asking the human. |
+| 5 | `denied` | The request was denied: by the human (Cancel), or by `cnd` when no dialog could be shown or answered (the message says why). | Do not retry without asking the human. |
 | 6 | `pending` | `--wait` timed out; the request is still pending. | Ask the human to approve, then `cn grants`. |
-| 7 | `request_expired`, `request_not_found` | The code is unknown or the request lapsed. | `cn request` again. |
+| 7 | `request_expired`, `request_not_found` | The code is unknown, already decided, or the request lapsed unanswered. | `cn request` again. |
 | 8 | `unknown_secret` | No secret by that name. | `cn list --all`. |
-| 9 | `limit_exceeded` | Refused by policy: TTL above max, too many names, mode disabled. | Ask for less. |
-| 10 | `rate_limited` | A per-session rate limit was hit. | Wait. |
+| 9 | `limit_exceeded` | Refused by policy: TTL above max, too many names, reason too long, reveal disabled, another project under `cross_project = "deny"`. | Ask for less. |
+| 10 | `rate_limited` | A per-session limit: pending requests, requests per hour, deny cooldown, `list` calls, hide streams or bytes. | Wait. |
 | 11 | `no_session`, `session_dead` | The caller is not under a session anchor, or the anchor exited. | `cn session`; start the agent with `cn session exec`. |
-| 12 | `store_sealed` | The store is not unlocked. | Human runs `cn unlock`. |
+| 12 | `store_sealed` | Phase 2 (FIDO2 unlock). | |
 | 13 | `audit_broken` | `cn audit verify` found a break. | Investigate; do not ignore. |
-| 14 | `approval_invalid`, `approver_unavailable` | An assertion failed verification, or no approver in the chain could run. | `cn doctor`. |
+| 14 | `approval_invalid` | `cn` found the digest `cnd` reported does not match the request it sent. | `cn doctor`. |
 
 ## JSON output
 
@@ -885,17 +833,20 @@ output. The rules:
 
    ```json
    {"cn":1,"ok":false,"error":{"code":"grant_required","exit":4,
-     "message":"no active grant for 'clickhouse-password' in session s_7k2mq9d4x1ha",
+     "message":"no active use grant for clickhouse-password",
      "hint":"cn request clickhouse-password --reason \"...\"",
      "detail":{"names":["clickhouse-password"]}}}
    ```
 
    `cn` is the JSON schema version. Within one version, fields are only added;
    consumers must ignore unknown fields. `error.code` values are stable and
-   match the daemon's error codes where one exists.
+   match the daemon's error codes where one exists. For a decided request
+   (`denied`, `request_expired`, `pending`), `error.detail` is the request,
+   with its `decision`.
 3. **Names and units.** `snake_case` keys; times are RFC 3339 UTC strings;
    durations are integer seconds in keys ending `_seconds`; grant ids start
-   `g_`, session ids `s_`, request ids `r_`.
+   `g_`, session ids `s_` (`h_` for a terminal outside any agent session),
+   request ids `r_`, run ids `u_`.
 4. **`cn run --json`.** The child's stdout and stderr pass through unchanged
    apart from scrubbing. If `cn` itself fails (exit 125), it writes the error
    envelope as one line on stderr. On success `cn` writes nothing of its own.
@@ -905,27 +856,34 @@ output. The rules:
 6. **`cn audit --json`** is JSON Lines, one audit record per line, no envelope.
    `cn audit verify --json` uses the envelope.
 
-Examples (comments are not part of the output):
+Examples (comments are not part of the output; long values shortened):
 
 ```text
 // cn list --json
 {"cn":1,"ok":true,"data":{"session":"s_7k2mq9d4x1ha","secrets":[
   {"name":"clickhouse-password","description":"ClickHouse analytics, read-only user `reporter`",
    "usage":"Read-only queries from scripts/clickhouse_*.py. ...","projects":["~/projects/moose/*"],
-   "in_project":true,"high_entropy":false,"default_env":"CLICKHOUSE_PASSWORD",
-   "grant":null}]}}
+   "tags":[],"high_entropy":false,"in_project":true,"default_env":"CLICKHOUSE_PASSWORD",
+   "grant":null,"created":"2026-10-02T11:40:00Z","updated":"2026-10-02T11:40:00Z",
+   "rotated":"2026-10-02T11:40:00Z","last_use":null}]}}
 
-// cn request --json
-{"cn":1,"ok":true,"data":{"request_id":"r_9w1k...","code":"K7M-Q2X","state":"pending",
-  "secrets":["clickhouse-password"],"mode":"use","ttl_seconds":1800,
-  "digest_short":"3QF8-ZK2M","expires_at":"2026-11-08T09:25:11Z",
-  "approvers":[{"name":"polkit","driven":"daemon","prompted":true}],
-  "approve_command":"! /usr/bin/cn approve K7M-Q2X"}}
+// cn request --json: the canonical request, then the state
+{"cn":1,"ok":true,"data":{"domain":"countersign/approve/v1","request_id":"r_9w1k...",
+  "code":"K7M-Q2X","host":"...","boot_id":"...","session":"s_7k2mq9d4x1ha",
+  "anchor":{"pid":41210,"starttime":8812345,"comm":"claude","registered":true},
+  "cwd":"/home/patrick/projects/x","secrets":["clickhouse-password"],"mode":"use",
+  "ttl_seconds":1800,"reason":"row counts ...","created_at":"2026-11-08T09:20:11Z",
+  "expires_at":"2026-11-08T09:25:11Z","nonce":"...",
+  "state":"pending","digest":"6f2a91c0...","digest_short":"3QF8-ZK2M",
+  "approvers":[{"name":"polkit","adapter":"polkit","driven":"daemon","prompted":true}],
+  "decision":null,"approve_command":"! /usr/bin/cn approve K7M-Q2X"}}
 
-// cn request --wait --json, approved
-{"cn":1,"ok":true,"data":{"code":"K7M-Q2X","state":"approved",
+// cn request --wait --json, approved: the same, with the decision and the grant
+{"cn":1,"ok":true,"data":{..., "state":"approved",
+  "decision":{"at":"2026-11-08T09:21:40Z","by":["polkit"],"reason":null,"grant":{...},"grants_revoked":0},
   "grant":{"id":"g_4hx2","secrets":["clickhouse-password"],"mode":"use",
-           "expires_at":"2026-11-08T09:51:40Z","approved_by":["polkit"]}}}
+           "expires_at":"2026-11-08T09:51:40Z","approved_by":["polkit"],"uses":0,
+           "reveals_left":null,"session":"s_7k2mq9d4x1ha"}}}
 ```
 
 ---
@@ -963,25 +921,25 @@ usage
 **It requests a 30-minute use grant and waits.**
 
 ```console
-[agent] $ cn request clickhouse-password --ttl 30m --wait 3m \
+[agent] $ cn request clickhouse-password --ttl 30m --wait 100s \
             --reason "row counts for the weekly cost report via scripts/clickhouse_rows.py"
 request K7M-Q2X pending  use clickhouse-password for 30m
 digest  3QF8-ZK2M
 approve a desktop dialog is open
-waiting up to 3m...
+expires 2026-11-08T09:25:11Z (5m)
+waiting up to 1m40s...
 ```
 
 The agent tells the human: "I requested `clickhouse-password` for 30 minutes
 (code K7M-Q2X, digest 3QF8-ZK2M). Please approve the desktop dialog."
 
-**Path A: polkit dialog (Phase 1, and the default chain).** GNOME Shell shows its
-authentication dialog, rendered from details `cnd` supplied. With the touch
-factor:
+**The polkit dialog.** GNOME Shell shows its authentication dialog, rendered
+from details `cnd` supplied. With the touch factor:
 
 ```text
 Authentication Required
   countersign request K7M-Q2X, digest 3QF8-ZK2M: USE clickhouse-password for 30m.
-  agent claude (pid 41210) in ~/projects/moose/liskov-agent-orchestrator.
+  agent claude (pid 41210, label orchestrator) in ~/projects/moose/liskov-agent-orchestrator.
   Agent's reason: row counts for the weekly cost report via scripts/clickhouse_rows.py
   touch the device
 ```
@@ -993,28 +951,6 @@ Authentication Required
 ```console
 [agent] approved by polkit  grant g_4hx2 active until 09:51:40
 ```
-
-**Path B: FIDO2 from the Claude Code prompt (Phase 2).** Only with a non-default chain
-that lets a `fido2` approver decide alone (`use = "desk-key"`, or an `any_of`
-for a machine with no graphical session). The terminal is then the only
-display, which a planning agent can alter
-([approvers.md](approvers.md#strength-of-a-chain)):
-
-```console
-[human] ! /usr/bin/cn approve K7M-Q2X
-countersign request K7M-Q2X
-  session   s_7k2mq9d4x1ha  anchor claude pid 41210 (registered by cn session exec)
-  cwd       /home/patrick/projects/moose/liskov-agent-orchestrator   (reported, untrusted)
-  secrets   clickhouse-password   (this project)
-  mode      use
-  ttl       30m  (max 8h)
-  reason    (agent-supplied) row counts for the weekly cost report via scripts/clickhouse_rows.py
-  digest    3QF8-ZK2M
-Touch the security key "desk-key" to approve, or wait 60s to let it lapse.
-approved by fido2:desk-key  grant g_4hx2 active until 09:51:40
-```
-
-The agent's waiting `cn request` returns with the same `approved` line.
 
 **The agent runs the script with the secret injected.** The script echoes its
 connection URL in verbose mode; `cn run` scrubs it.
@@ -1040,51 +976,50 @@ script also wrote a log file, which `cn run` does not scrub:
 
 ```console
 [agent] $ cn run --use clickhouse-password -- python3 scripts/clickhouse_rows.py --since 1d
-cn: error[grant_required]: no active grant for 'clickhouse-password' in session s_7k2mq9d4x1ha
-    (grant g_4hx2 expired at 09:51:40)
+cn: error[grant_required]: no active use grant for clickhouse-password
 hint: cn request clickhouse-password --reason "..."
 [exit 125]
 ```
 
 The agent requests again with a new reason, or stops and asks the human.
 
-**The human reviews what happened** (this session took path A):
+**The human reviews what happened:**
 
 ```console
-[human] ! cn audit --current --since 1h
-SEQ    TIME      EVENT          DETAIL
-18331  09:20:11  request.create   K7M-Q2X use clickhouse-password 30m "row counts for the weekly..."
-18332  09:21:40  request.approve  K7M-Q2X polkit -> g_4hx2
-18333  09:22:03  use.start        g_4hx2 clickhouse-password argv0=python3 pid=41502
-18334  09:22:09  use.end          exit=0 6.1s hits={clickhouse-password:1}
-18335  09:23:30  hide             1 KiB in, hits={clickhouse-password:1}
-18336  09:51:40  grant.expire     g_4hx2
+[human] ! cn audit --session s_7k2mq9d4x1ha --since 1h
+SEQ    TIME      EVENT            DETAIL
+18331  09:20:11  request.create   K7M-Q2X use clickhouse-password 30m "row counts for the weekly cost report..."
+18332  09:21:40  request.approve  r_9w1k... polkit -> g_4hx2
+18333  09:22:03  use.start        u_8d1e... clickhouse-password argv0=python3 pid=41502
+18334  09:22:09  use.end          u_8d1e... exited exit=0 signal=null 6100ms hits={clickhouse-password:1}
+18335  09:23:30  hide             1024 B in, hits={clickhouse-password:1}
+18336  09:51:40  grant.expire     g_4hx2 clickhouse-password by=ttl
 ```
 
 ## Open questions
 
 1. **`--wait` and agent tool timeouts.** Claude Code's Bash tool has a default
    timeout of about two minutes. A `--wait` longer than that is killed by the
-   harness while the request stays pending. Should `cn request` default to
-   `--wait 100s` when it detects it is under an agent, or should the snippet
-   always say `--wait 2m` and then `cn grants`?
+   harness while the request stays pending. The snippet says `--wait 100s`,
+   which with the two-minute dialog timeout covers most of a request's life.
+   Should `cn request` pick that itself when it detects an agent?
 2. **Rejected `run` attempts in the audit.** [audit.md](audit.md) has no
    event for a `cn run` refused with `grant_required`. Is that worth a record
    (useful to see probing) or noise (coalesce per session)?
-3. **`cn approve` in a polkit-only chain.** In Phase 1 it only prints the
-   request. Should it also re-raise a dialog the human dismissed by accident?
-   If so, should the agent be allowed to trigger that (prompt spam), or only a
-   caller outside any agent session?
-4. **Exit code granularity.** Exit 5 covers a human's explicit deny and a
-   dismissed dialog. Agents should treat both the same; if a reason is needed
-   it is in `error.detail.by`.
+3. **Raising a dialog again.** `cn approve` does not re-raise a dialog that
+   was dismissed by accident or timed out. Should it? If so, should the agent
+   be allowed to trigger that (prompt spam), or only a caller outside any
+   agent session?
+4. **Exit code granularity.** Exit 5 covers a human's explicit deny, a
+   dismissed dialog and `cnd` finding no way to ask. Agents should treat all
+   the same and tell the human; the decision's `by` and `reason` say which.
 5. **`--clipboard` on `reveal` and `add`.** The clipboard is readable by every
    process of the uid. It keeps the value out of the transcript, which is the
    main risk, but it is not private. Keep it, or require a real terminal for
    `reveal` by humans?
 6. **Value length on `show`.** Omitted on purpose (a length narrows guesses).
-   The mutation display shows only a length class. Is a class (`<16`, `16-64`,
-   `>64` bytes) leaking anything that matters?
+   The mutation display shows only a length class. Is a class leaking
+   anything that matters?
 7. **`cn import` default for shredding** in a `!` command (no prompt): this
    document keeps files unless `--shred` is given. The other choice is to shred
    by default and require `--keep`.

@@ -30,10 +30,16 @@ asks for a grant with a reason, and runs commands that receive the value in
 their environment.
 
 In Phase 1 the only approver is polkit (decision 14), so every approval
-happens in the desktop dialog that `cnd` raises. `cn approve CODE` only prints
-the pending request, so the human can cross-check it against the dialog. The
-client-driven path (`! /usr/bin/cn approve CODE` with a FIDO2 touch) comes
-with the `fido2` approver in Phase 2.
+happens in the desktop dialog that `cnd` raises. `cn approve CODE` only shows
+the pending request, so the human can cross-check it against the dialog, and
+waits for the answer. The client-driven path (`! /usr/bin/cn approve CODE`
+with a FIDO2 touch) comes with the `fido2` approver in Phase 2.
+
+The dialog stays open at most two minutes. A request nobody answers then
+expires (exit 7), and there is no way to raise its dialog again: the agent
+requests again. When `cnd` cannot show a dialog at all (no graphical session,
+not Wayland, polkitd not running), the request ends denied by `cnd` (exit 5)
+with the reason in the message, and the agent should tell the human.
 
 ## Start the agent under a session
 
@@ -259,10 +265,12 @@ model), and later the egress proxy, where the value never enters your uid.
    `/usr/bin/cn import` and other store commands (and, in Phase 2,
    `/usr/bin/cn approve`).
 2. **`--wait` length.** The snippet uses `--wait 100s` to stay under Claude
-   Code's default Bash tool timeout (about two minutes). A human who takes
-   longer leaves the agent with exit 6 and a follow-up `cn grants` call. Is
-   that acceptable, or should `cn request` learn a "wait for approval, then
-   print the grant" mode tuned for agent harnesses?
+   Code's default Bash tool timeout (about two minutes). The dialog itself
+   closes after two minutes, so a human who takes longer than 100 seconds
+   leaves the agent with exit 6, a follow-up `cn grants` call, and at most
+   20 seconds in which the dialog is still open. Is that acceptable, or
+   should `cn request` learn a "wait for approval, then print the grant" mode
+   tuned for agent harnesses?
 3. **Hook distribution.** Ship the hook script and settings fragment with the
    package (e.g. `/usr/share/countersign/claude/`) and have `cn doctor`
    offer to install them, or leave it to documentation?

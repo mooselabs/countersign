@@ -64,23 +64,28 @@ agent claude (pid 41210) in ~/projects/x. Agent's reason: row counts for the cos
 They compare the code and digest with your message, then touch their
 security key or type their password, depending on how countersign was
 installed. Cancel denies the request (exit 5). If they do nothing, the
-request expires after a few minutes and the dialog closes (exit 7 when you
-were waiting; request again if still needed).
+dialog closes after two minutes and the request expires (exit 7 when you
+were waiting); it cannot be raised again, so request again if still needed.
 
-`cn approve CODE` only prints the request for cross-checking; approving
-happens in the dialog. Do not run it yourself.
+If `cnd` cannot show a dialog at all (no graphical session, not Wayland,
+polkit not running), the request ends at once, denied by `cnd`, with the
+reason in the message (exit 5). Tell the human the reason.
+
+`cn approve CODE` only shows the request for cross-checking and waits for
+the dialog's answer; approving happens in the dialog. Do not run it
+yourself.
 
 ## Exit codes
 
 | Exit | Meaning | Do |
 | --- | --- | --- |
 | 4 | `grant_required` | Go to step 4. |
-| 5 | `denied` | Stop. Ask the human what they want instead. Do not look for another way to get the value. |
+| 5 | `denied` | Stop. Tell the human, with the message (a denial by `cnd` says why no dialog could be shown). Do not look for another way to get the value. |
 | 6 | `pending` | Ask the human to approve (step 5). |
 | 7 | `request_expired` | Request again if still needed. |
 | 8 | `unknown_secret` | `cn list --all`; it may be scoped to another project. |
+| 10 | `rate_limited` | Too many pending or recent requests, or the same secrets were denied a moment ago. Wait, and ask the human. |
 | 11 | `no_session` | Tell the human; they should start you with `cn session exec -- claude`. |
-| 12 | `store_sealed` | Tell the human; the daemon could not open its store. |
 | 125 from `cn run` | `cn` failed before running the command | Read the error code on stderr. |
 
 ## Never
