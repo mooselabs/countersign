@@ -21,6 +21,8 @@ pub struct Query {
     pub since: Option<SystemTime>,
     /// Records at or before this time.
     pub until: Option<SystemTime>,
+    /// Only records with a larger `seq`.
+    pub after_seq: Option<u64>,
     /// The newest this many matches (default [`Query::DEFAULT_LIMIT`]).
     pub limit: Option<usize>,
 }
@@ -31,6 +33,14 @@ impl Query {
 
     /// Whether a record matches.
     pub fn matches(&self, r: &Value) -> bool {
+        if let Some(after) = self.after_seq {
+            if r.get("seq")
+                .and_then(Value::as_u64)
+                .is_none_or(|s| s <= after)
+            {
+                return false;
+            }
+        }
         let session = r.pointer("/session/id").and_then(Value::as_str);
         if self
             .session

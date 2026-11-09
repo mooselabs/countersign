@@ -16,22 +16,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+use countersign_core::config::{OnDismiss, PolkitConfig, PolkitSubject};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use zbus::DBusError as _;
 use zvariant::{Type, Value};
 
 use crate::{
-    ApprovalKind, ApprovalRequest, ApproverError, ApproverInfo, BoxFuture, DaemonApprover,
-    Evidence, Outcome,
+    ApprovalRequest, ApproverError, ApproverInfo, BoxFuture, DaemonApprover, Evidence, Outcome,
 };
-
-/// Action for `use` requests.
-pub const ACTION_APPROVE: &str = "computer.mooselabs.countersign.approve";
-/// Action for `reveal` requests.
-pub const ACTION_REVEAL: &str = "computer.mooselabs.countersign.reveal";
-/// Action for `mutate` and `export` requests.
-pub const ACTION_MUTATE: &str = "computer.mooselabs.countersign.mutate";
 
 /// The keys the actions' messages use. Every one is always set.
 pub const DETAIL_KEYS: [&str; 7] = [
@@ -50,45 +43,6 @@ const ALLOW_USER_INTERACTION: u32 = 1;
 /// How long a `CancelCheckAuthorization` call may take.
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The polkit action for a request kind.
-pub fn action_id(kind: ApprovalKind) -> &'static str {
-    match kind {
-        ApprovalKind::Use => ACTION_APPROVE,
-        ApprovalKind::Reveal => ACTION_REVEAL,
-        ApprovalKind::Mutate | ApprovalKind::Export => ACTION_MUTATE,
-    }
-}
-
-/// Which polkit subject `cnd` asks about. Config `[approvers.polkit] subject`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SubjectMode {
-    /// `unix-process` for the session anchor (pid, start time, uid). Works on
-    /// polkit 127/128. Limit: a same-uid agent can register its own
-    /// authentication agent for that process (`pkttyagent --process`) and draw
-    /// the prompt. It still needs the human's factor, so it can spoof the
-    /// display but not bypass approval.
-    #[default]
-    Process,
-    /// `unix-session` for the developer's logind graphical session. One agent
-    /// per session, held by gnome-shell, so the display cannot be hijacked.
-    /// polkitd 127 and 128 abort (SIGABRT) on this subject
-    /// (polkit-org/polkit#699); use it only on a polkit with the fix.
-    Session,
-}
-
-/// What a dismissed dialog means. Config `[approvers.polkit] on_dismiss`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OnDismiss {
-    /// A dismissed dialog denies the request.
-    #[default]
-    Deny,
-    /// A dismissed dialog gives no decision ([`ApproverError::Unavailable`]),
-    /// so another `any_of` member can still approve.
-    Ignore,
-}
-
 /// Which bus polkitd is on.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Bus {
@@ -98,30 +52,6 @@ pub enum Bus {
     /// A bus at this D-Bus address. For tests against a private bus with a
     /// fake authority; never point it at the real system bus in tests.
     Address(String),
-}
-
-/// Settings for one polkit approver instance.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PolkitConfig {
-    /// Instance name used in chains and evidence, e.g. "polkit".
-    pub name: String,
-    /// Which subject to ask about.
-    pub subject: SubjectMode,
-    /// What a dismissed dialog means.
-    pub on_dismiss: OnDismiss,
-    /// Where polkitd is.
-    pub bus: Bus,
-}
-
-impl Default for PolkitConfig {
-    fn default() -> Self {
-        Self {
-            name: "polkit".into(),
-            subject: SubjectMode::default(),
-            on_dismiss: OnDismiss::default(),
-            bus: Bus::default(),
-        }
-    }
 }
 
 /// polkit's `(sa{sv})` subject.
@@ -163,15 +93,20 @@ trait Authority {
 
 /// The polkit approver.
 pub struct PolkitApprover {
+    name: String,
     config: PolkitConfig,
+    bus: Bus,
     conn: tokio::sync::Mutex<Option<zbus::Connection>>,
 }
 
 impl PolkitApprover {
-    /// An approver with these settings. Connects on first use.
-    pub fn new(config: PolkitConfig) -> Self {
+    /// The instance `[approvers.NAME]` with these settings, talking to
+    /// polkitd on `bus`. Connects on first use.
+    pub fn new(name: impl Into<String>, config: PolkitConfig, bus: Bus) -> Self {
         Self {
+            name: name.into(),
             config,
+            bus,
             conn: tokio::sync::Mutex::new(None),
         }
     }
@@ -215,7 +150,7 @@ impl PolkitApprover {
     fn subject(&self, req: &ApprovalRequest) -> Result<Subject, ApproverError> {
         let s = req.session();
         match self.config.subject {
-            SubjectMode::Process => {
+            PolkitSubject::Process => {
                 let uid = i32::try_from(s.uid).map_err(|_| {
                     ApproverError::Internal(format!("uid {} does not fit polkit's int32", s.uid))
                 })?;
@@ -228,7 +163,7 @@ impl PolkitApprover {
                     ]),
                 })
             }
-            SubjectMode::Session => {
+            PolkitSubject::Session => {
                 let Some(id) = s.logind_session.clone() else {
                     return Err(ApproverError::Unavailable(
                         "no logind graphical session for the developer".into(),
@@ -247,7 +182,7 @@ impl PolkitApprover {
         if let Some(conn) = &*slot {
             return Ok(conn.clone());
         }
-        let conn = match &self.config.bus {
+        let conn = match &self.bus {
             Bus::System => zbus::Connection::system().await,
             Bus::Address(addr) => match zbus::connection::Builder::address(addr.as_str()) {
                 Ok(b) => b.build().await,
@@ -284,10 +219,10 @@ impl PolkitApprover {
             }
             "org.freedesktop.DBus.Error.NoReply" => {
                 let hint = match self.config.subject {
-                    SubjectMode::Session => {
+                    PolkitSubject::Session => {
                         " (polkitd 127/128 abort on unix-session subjects, polkit-org/polkit#699)"
                     }
-                    SubjectMode::Process => "",
+                    PolkitSubject::Process => "",
                 };
                 ApproverError::Internal(format!("polkitd did not reply: {message}{hint}"))
             }
@@ -305,13 +240,16 @@ impl PolkitApprover {
             Ok(d) if !d.is_zero() => d,
             _ => return Err(ApproverError::Timeout),
         };
+        // One dialog stays open at most `timeout`, even if the request
+        // lives longer.
+        let remaining = remaining.min(self.config.timeout);
         if cancel.is_cancelled() {
             return Err(ApproverError::Cancelled);
         }
         let deadline = tokio::time::Instant::now() + remaining;
         let subject = self.subject(req)?;
         let subject_json = subject_json(&subject);
-        let action = action_id(req.kind());
+        let action = self.config.action(req.kind()).to_owned();
         let details = Self::details(req);
         let details: HashMap<&str, &str> = details.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
@@ -337,7 +275,7 @@ impl PolkitApprover {
                 guard.cancel_now().await;
                 return Err(ApproverError::Timeout);
             }
-            reply = proxy.check_authorization(&subject, action, &details, ALLOW_USER_INTERACTION, &id) => {
+            reply = proxy.check_authorization(&subject, &action, &details, ALLOW_USER_INTERACTION, &id) => {
                 guard.disarm();
                 reply
             }
@@ -362,7 +300,7 @@ impl PolkitApprover {
             .get("polkit.dismissed")
             .is_some_and(|v| v == "true");
         let evidence = Evidence {
-            approver: self.config.name.clone(),
+            approver: self.name.clone(),
             adapter: "polkit",
             at: SystemTime::now(),
             detail: serde_json::json!({
@@ -397,20 +335,20 @@ impl PolkitApprover {
 impl DaemonApprover for PolkitApprover {
     fn info(&self) -> ApproverInfo {
         let (trusted_display, notes) = match self.config.subject {
-            SubjectMode::Process => (
+            PolkitSubject::Process => (
                 false,
                 "polkit dialog for the session anchor process; a same-uid agent can register \
                  its own authentication agent and draw the prompt (it still needs the human's \
                  factor)",
             ),
-            SubjectMode::Session => (
+            PolkitSubject::Session => (
                 true,
                 "polkit dialog for the logind session; polkitd 127/128 abort on this subject \
                  (polkit-org/polkit#699)",
             ),
         };
         ApproverInfo {
-            name: self.config.name.clone(),
+            name: self.name.clone(),
             adapter: "polkit",
             trusted_display,
             notes: notes.into(),
@@ -501,41 +439,23 @@ async fn cancel_call(conn: zbus::Connection, id: String) {
 
 #[cfg(test)]
 mod tests {
+    use countersign_proto::ApprovalKind;
+
     use super::*;
 
     #[test]
-    fn action_by_kind() {
+    fn actions_come_from_the_config() {
+        let c = PolkitConfig::default();
         assert_eq!(
-            action_id(ApprovalKind::Use),
+            c.action(ApprovalKind::Use),
             "computer.mooselabs.countersign.approve"
         );
         assert_eq!(
-            action_id(ApprovalKind::Reveal),
-            "computer.mooselabs.countersign.reveal"
-        );
-        assert_eq!(
-            action_id(ApprovalKind::Mutate),
+            c.action(ApprovalKind::Export),
             "computer.mooselabs.countersign.mutate"
         );
-        assert_eq!(
-            action_id(ApprovalKind::Export),
-            "computer.mooselabs.countersign.mutate"
-        );
-    }
-
-    #[test]
-    fn config_names() {
-        #[derive(Deserialize)]
-        struct C {
-            subject: SubjectMode,
-            on_dismiss: OnDismiss,
-        }
-        let c: C = serde_json::from_str(r#"{"subject":"session","on_dismiss":"ignore"}"#).unwrap();
-        assert_eq!(
-            (c.subject, c.on_dismiss),
-            (SubjectMode::Session, OnDismiss::Ignore)
-        );
-        assert_eq!(PolkitConfig::default().subject, SubjectMode::Process);
-        assert_eq!(PolkitConfig::default().bus, Bus::System);
+        let a = PolkitApprover::new("polkit", c, Bus::default());
+        assert_eq!(a.info().name, "polkit");
+        assert!(!a.info().trusted_display);
     }
 }

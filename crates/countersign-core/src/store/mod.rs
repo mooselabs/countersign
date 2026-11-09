@@ -97,13 +97,11 @@ impl StoreError {
     }
 
     /// The protocol error code to send a client.
-    ///
-    /// `Exists` and `Invalid` map to `limit_exceeded` until the protocol has
-    /// a code for a request that is well-formed but not acceptable.
     pub fn code(&self) -> ErrorCode {
         match self {
             StoreError::Unknown(_) => ErrorCode::UnknownSecret,
-            StoreError::Exists(_) | StoreError::Invalid(_) => ErrorCode::LimitExceeded,
+            StoreError::Exists(_) => ErrorCode::SecretExists,
+            StoreError::Invalid(_) => ErrorCode::BadRequest,
             _ => ErrorCode::Internal,
         }
     }
@@ -301,83 +299,57 @@ impl Store {
     /// mutation request is created, so the human is not asked to approve
     /// something that cannot commit.
     pub fn check(&self, m: &Mutation) -> Result<(), StoreError> {
-        match m {
-            Mutation::Add { meta, value } => {
-                check_meta(meta)?;
-                check_value(value)?;
-                if self.contains(&meta.name) {
-                    return Err(StoreError::Exists(meta.name.clone()));
-                }
-            }
-            Mutation::Set { name, value } => {
-                check_value(value)?;
-                self.require(name)?;
-            }
-            Mutation::Edit { meta } => {
-                check_meta(meta)?;
-                self.require(&meta.name)?;
-            }
-            Mutation::Rm { name } => {
-                self.require(name)?;
-            }
-        }
-        Ok(())
+        check_in(&self.secrets, m)
     }
 
-    fn require(&self, name: &str) -> Result<&Entry, StoreError> {
-        self.secrets
-            .get(name)
-            .ok_or_else(|| StoreError::Unknown(name.to_owned()))
+    /// Checks a batch the way [`Store::apply_all`] would apply it: in order,
+    /// each against the store as the earlier ones left it.
+    pub fn check_all(&self, ms: &[Mutation]) -> Result<(), StoreError> {
+        let mut next = self.secrets.clone();
+        for m in ms {
+            check_in(&next, m)?;
+            apply_in(&self.keys, &mut next, m, SystemTime::UNIX_EPOCH);
+        }
+        Ok(())
     }
 
     /// Applies a mutation and writes the store. On error nothing changes, on
     /// disk or in memory.
     pub fn apply(&mut self, m: &Mutation, now: SystemTime) -> Result<Change, StoreError> {
-        self.check(m)?;
+        let mut changes = self.apply_all(std::slice::from_ref(m), now)?;
+        Ok(changes.pop().expect("one change per mutation"))
+    }
+
+    /// Applies a batch (`rm` of several names, `import`) in order and writes
+    /// the store once: all of it commits or none of it. The changes share
+    /// the new generation.
+    pub fn apply_all(
+        &mut self,
+        ms: &[Mutation],
+        now: SystemTime,
+    ) -> Result<Vec<Change>, StoreError> {
         let mut next = self.secrets.clone();
-        let (fields_changed, value_changed, metadata) = match m {
-            Mutation::Add { meta, value } => {
-                let info = SecretInfo {
-                    meta: meta.clone(),
-                    created: now,
-                    updated: now,
-                    rotated: now,
-                };
-                let value = seal_value(&self.keys, &meta.name, value.as_bytes());
-                next.insert(meta.name.clone(), Entry { info, value });
-                (vec![], true, Some(meta.clone()))
-            }
-            Mutation::Set { name, value } => {
-                let e = next.get_mut(name).expect("checked");
-                e.value = seal_value(&self.keys, name, value.as_bytes());
-                e.info.updated = now;
-                e.info.rotated = now;
-                (vec!["value", "rotated"], true, None)
-            }
-            Mutation::Edit { meta } => {
-                let e = next.get_mut(&meta.name).expect("checked");
-                let changed = model::meta_diff(&e.info.meta, meta);
-                e.info.meta = meta.clone();
-                e.info.updated = now;
-                (changed, false, Some(meta.clone()))
-            }
-            Mutation::Rm { name } => {
-                next.remove(name);
-                (vec![], false, None)
-            }
-        };
+        let mut changes = Vec::with_capacity(ms.len());
         let generation = self.generation + 1;
+        for m in ms {
+            check_in(&next, m)?;
+            let (fields_changed, value_changed, metadata) = apply_in(&self.keys, &mut next, m, now);
+            changes.push(Change {
+                op: m.op(),
+                secret: m.name().to_owned(),
+                fields_changed,
+                value_changed,
+                generation,
+                metadata,
+            });
+        }
+        if changes.is_empty() {
+            return Ok(changes);
+        }
         self.write(generation, &next)?;
         self.secrets = next;
         self.generation = generation;
-        Ok(Change {
-            op: m.op(),
-            secret: m.name().to_owned(),
-            fields_changed,
-            value_changed,
-            generation,
-            metadata,
-        })
+        Ok(changes)
     }
 
     /// Adds a secret. Shorthand for [`Store::apply`].
@@ -434,6 +406,76 @@ impl Store {
 
     fn encode(&self, generation: u64) -> Result<Vec<u8>, StoreError> {
         encode(&self.keys, generation, &self.secrets)
+    }
+}
+
+fn check_in(secrets: &BTreeMap<String, Entry>, m: &Mutation) -> Result<(), StoreError> {
+    let require = |name: &str| {
+        if secrets.contains_key(name) {
+            Ok(())
+        } else {
+            Err(StoreError::Unknown(name.to_owned()))
+        }
+    };
+    match m {
+        Mutation::Add { meta, value } => {
+            check_meta(meta)?;
+            check_value(value)?;
+            if secrets.contains_key(&meta.name) {
+                return Err(StoreError::Exists(meta.name.clone()));
+            }
+        }
+        Mutation::Set { name, value } => {
+            check_value(value)?;
+            require(name)?;
+        }
+        Mutation::Edit { meta } => {
+            check_meta(meta)?;
+            require(&meta.name)?;
+        }
+        Mutation::Rm { name } => require(name)?,
+    }
+    Ok(())
+}
+
+/// Applies a checked mutation to `next`. Returns the changed fields, whether
+/// the value changed, and the new metadata for `add` and `edit`.
+fn apply_in(
+    keys: &Keys,
+    next: &mut BTreeMap<String, Entry>,
+    m: &Mutation,
+    now: SystemTime,
+) -> (Vec<&'static str>, bool, Option<SecretMeta>) {
+    match m {
+        Mutation::Add { meta, value } => {
+            let info = SecretInfo {
+                meta: meta.clone(),
+                created: now,
+                updated: now,
+                rotated: now,
+            };
+            let value = seal_value(keys, &meta.name, value.as_bytes());
+            next.insert(meta.name.clone(), Entry { info, value });
+            (vec![], true, Some(meta.clone()))
+        }
+        Mutation::Set { name, value } => {
+            let e = next.get_mut(name).expect("checked");
+            e.value = seal_value(keys, name, value.as_bytes());
+            e.info.updated = now;
+            e.info.rotated = now;
+            (vec!["value", "rotated"], true, None)
+        }
+        Mutation::Edit { meta } => {
+            let e = next.get_mut(&meta.name).expect("checked");
+            let changed = model::meta_diff(&e.info.meta, meta);
+            e.info.meta = meta.clone();
+            e.info.updated = now;
+            (changed, false, Some(meta.clone()))
+        }
+        Mutation::Rm { name } => {
+            next.remove(name);
+            (vec![], false, None)
+        }
     }
 }
 

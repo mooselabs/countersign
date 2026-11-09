@@ -1,9 +1,14 @@
 //! Approvers for countersign. See `docs/approvers.md`.
 //!
 //! An approver turns a pending request into a human decision. `cnd` builds an
-//! [`ApprovalRequest`] once per request, evaluates the configured [`Chain`] for
-//! the request's kind against a [`Registry`] of approver instances, and audits
-//! every member's result from the [`ChainReport`].
+//! [`ApprovalRequest`] once per request, [`evaluate`]s the configured chain
+//! (`countersign_core::config::Chain`) for the request's kind against a
+//! [`Registry`] of approver instances, and audits every member's result from
+//! the [`ChainReport`].
+//!
+//! Config types (chains, the polkit and insecure-auto settings) belong to
+//! `countersign_core::config`; the request kind and digest to
+//! `countersign_proto`. This crate only runs them.
 //!
 //! Phase 1 has one real adapter, [`polkit::PolkitApprover`], used for every
 //! kind. The FIDO2 (`ClientApprover`) and `command` adapters come in Phase 2.
@@ -28,9 +33,9 @@ pub mod insecure;
 pub mod polkit;
 mod request;
 
-pub use chain::{Chain, ChainError, ChainReport, Decision, MemberResult, Registry};
+pub use chain::{ChainReport, Decision, MemberResult, Registry, evaluate};
 pub use display::{DisplayInput, DisplayView};
-pub use request::{ApprovalKind, ApprovalRequest, SessionRef, digest_short};
+pub use request::{ApprovalRequest, SessionRef};
 
 /// A boxed, `Send` future, as returned by [`DaemonApprover::present`].
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

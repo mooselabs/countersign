@@ -96,7 +96,7 @@ impl From<ErrorBody> for CnError {
 /// Exit code for an error code, per docs/cli.md. Unknown codes are 1.
 pub fn exit_for(code: &str) -> i32 {
     match code {
-        "usage" | "no_tty" | "bad_request" | "not_in_this_version" => 2,
+        "usage" | "no_tty" | "bad_request" | "secret_exists" | "not_in_this_version" => 2,
         "daemon_unreachable"
         | "unsupported_version"
         | "unknown_request"
@@ -150,6 +150,7 @@ pub fn hint_for(code: &str, detail: &Value) -> Option<String> {
         "rate_limited" => "wait a minute and try again".into(),
         "store_sealed" => "the human unseals the store; see cn doctor".into(),
         "no_tty" => "use --from-stdin, --from-file PATH or --from-clipboard".into(),
+        "secret_exists" => "cn set NAME changes the value of an existing secret".into(),
         _ => return None,
     };
     Some(hint)
@@ -211,6 +212,7 @@ mod tests {
             ErrorCode::ApproverUnavailable,
             ErrorCode::UnknownRequest,
             ErrorCode::BadRequest,
+            ErrorCode::SecretExists,
         ] {
             assert_ne!(exit_for(&code.to_string()), 1, "{code}");
         }

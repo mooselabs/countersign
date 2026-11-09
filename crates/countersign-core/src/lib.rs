@@ -18,5 +18,3 @@ pub mod grants;
 pub mod sessions;
 pub mod store;
 pub mod time;
-
-pub use encoding::{NotCanonical, canonical_json};

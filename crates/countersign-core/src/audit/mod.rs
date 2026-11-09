@@ -35,7 +35,9 @@ pub use verify::{
     verify_segments, verify_segments_with,
 };
 
-use crate::encoding::{b64, canonical_json};
+use countersign_proto::jcs::{self, JcsError};
+
+use crate::encoding::b64;
 use crate::time::{Clock, format_rfc3339_micros};
 use event::Internal;
 
@@ -438,8 +440,8 @@ impl AuditLog {
         }
         let hash = record_hash(&rec).map_err(|e| AuditError::Encode(e.to_string()))?;
         rec.insert("hash".into(), Value::from(hash.clone()));
-        let mut line =
-            canonical_json(&Value::Object(rec)).map_err(|e| AuditError::Encode(e.to_string()))?;
+        let mut line = jcs::value_to_vec(&Value::Object(rec))
+            .map_err(|e| AuditError::Encode(e.to_string()))?;
         line.push(b'\n');
         let path = self.dir.join(segment_name(self.segment));
         self.file
@@ -477,12 +479,12 @@ impl AuditLog {
 }
 
 /// `SHA-256("countersign/audit/v1\0" || JCS(record without "hash"))`, hex.
-pub(crate) fn record_hash(rec: &Map<String, Value>) -> Result<String, crate::NotCanonical> {
+pub(crate) fn record_hash(rec: &Map<String, Value>) -> Result<String, JcsError> {
     let mut rec = rec.clone();
     rec.remove("hash");
     let mut h = Sha256::new();
     h.update(HASH_DOMAIN);
-    h.update(canonical_json(&Value::Object(rec))?);
+    h.update(jcs::value_to_vec(&Value::Object(rec))?);
     Ok(hex(&h.finalize()))
 }
 
@@ -494,7 +496,7 @@ pub(crate) fn checkpoint_payload(host: &str, upto_seq: u64, upto_hash: &str, ts:
         "upto_hash": upto_hash,
         "ts": ts,
     });
-    canonical_json(&v).expect("integers and strings only")
+    jcs::value_to_vec(&v).expect("small integers and strings only")
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {

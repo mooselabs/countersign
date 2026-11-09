@@ -11,11 +11,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use countersign_approve::polkit::{Bus, OnDismiss, PolkitApprover, PolkitConfig, SubjectMode};
+use countersign_approve::polkit::{Bus, PolkitApprover};
 use countersign_approve::{
-    ApprovalKind, ApprovalRequest, ApproverError, CancellationToken, DaemonApprover, DisplayInput,
-    DisplayView, Outcome, SessionRef,
+    ApprovalRequest, ApproverError, CancellationToken, DaemonApprover, DisplayInput, DisplayView,
+    Outcome, SessionRef,
 };
+use countersign_core::config::{OnDismiss, PolkitConfig, PolkitSubject as SubjectMode};
+use countersign_proto::{APPROVE_DOMAIN, Anchor, ApprovalKind, CanonicalRequest};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use zvariant::{OwnedValue, Type, Value};
@@ -254,12 +256,15 @@ impl Fixture {
     }
 
     fn approver(&self, subject: SubjectMode, on_dismiss: OnDismiss) -> PolkitApprover {
-        PolkitApprover::new(PolkitConfig {
-            name: "polkit".into(),
-            subject,
-            on_dismiss,
-            bus: Bus::Address(self.bus.address.clone()),
-        })
+        PolkitApprover::new(
+            "polkit",
+            PolkitConfig {
+                subject,
+                on_dismiss,
+                ..PolkitConfig::default()
+            },
+            Bus::Address(self.bus.address.clone()),
+        )
     }
 
     fn default_approver(&self) -> PolkitApprover {
@@ -600,10 +605,11 @@ async fn missing_polkitd_is_unavailable() {
     let Some(bus) = PrivateBus::start() else {
         return;
     };
-    let approver = PolkitApprover::new(PolkitConfig {
-        bus: Bus::Address(bus.address.clone()),
-        ..PolkitConfig::default()
-    });
+    let approver = PolkitApprover::new(
+        "polkit",
+        PolkitConfig::default(),
+        Bus::Address(bus.address.clone()),
+    );
     let err = approver
         .present(&use_request(MINUTE), CancellationToken::new())
         .await
@@ -613,10 +619,11 @@ async fn missing_polkitd_is_unavailable() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unreachable_bus_is_unavailable() {
-    let approver = PolkitApprover::new(PolkitConfig {
-        bus: Bus::Address("unix:path=/nonexistent/countersign-test-bus".into()),
-        ..PolkitConfig::default()
-    });
+    let approver = PolkitApprover::new(
+        "polkit",
+        PolkitConfig::default(),
+        Bus::Address("unix:path=/nonexistent/countersign-test-bus".into()),
+    );
     let err = approver
         .present(&use_request(MINUTE), CancellationToken::new())
         .await
@@ -737,4 +744,51 @@ async fn backend_version_is_readable() {
         fx.default_approver().backend_version().await.unwrap(),
         "128-fake"
     );
+}
+
+/// The digest the dialog shows is the one `cn approve` computes from the
+/// request `get_request` returns: both come from `countersign_proto`.
+#[test]
+fn dialog_digest_matches_what_cn_approve_computes() {
+    let canonical = CanonicalRequest {
+        domain: APPROVE_DOMAIN.into(),
+        request_id: "r_q4m8a1b2c3d4e5f6g7h8j9k0mn".into(),
+        code: "K7M-Q2X".into(),
+        host: "4f1c2a9e0b7d4e3f8a6b5c4d3e2f1a0b".into(),
+        boot_id: "5e1c9a07-1d2e-4f3a-9b8c-7d6e5f4a3b2c".into(),
+        session: "s_7k2mq9d4x1ha".into(),
+        anchor: Anchor {
+            pid: 41210,
+            starttime: 8_812_345,
+            comm: "claude".into(),
+            registered: true,
+        },
+        cwd: Some("/home/patrick/projects/x".into()),
+        secrets: vec!["github-token".into(), "clickhouse-prod".into()],
+        mode: ApprovalKind::Use,
+        ttl_seconds: Some(3600),
+        operation: None,
+        reason: "run the drift report against prod".into(),
+        created_at: "2026-11-08T09:20:11Z".parse().unwrap(),
+        expires_at: "2026-11-08T09:25:11Z".parse().unwrap(),
+        nonce: "q1w2e3r4t5y6u7i8o9p0a1s2d3f4g5h6j7k8l9z0x1c".into(),
+    };
+    let req = ApprovalRequest::new(
+        canonical.request_id.clone(),
+        canonical.canonical_bytes().unwrap(),
+        &canonical.code,
+        canonical.mode,
+        DisplayView::default(),
+        session(),
+        SystemTime::now() + MINUTE,
+    );
+    // What `cn approve` does: recompute from the fields `get_request` sent,
+    // after a round trip through JSON.
+    let json = serde_json::to_string(&canonical).unwrap();
+    let as_cn_sees_it: CanonicalRequest = serde_json::from_str(&json).unwrap();
+    let cn_digest = as_cn_sees_it.digest().unwrap();
+    let details = PolkitApprover::details(&req);
+    assert_eq!(details["digest"], cn_digest.short());
+    assert_eq!(req.digest(), &cn_digest.0);
+    assert_eq!(cn_digest.short(), "04DY-AGEE");
 }

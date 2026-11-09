@@ -487,13 +487,14 @@ pub struct VerifyArgs {
     /// Re-verify FIDO2 approvals (not in this version).
     #[arg(long)]
     pub approvals: bool,
-    /// Checkpoint public key file (not in this version).
+    /// Checkpoint public key file (default: the daemon's checkpoint.pub).
     #[arg(long, value_name = "FILE")]
     pub pubkey: Option<PathBuf>,
-    /// Exported checkpoints to compare (not in this version).
+    /// Exported checkpoints (JSONL) to compare with the chain.
     #[arg(long, value_name = "FILE")]
     pub checkpoints: Option<PathBuf>,
-    /// Read segments from a directory as root (not in this version).
+    /// Read the segment files from this directory instead of asking cnd
+    /// (root, or the countersign user).
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
 }

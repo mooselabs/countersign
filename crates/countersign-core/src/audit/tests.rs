@@ -192,7 +192,7 @@ fn an_edited_record_with_a_recomputed_hash_breaks_the_next_link() {
     rec.insert("reason".into(), "innocent".into());
     let h = record_hash(&rec).unwrap();
     rec.insert("hash".into(), h.into());
-    lines[4] = canonical_json(&Value::Object(rec)).unwrap();
+    lines[4] = countersign_proto::jcs::value_to_vec(&Value::Object(rec)).unwrap();
     let e = verify_segments(&join(&lines)).unwrap_err();
     assert_eq!((e.line, e.seq, e.kind), (6, Some(6), BreakKind::Prev));
 }
@@ -361,7 +361,7 @@ fn exported_checkpoints_catch_rewrites_and_truncation() {
         let h = record_hash(&rec).unwrap();
         rec.insert("hash".into(), h.clone().into());
         prev = h;
-        rewritten.push(canonical_json(&Value::Object(rec)).unwrap());
+        rewritten.push(countersign_proto::jcs::value_to_vec(&Value::Object(rec)).unwrap());
     }
     let rewritten = join(&rewritten);
     assert!(verify_segments(&rewritten).is_ok());

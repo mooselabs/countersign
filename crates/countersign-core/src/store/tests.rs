@@ -119,9 +119,9 @@ fn invalid_mutations_change_nothing() {
     assert_eq!(
         codes,
         [
-            LimitExceeded,
-            LimitExceeded,
-            LimitExceeded,
+            SecretExists,
+            BadRequest,
+            BadRequest,
             UnknownSecret,
             UnknownSecret,
             UnknownSecret
@@ -330,4 +330,38 @@ fn values_never_reach_disk_in_the_clear() {
             "{f}"
         );
     }
+}
+
+#[test]
+fn a_batch_commits_whole_or_not_at_all() {
+    let (_d, mk, mut s, _) = new_store();
+    s.add(meta("a"), val("aaaaaaaaaa"), t(1)).unwrap();
+    let add = |n: &str| Mutation::Add {
+        meta: meta(n),
+        value: val("bbbbbbbbbb"),
+    };
+    // The second add of "b" fails against the first: nothing is written.
+    let bad = [add("b"), add("b")];
+    assert!(matches!(s.check_all(&bad), Err(StoreError::Exists(_))));
+    assert!(matches!(
+        s.apply_all(&bad, t(2)),
+        Err(StoreError::Exists(_))
+    ));
+    assert_eq!(s.generation(), 1);
+    assert!(!s.contains("b"));
+
+    let good = [add("b"), add("c"), Mutation::Rm { name: "a".into() }];
+    s.check_all(&good).unwrap();
+    let changes = s.apply_all(&good, t(3)).unwrap();
+    assert_eq!(changes.len(), 3);
+    assert!(changes.iter().all(|c| c.generation == 2));
+    let s2 = Store::open(s.dir(), &mk).unwrap();
+    let names: Vec<_> = s2.list().map(|i| i.meta.name.as_str()).collect();
+    assert_eq!(names, ["b", "c"]);
+    assert_eq!(s2.generation(), 2);
+
+    // Rollback restores the store before the whole batch.
+    s.rollback().unwrap();
+    assert_eq!(s.generation(), 1);
+    assert!(s.contains("a") && !s.contains("b"));
 }

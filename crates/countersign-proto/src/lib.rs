@@ -185,9 +185,11 @@ pub enum ErrorCode {
     ApproverUnavailable,
     /// The request type is not known.
     UnknownRequest,
-    /// The arguments are invalid: a bad name, a value too large, a secret
-    /// that already exists, a `revoke` without exactly one selector.
+    /// The arguments are invalid: a bad name or metadata, a value too
+    /// large, a `revoke` without exactly one selector.
     BadRequest,
+    /// `add` or `import` of a name that is already in the store.
+    SecretExists,
     /// Server fault; details only in the daemon log.
     Internal,
     /// A code this version does not know (sent by a newer `cnd`). Never sent.

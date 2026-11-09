@@ -11,12 +11,13 @@ authors.workspace = true
 [features]
 # Adds the `insecure-auto` approver for end-to-end tests. Debug builds only:
 # a release build with this feature fails to compile.
-insecure-test = []
+insecure-test = ["countersign-core/insecure-test"]
 
 [dependencies]
+countersign-core.workspace = true
+countersign-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tokio-util.workspace = true

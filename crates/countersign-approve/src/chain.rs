@@ -6,155 +6,36 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
 
-use serde::Deserialize;
+use countersign_core::config::Chain;
 
 use crate::{
     ApprovalRequest, ApproverError, BoxFuture, CancellationToken, DaemonApprover, Outcome,
 };
-
-/// Deepest nesting of `all_of` / `any_of` (docs/approvers.md, "Chaining").
-pub const MAX_DEPTH: usize = 3;
 
 /// How long an `any_of` waits for its other members to finish after it
 /// cancelled them. Members still running after that are dropped, which makes
 /// the polkit adapter withdraw its prompt in the background.
 const DRAIN: Duration = Duration::from_secs(5);
 
-/// A chain from config: an approver name, or `all_of` / `any_of` over chains.
+/// Runs `chain` for `req`.
 ///
-/// Deserialises from `"polkit"`, `{ all_of = [...] }` or `{ any_of = [...] }`,
-/// refusing empty lists, tables with both or neither key, and nesting deeper
-/// than [`MAX_DEPTH`].
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "RawChain")]
-pub enum Chain {
-    /// One approver instance, by name.
-    One(String),
-    /// Every member must approve. Members run one at a time, in order; the
-    /// first denial or error ends the chain.
-    AllOf(Vec<Chain>),
-    /// Members run at the same time. The first approval or denial decides and
-    /// cancels the rest. Unavailable members are skipped.
-    AnyOf(Vec<Chain>),
-}
-
-/// A chain that config may not use.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ChainError {
-    /// More than [`MAX_DEPTH`] levels of `all_of` / `any_of`.
-    #[error("approver chain nests deeper than {MAX_DEPTH} levels")]
-    TooDeep,
-    /// An `all_of` or `any_of` with no members.
-    #[error("{0} needs at least one member")]
-    Empty(&'static str),
-    /// A table that is not exactly one of `all_of` or `any_of`.
-    #[error("a chain table needs exactly one of all_of or any_of")]
-    Shape,
-    /// A name with no configured approver.
-    #[error("no approver named {0:?}")]
-    Unknown(String),
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RawChain {
-    Name(String),
-    Table(RawTable),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawTable {
-    #[serde(default)]
-    all_of: Option<Vec<Chain>>,
-    #[serde(default)]
-    any_of: Option<Vec<Chain>>,
-}
-
-impl TryFrom<RawChain> for Chain {
-    type Error = ChainError;
-
-    fn try_from(raw: RawChain) -> Result<Self, ChainError> {
-        let chain = match raw {
-            RawChain::Name(name) => Chain::One(name),
-            RawChain::Table(RawTable {
-                all_of: Some(list),
-                any_of: None,
-            }) => Chain::AllOf(list),
-            RawChain::Table(RawTable {
-                all_of: None,
-                any_of: Some(list),
-            }) => Chain::AnyOf(list),
-            RawChain::Table(_) => return Err(ChainError::Shape),
-        };
-        chain.check_shape()?;
-        Ok(chain)
-    }
-}
-
-impl Chain {
-    /// Levels of `all_of` / `any_of`: 0 for a name.
-    pub fn depth(&self) -> usize {
-        match self {
-            Chain::One(_) => 0,
-            Chain::AllOf(list) | Chain::AnyOf(list) => {
-                1 + list.iter().map(Chain::depth).max().unwrap_or(0)
-            }
-        }
-    }
-
-    /// Every approver name in the chain, in order, with repeats.
-    pub fn names(&self) -> Vec<&str> {
-        match self {
-            Chain::One(name) => vec![name.as_str()],
-            Chain::AllOf(list) | Chain::AnyOf(list) => list.iter().flat_map(Chain::names).collect(),
-        }
-    }
-
-    fn check_shape(&self) -> Result<(), ChainError> {
-        match self {
-            Chain::One(_) => {}
-            Chain::AllOf(list) if list.is_empty() => return Err(ChainError::Empty("all_of")),
-            Chain::AnyOf(list) if list.is_empty() => return Err(ChainError::Empty("any_of")),
-            Chain::AllOf(list) | Chain::AnyOf(list) => {
-                for member in list {
-                    member.check_shape()?;
-                }
-            }
-        }
-        if self.depth() > MAX_DEPTH {
-            return Err(ChainError::TooDeep);
-        }
-        Ok(())
-    }
-
-    /// Checks the shape and that every name is in `registry`. `cnd` calls
-    /// this at config load.
-    pub fn validate(&self, registry: &Registry) -> Result<(), ChainError> {
-        self.check_shape()?;
-        match self.names().into_iter().find(|n| registry.get(n).is_none()) {
-            Some(unknown) => Err(ChainError::Unknown(unknown.to_string())),
-            None => Ok(()),
-        }
-    }
-
-    /// Runs the chain for `req`.
-    ///
-    /// Cancelling `cancel` cancels every running member; the result is then
-    /// [`ApproverError::Cancelled`]. Each member honours `req.expires_at()`
-    /// itself. The future is `Send`; spawn it or await it in place.
-    pub async fn evaluate(
-        &self,
-        registry: &Registry,
-        req: &ApprovalRequest,
-        cancel: &CancellationToken,
-    ) -> ChainReport {
-        let members = Mutex::new(Vec::new());
-        let result = eval(self, registry, req, cancel.child_token(), &members).await;
-        ChainReport {
-            result,
-            members: members.into_inner().unwrap_or_else(PoisonError::into_inner),
-        }
+/// `all_of` members run one at a time, in order; the first denial or error
+/// ends the chain. `any_of` members run at the same time; the first approval
+/// or denial decides and cancels the rest, and unavailable members are
+/// skipped. Cancelling `cancel` cancels every running member; the result is
+/// then [`ApproverError::Cancelled`]. Each member honours `req.expires_at()`
+/// itself. The future is `Send`; spawn it or await it in place.
+pub async fn evaluate(
+    chain: &Chain,
+    registry: &Registry,
+    req: &ApprovalRequest,
+    cancel: &CancellationToken,
+) -> ChainReport {
+    let members = Mutex::new(Vec::new());
+    let result = eval(chain, registry, req, cancel.child_token(), &members).await;
+    ChainReport {
+        result,
+        members: members.into_inner().unwrap_or_else(PoisonError::into_inner),
     }
 }
 
@@ -365,8 +246,10 @@ fn no_decision(errors: &[ApproverError], cancel: &CancellationToken) -> Approver
 mod tests {
     use std::time::SystemTime;
 
+    use countersign_proto::ApprovalKind;
+
     use super::*;
-    use crate::{ApprovalKind, ApproverInfo, DisplayView, Evidence, SessionRef};
+    use crate::{ApproverInfo, DisplayView, Evidence, SessionRef};
 
     #[derive(Clone, Copy)]
     enum Act {
@@ -459,8 +342,21 @@ mod tests {
         )
     }
 
+    /// A chain as config writes it, e.g. `{ all_of = ["a", "b"] }`.
     fn chain(json: serde_json::Value) -> Chain {
-        serde_json::from_value(json).unwrap()
+        match json {
+            serde_json::Value::String(s) => Chain::One(s),
+            serde_json::Value::Object(m) => {
+                let (k, v) = m.into_iter().next().unwrap();
+                let list = v.as_array().unwrap().iter().cloned().map(chain).collect();
+                match k.as_str() {
+                    "all_of" => Chain::AllOf(list),
+                    "any_of" => Chain::AnyOf(list),
+                    other => panic!("{other}"),
+                }
+            }
+            other => panic!("{other}"),
+        }
     }
 
     fn names(report: &ChainReport) -> Vec<(&str, bool)> {
@@ -477,7 +373,7 @@ mod tests {
     }
 
     async fn run(c: &Chain, reg: &Registry) -> ChainReport {
-        c.evaluate(reg, &request(), &CancellationToken::new()).await
+        evaluate(c, reg, &request(), &CancellationToken::new()).await
     }
 
     #[tokio::test(start_paused = true)]
@@ -592,7 +488,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
             fire.cancel();
         });
-        let report = c.evaluate(&reg, &req, &cancel).await;
+        let report = evaluate(&c, &reg, &req, &cancel).await;
         assert_eq!(report.result, Err(ApproverError::Cancelled));
         let ev = events.lock().unwrap();
         assert!(ev.contains(&"a cancelled".to_string()) && ev.contains(&"b cancelled".to_string()));
@@ -603,48 +499,5 @@ mod tests {
         let (reg, _) = setup(&[]);
         let report = run(&Chain::One("nope".into()), &reg).await;
         assert!(matches!(report.result, Err(ApproverError::Internal(_))));
-    }
-
-    #[test]
-    fn config_shapes() {
-        assert_eq!(
-            chain(serde_json::json!("polkit")),
-            Chain::One("polkit".into())
-        );
-        assert_eq!(
-            chain(serde_json::json!({"all_of": ["polkit", {"any_of": ["a", "b"]}]})),
-            Chain::AllOf(vec![
-                Chain::One("polkit".into()),
-                Chain::AnyOf(vec![Chain::One("a".into()), Chain::One("b".into())]),
-            ])
-        );
-        let bad = [
-            serde_json::json!({"all_of": []}),
-            serde_json::json!({"any_of": []}),
-            serde_json::json!({"all_of": ["a"], "any_of": ["b"]}),
-            serde_json::json!({}),
-            serde_json::json!({"one_of": ["a"]}),
-            serde_json::json!(3),
-            serde_json::json!({"all_of": [{"all_of": [{"all_of": [{"all_of": ["a"]}]}]}]}),
-        ];
-        for b in bad {
-            assert!(serde_json::from_value::<Chain>(b.clone()).is_err(), "{b}");
-        }
-        // Three levels are allowed.
-        chain(serde_json::json!({"all_of": [{"any_of": [{"all_of": ["a"]}]}]}));
-    }
-
-    #[test]
-    fn validate_finds_unknown_names() {
-        let (reg, _) = setup(&[("polkit", Act::Unavailable)]);
-        assert_eq!(chain(serde_json::json!("polkit")).validate(&reg), Ok(()));
-        assert_eq!(
-            chain(serde_json::json!({"all_of": ["polkit", "desk-key"]})).validate(&reg),
-            Err(ChainError::Unknown("desk-key".into()))
-        );
-        assert_eq!(
-            Chain::AllOf(vec![]).validate(&reg),
-            Err(ChainError::Empty("all_of"))
-        );
     }
 }

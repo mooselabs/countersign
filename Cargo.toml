@@ -49,3 +49,9 @@ missing_docs = "warn"
 [workspace.lints.clippy]
 dbg_macro = "deny"
 print_stdout = "warn"
+
+# Argon2id (cnd init and recover) takes seconds unoptimised; tests run it.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

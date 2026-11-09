@@ -853,7 +853,7 @@ All commands except `cn run` use this table. `cn run` uses the
 | --- | --- | --- | --- |
 | 0 | — | Success. For `cn request` without `--wait`: request created and pending. | |
 | 1 | `internal` | Unexpected failure; details in the daemon log. | Report it. |
-| 2 | `usage`, `no_tty` | Bad arguments, or a prompt was needed with no terminal. | Fix the command; use `--from-*` value sources. |
+| 2 | `usage`, `no_tty`, `bad_request`, `secret_exists`, `not_in_this_version` | Bad arguments, a secret that already exists, a prompt was needed with no terminal, or a Phase 2 command. | Fix the command; use `--from-*` value sources. |
 | 3 | `daemon_unreachable`, `unsupported_version`, `unknown_request`, `forbidden_peer`, `bad_peer` | Cannot talk to a genuine `cnd` with a common protocol. | `cn doctor`. |
 | 4 | `grant_required` | No active grant for that secret and mode in this session. | `cn request`. |
 | 5 | `denied` | The request was denied (by a human, an approver, or a dismissed dialog). | Do not retry without asking the human. |

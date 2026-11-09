@@ -12,7 +12,9 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde_json::Value;
 
 use super::{GENESIS_PREV, checkpoint_payload, record_hash};
-use crate::encoding::{canonical_json, unb64};
+use countersign_proto::jcs;
+
+use crate::encoding::unb64;
 
 /// What to check besides the chain.
 #[derive(Debug, Clone, Default)]
@@ -184,7 +186,7 @@ pub fn verify_segments_with(
                 .ok_or_else(|| malformed(Some(seq), &format!("no {k}")))
         };
         let (prev, hash) = (str_field("prev")?, str_field("hash")?);
-        let canon = canonical_json(&v).map_err(|e| malformed(Some(seq), &e.to_string()))?;
+        let canon = jcs::value_to_vec(&v).map_err(|e| malformed(Some(seq), &e.to_string()))?;
         if canon != line {
             return Err(fail(Some(seq), BreakKind::NotCanonical));
         }

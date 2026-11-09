@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use base64::Engine as _;
+use countersign_core::audit::{VerifyOptions, parse_pubkey, verify_segments_with};
 use countersign_proto::{Request, Response, Timestamp};
 use serde_json::{Value, json};
 
@@ -210,73 +211,22 @@ fn detail(r: &Value) -> String {
     }
 }
 
-/// What the chain verifier reports. Mirrors the report of
-/// `countersign_core::audit::verify_segments` (see [`verify_segments`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifyReport {
-    /// Records checked.
-    pub records: u64,
-    /// First `seq` checked.
-    pub first_seq: u64,
-    /// Last `seq` checked.
-    pub last_seq: u64,
-    /// `hash` of the last record.
-    pub head: String,
-    /// Checkpoint records seen.
-    pub checkpoints: u64,
-}
-
-/// Why verification did not complete.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VerifyFailure {
-    /// The chain is broken at `seq`.
-    #[expect(
-        dead_code,
-        reason = "built by the countersign-core verifier once verify_segments is wired"
-    )]
-    Broken {
-        /// First bad record.
-        seq: u64,
-        /// What is wrong (chain, hash, seq gap).
-        reason: String,
-    },
-    /// No verifier is linked into this build.
-    NotWired,
-}
-
-/// The hash-chain verifier.
-///
-/// NOT WIRED YET. The verifier belongs in countersign-core, which is being
-/// written in parallel; the integration step replaces this body with a call
-/// to `countersign_core::audit::verify_segments(data)` (expected signature:
-/// `fn verify_segments(data: &[u8]) -> Result<VerifyReport, VerifyError>`,
-/// where `data` is the concatenated JSONL bytes from `audit_segments`) and
-/// maps its report and error into the two types above.
-pub fn verify_segments(data: &[u8]) -> Result<VerifyReport, VerifyFailure> {
-    let _ = data;
-    Err(VerifyFailure::NotWired)
-}
-
-/// `cn audit verify`.
-pub fn verify(ctx: &Ctx, args: &VerifyArgs) -> Result<Done, CnError> {
-    if args.approvals {
-        return Err(CnError::later("cn audit verify --approvals"));
-    }
-    if args.pubkey.is_some() || args.checkpoints.is_some() {
-        return Err(CnError::later(
-            "checkpoint signature checks (--pubkey, --checkpoints)",
-        ));
-    }
-    if args.dir.is_some() {
-        return Err(CnError::later("cn audit verify --dir"));
+/// The raw log: from `cnd` (`audit_segments`, with its `checkpoint.pub`),
+/// or with `--dir` from the segment files (root).
+fn fetch_segments(ctx: &Ctx, args: &VerifyArgs) -> Result<(Vec<u8>, Option<String>), CnError> {
+    if let Some(dir) = &args.dir {
+        return read_dir_segments(dir, args.from.unwrap_or(1));
     }
     let mut client = Client::connect(ctx)?;
     let mut data = Vec::new();
+    let mut pubkey = None;
     let mut from_seq = args.from.unwrap_or(1);
     loop {
         match client.call(Request::AuditSegments { from_seq })? {
             Response::AuditSegments {
-                data_b64, next_seq, ..
+                data_b64,
+                next_seq,
+                checkpoint_pubkey,
             } => {
                 let chunk = base64::engine::general_purpose::STANDARD
                     .decode(data_b64)
@@ -284,6 +234,7 @@ pub fn verify(ctx: &Ctx, args: &VerifyArgs) -> Result<Done, CnError> {
                         CnError::internal(format!("protocol error: bad segment encoding: {e}"))
                     })?;
                 data.extend_from_slice(&chunk);
+                pubkey = pubkey.or(checkpoint_pubkey);
                 match next_seq {
                     Some(next) if next > from_seq => from_seq = next,
                     Some(_) => {
@@ -297,30 +248,107 @@ pub fn verify(ctx: &Ctx, args: &VerifyArgs) -> Result<Done, CnError> {
             other => return Err(unexpected("audit_segments", &other)),
         }
     }
-    match verify_segments(&data) {
-        Ok(r) => Ok(Done::ok(
-            json!({"result": "ok", "records": r.records, "first_seq": r.first_seq,
-                   "last_seq": r.last_seq, "head": r.head, "checkpoints": r.checkpoints}),
-            format!(
-                "chain ok: {} records ({}..{}), {} checkpoints, head {}\n",
-                r.records,
-                r.first_seq,
-                r.last_seq,
-                r.checkpoints,
-                truncate(&r.head, 12)
-            ),
-        )),
-        Err(VerifyFailure::Broken { seq, reason }) => Err(CnError::new(
-            "audit_broken",
-            format!("the audit chain is broken at seq {seq}: {reason}"),
-        )
-        .with_hint("investigate; do not ignore")
-        .with_detail(json!({"seq": seq, "reason": reason}))),
-        Err(VerifyFailure::NotWired) => Err(CnError::internal(format!(
-            "fetched {} bytes of audit log, but this build has no chain verifier yet \
-             (countersign_core::audit::verify_segments is not wired)",
-            data.len()
-        ))),
+    Ok((data, pubkey))
+}
+
+/// `NNNNNN.jsonl` files in `dir`, in order, from the record `from` on, and
+/// `checkpoint.pub`.
+fn read_dir_segments(
+    dir: &std::path::Path,
+    from: u64,
+) -> Result<(Vec<u8>, Option<String>), CnError> {
+    let read_err = |e: std::io::Error| CnError::internal(format!("{}: {e}", dir.display()));
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map_err(read_err)?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| {
+            n.strip_suffix(".jsonl")
+                .is_some_and(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .collect();
+    names.sort();
+    let mut data = Vec::new();
+    for name in names {
+        let bytes = std::fs::read(dir.join(&name)).map_err(read_err)?;
+        for line in bytes.split_inclusive(|&b| b == b'\n') {
+            let seq = serde_json::from_slice::<Value>(line)
+                .ok()
+                .and_then(|v| v["seq"].as_u64());
+            if seq.is_none_or(|s| s >= from) {
+                data.extend_from_slice(line);
+            }
+        }
+    }
+    let pubkey = std::fs::read_to_string(dir.join("checkpoint.pub")).ok();
+    Ok((data, pubkey))
+}
+
+/// `cn audit verify`.
+pub fn verify(ctx: &Ctx, args: &VerifyArgs) -> Result<Done, CnError> {
+    if args.approvals {
+        return Err(CnError::later("cn audit verify --approvals"));
+    }
+    let (data, served_key) = fetch_segments(ctx, args)?;
+    let key_text = match &args.pubkey {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .map_err(|e| CnError::usage(format!("--pubkey {}: {e}", path.display())))?,
+        ),
+        None => served_key,
+    };
+    let pubkey = match key_text.as_deref() {
+        Some(text) => Some(
+            parse_pubkey(text)
+                .ok_or_else(|| CnError::usage("the checkpoint public key is not an ed25519 key"))?,
+        ),
+        None => None,
+    };
+    let exported = match &args.checkpoints {
+        Some(path) => Some(
+            std::fs::read(path)
+                .map_err(|e| CnError::usage(format!("--checkpoints {}: {e}", path.display())))?,
+        ),
+        None => None,
+    };
+    let opts = VerifyOptions {
+        pubkey,
+        exported_checkpoints: exported.as_deref(),
+    };
+    match verify_segments_with(&data, &opts) {
+        Ok(r) => {
+            let last = r
+                .last_checkpoint
+                .as_ref()
+                .map(|c| format!(", last checkpoint {}", clean_line(&c.ts)))
+                .unwrap_or_default();
+            let exported = if args.checkpoints.is_some() {
+                format!(", {} exported checkpoints match", r.exported_matched)
+            } else {
+                String::new()
+            };
+            Ok(Done::ok(
+                json!({"result": "ok", "records": r.records, "first_seq": r.first_seq,
+                       "last_seq": r.last_seq, "head": r.head_hash,
+                       "from_genesis": r.from_genesis, "checkpoints": r.checkpoints,
+                       "signatures_verified": r.signatures_verified,
+                       "exported_matched": r.exported_matched,
+                       "exported_not_covered": r.exported_not_covered}),
+                format!(
+                    "chain ok: {} records ({}..{}), {} checkpoints ({} signatures verified), head {}{last}{exported}\n",
+                    r.records,
+                    r.first_seq,
+                    r.last_seq,
+                    r.checkpoints,
+                    r.signatures_verified,
+                    truncate(&r.head_hash, 12)
+                ),
+            ))
+        }
+        Err(e) => Err(
+            CnError::new("audit_broken", format!("the audit chain is broken: {e}"))
+                .with_hint("investigate; do not ignore")
+                .with_detail(json!({"seq": e.seq, "line": e.line, "reason": e.to_string()})),
+        ),
     }
 }
 
@@ -353,7 +381,17 @@ mod tests {
     }
 
     #[test]
-    fn the_verifier_says_it_is_not_wired() {
-        assert_eq!(verify_segments(b""), Err(VerifyFailure::NotWired));
+    fn segments_are_read_from_a_directory_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("000002.jsonl"), "{\"seq\":3}\n").unwrap();
+        std::fs::write(
+            dir.path().join("000001.jsonl"),
+            "{\"seq\":1}\n{\"seq\":2}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        let (data, key) = read_dir_segments(dir.path(), 2).unwrap();
+        assert_eq!(data, b"{\"seq\":2}\n{\"seq\":3}\n");
+        assert_eq!(key, None);
     }
 }

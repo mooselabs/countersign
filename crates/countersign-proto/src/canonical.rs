@@ -19,7 +19,7 @@ pub const APPROVE_DOMAIN: &str = "countersign/approve/v1";
 
 /// What an approval allows. `use` and `reveal` create grants; `mutate`
 /// changes the store; `export` writes the store out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalKind {
     /// A `use` grant.
@@ -30,6 +30,21 @@ pub enum ApprovalKind {
     Mutate,
     /// An export of the whole store.
     Export,
+}
+
+impl ApprovalKind {
+    /// Every kind.
+    pub const ALL: [ApprovalKind; 4] = [Self::Use, Self::Reveal, Self::Mutate, Self::Export];
+
+    /// The wire, config and audit name: `use`, `reveal`, `mutate`, `export`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Use => "use",
+            Self::Reveal => "reveal",
+            Self::Mutate => "mutate",
+            Self::Export => "export",
+        }
+    }
 }
 
 impl From<Mode> for ApprovalKind {
@@ -43,12 +58,7 @@ impl From<Mode> for ApprovalKind {
 
 impl fmt::Display for ApprovalKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Use => "use",
-            Self::Reveal => "reveal",
-            Self::Mutate => "mutate",
-            Self::Export => "export",
-        })
+        f.write_str(self.as_str())
     }
 }
 

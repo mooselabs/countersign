@@ -276,17 +276,17 @@ fn human_sessions_cannot_hold_grants_but_can_mutate() {
         value: SecretValue::new(b"new-value-1".to_vec()),
     };
     let id =
-        t.g.request_mutation(&h, m.clone(), "rotate", digest)
+        t.g.request_mutation(&h, vec![m.clone()], "rotate", digest)
             .unwrap()
             .id
             .clone();
     assert_eq!(
         t.g.get_by_id(&id).unwrap().kind.approval_kind(),
-        crate::config::Kind::Mutate
+        countersign_proto::ApprovalKind::Mutate
     );
     let a = t.g.approve(&id).unwrap();
     assert!(a.grant.is_none());
-    assert_eq!(a.request.kind, RequestKind::Mutation(m));
+    assert_eq!(a.request.kind, RequestKind::Mutation(vec![m]));
 }
 
 #[test]

@@ -268,9 +268,10 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 name = "countersign-approve"
 version = "0.0.1"
 dependencies = [
+ "countersign-core",
+ "countersign-proto",
  "serde",
  "serde_json",
- "sha2",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -284,6 +285,7 @@ version = "0.0.1"
 dependencies = [
  "base64",
  "clap",
+ "countersign-core",
  "countersign-hide",
  "countersign-proto",
  "glob",

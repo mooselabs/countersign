@@ -11,6 +11,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use countersign_proto::ApprovalKind;
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
 use sha2::{Digest, Sha256};
@@ -154,7 +155,7 @@ impl Config {
                 )));
             }
         }
-        for kind in Kind::ALL {
+        for kind in ApprovalKind::ALL {
             for name in self.approval.chain(kind).names() {
                 if !self.approvers.contains_key(name) {
                     return Err(invalid(format!(
@@ -210,7 +211,7 @@ impl Config {
     }
 
     /// The approver chain for a kind.
-    pub fn chain(&self, kind: Kind) -> &Chain {
+    pub fn chain(&self, kind: ApprovalKind) -> &Chain {
         self.approval.chain(kind)
     }
 }
@@ -546,40 +547,6 @@ impl Default for Grants {
 
 // ---------------------------------------------------------------------------
 
-/// An approval kind; each has its own chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Kind {
-    /// `cn request` in `use` mode.
-    Use,
-    /// `cn request --mode reveal`.
-    Reveal,
-    /// Store mutations.
-    Mutate,
-    /// `cn export`.
-    Export,
-}
-
-impl Kind {
-    /// Every kind.
-    pub const ALL: [Kind; 4] = [Kind::Use, Kind::Reveal, Kind::Mutate, Kind::Export];
-
-    /// The config key and audit name.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Kind::Use => "use",
-            Kind::Reveal => "reveal",
-            Kind::Mutate => "mutate",
-            Kind::Export => "export",
-        }
-    }
-}
-
-impl fmt::Display for Kind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 /// An approver chain: one instance, or all / any of nested chains.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Chain {
@@ -656,12 +623,12 @@ pub struct Approval {
 
 impl Approval {
     /// The chain for a kind.
-    pub fn chain(&self, kind: Kind) -> &Chain {
+    pub fn chain(&self, kind: ApprovalKind) -> &Chain {
         match kind {
-            Kind::Use => &self.use_,
-            Kind::Reveal => &self.reveal,
-            Kind::Mutate => &self.mutate,
-            Kind::Export => &self.export,
+            ApprovalKind::Use => &self.use_,
+            ApprovalKind::Reveal => &self.reveal,
+            ApprovalKind::Mutate => &self.mutate,
+            ApprovalKind::Export => &self.export,
         }
     }
 }
@@ -822,11 +789,11 @@ impl Default for PolkitConfig {
 
 impl PolkitConfig {
     /// The action id for a kind.
-    pub fn action(&self, kind: Kind) -> &str {
+    pub fn action(&self, kind: ApprovalKind) -> &str {
         match kind {
-            Kind::Use => &self.action_use,
-            Kind::Reveal => &self.action_reveal,
-            Kind::Mutate | Kind::Export => &self.action_mutate,
+            ApprovalKind::Use => &self.action_use,
+            ApprovalKind::Reveal => &self.action_reveal,
+            ApprovalKind::Mutate | ApprovalKind::Export => &self.action_mutate,
         }
     }
 }
@@ -841,6 +808,8 @@ pub enum AutoDecision {
     Approve,
     /// Deny.
     Deny,
+    /// Give no decision (`approver_unavailable`), to test `any_of`.
+    Unavailable,
 }
 
 /// `[approvers.NAME] type = "insecure-auto"`. Test builds only.
@@ -1139,7 +1108,7 @@ mod tests {
     #[test]
     fn empty_file_is_the_phase1_default() {
         let c = Config::default();
-        for kind in Kind::ALL {
+        for kind in ApprovalKind::ALL {
             assert_eq!(c.chain(kind), &Chain::One("polkit".into()));
         }
         assert_eq!(
@@ -1148,7 +1117,7 @@ mod tests {
         );
         let p = polkit(&c.approvers["polkit"]);
         assert_eq!(p.subject, PolkitSubject::Process);
-        assert_eq!(p.action(Kind::Export), ACTION_MUTATE);
+        assert_eq!(p.action(ApprovalKind::Export), ACTION_MUTATE);
         assert_eq!(c.unlock.slots, [SlotKind::SystemdCreds, SlotKind::Recovery]);
         assert_eq!(c.grants.max_ttl, Duration::from_secs(8 * 3600));
         assert_eq!(c.limits.max_names_per_request, 16);
@@ -1212,13 +1181,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            c.chain(Kind::Reveal),
+            c.chain(ApprovalKind::Reveal),
             &Chain::AllOf(vec![
                 Chain::One("a".into()),
                 Chain::AnyOf(vec![Chain::One("b".into()), Chain::One("a".into())])
             ])
         );
-        assert_eq!(c.chain(Kind::Reveal).names(), ["a", "b", "a"]);
+        assert_eq!(c.chain(ApprovalKind::Reveal).names(), ["a", "b", "a"]);
         let b = polkit(&c.approvers["b"]);
         assert_eq!(b.subject, PolkitSubject::Session);
         assert_eq!(b.on_dismiss, OnDismiss::Ignore);

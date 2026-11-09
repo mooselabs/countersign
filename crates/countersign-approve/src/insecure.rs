@@ -3,66 +3,44 @@
 //! Only for end-to-end tests. It exists only with the `insecure-test` feature,
 //! and that feature does not compile in release builds.
 
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
-use serde::{Deserialize, Serialize};
+use countersign_core::config::{AutoDecision, InsecureAutoConfig};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     ApprovalRequest, ApproverError, ApproverInfo, BoxFuture, DaemonApprover, Evidence, Outcome,
 };
 
-/// What the approver answers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum InsecureDecision {
-    /// Approve every request.
-    #[default]
-    Approve,
-    /// Deny every request.
-    Deny,
-    /// Return [`ApproverError::Unavailable`], to test `any_of` fallbacks.
-    Unavailable,
-}
-
-impl InsecureDecision {
-    fn as_str(self) -> &'static str {
-        match self {
-            InsecureDecision::Approve => "approve",
-            InsecureDecision::Deny => "deny",
-            InsecureDecision::Unavailable => "unavailable",
-        }
-    }
-}
-
-/// Settings for one `insecure-auto` instance.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InsecureAutoConfig {
-    /// Instance name used in chains and evidence.
-    pub name: String,
-    /// What to answer.
-    pub decision: InsecureDecision,
-    /// How long to wait before answering.
-    pub delay: Duration,
-}
-
 /// Answers every request with a fixed decision after a delay. Honours
 /// cancellation and expiry like a real approver.
 pub struct InsecureAutoApprover {
+    name: String,
     config: InsecureAutoConfig,
 }
 
 impl InsecureAutoApprover {
-    /// An approver with these settings.
-    pub fn new(config: InsecureAutoConfig) -> Self {
-        Self { config }
+    /// The instance `[approvers.NAME]` with these settings.
+    pub fn new(name: impl Into<String>, config: InsecureAutoConfig) -> Self {
+        Self {
+            name: name.into(),
+            config,
+        }
+    }
+}
+
+fn decision_str(d: AutoDecision) -> &'static str {
+    match d {
+        AutoDecision::Approve => "approve",
+        AutoDecision::Deny => "deny",
+        AutoDecision::Unavailable => "unavailable",
     }
 }
 
 impl DaemonApprover for InsecureAutoApprover {
     fn info(&self) -> ApproverInfo {
         ApproverInfo {
-            name: self.config.name.clone(),
+            name: self.name.clone(),
             adapter: "insecure-auto",
             trusted_display: false,
             notes: "insecure-test build: no human is asked".into(),
@@ -90,19 +68,19 @@ impl DaemonApprover for InsecureAutoApprover {
                 _ = tokio::time::sleep(self.config.delay) => {}
             }
             let evidence = Evidence {
-                approver: self.config.name.clone(),
+                approver: self.name.clone(),
                 adapter: "insecure-auto",
                 at: SystemTime::now(),
                 detail: serde_json::json!({
                     "mode": "insecure-test",
-                    "decision": self.config.decision.as_str(),
+                    "decision": decision_str(self.config.decision),
                     "delay_ms": u64::try_from(self.config.delay.as_millis()).unwrap_or(u64::MAX),
                 }),
             };
             match self.config.decision {
-                InsecureDecision::Approve => Ok(Outcome::Approved(evidence)),
-                InsecureDecision::Deny => Ok(Outcome::Denied(evidence)),
-                InsecureDecision::Unavailable => Err(ApproverError::Unavailable(
+                AutoDecision::Approve => Ok(Outcome::Approved(evidence)),
+                AutoDecision::Deny => Ok(Outcome::Denied(evidence)),
+                AutoDecision::Unavailable => Err(ApproverError::Unavailable(
                     "insecure-auto configured as unavailable".into(),
                 )),
             }
@@ -112,8 +90,12 @@ impl DaemonApprover for InsecureAutoApprover {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use countersign_proto::ApprovalKind;
+
     use super::*;
-    use crate::{ApprovalKind, DisplayView, SessionRef};
+    use crate::{DisplayView, SessionRef};
 
     fn request(expires_in: Duration) -> ApprovalRequest {
         ApprovalRequest::new(
@@ -134,30 +116,32 @@ mod tests {
         )
     }
 
-    fn approver(decision: InsecureDecision, delay_ms: u64) -> InsecureAutoApprover {
-        InsecureAutoApprover::new(InsecureAutoConfig {
-            name: "auto".into(),
-            decision,
-            delay: Duration::from_millis(delay_ms),
-        })
+    fn approver(decision: AutoDecision, delay_ms: u64) -> InsecureAutoApprover {
+        InsecureAutoApprover::new(
+            "auto",
+            InsecureAutoConfig {
+                decision,
+                delay: Duration::from_millis(delay_ms),
+            },
+        )
     }
 
     #[tokio::test]
     async fn approves_and_denies_after_the_delay() {
         let req = request(Duration::from_secs(60));
-        let out = approver(InsecureDecision::Approve, 10)
+        let out = approver(AutoDecision::Approve, 10)
             .present(&req, CancellationToken::new())
             .await
             .unwrap();
         assert!(out.is_approved());
         assert_eq!(out.evidence().adapter, "insecure-auto");
         assert_eq!(out.evidence().detail["mode"], "insecure-test");
-        let out = approver(InsecureDecision::Deny, 0)
+        let out = approver(AutoDecision::Deny, 0)
             .present(&req, CancellationToken::new())
             .await
             .unwrap();
         assert!(!out.is_approved());
-        let err = approver(InsecureDecision::Unavailable, 0)
+        let err = approver(AutoDecision::Unavailable, 0)
             .present(&req, CancellationToken::new())
             .await
             .unwrap_err();
@@ -169,14 +153,14 @@ mod tests {
         let req = request(Duration::from_secs(60));
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let err = approver(InsecureDecision::Approve, 10_000)
+        let err = approver(AutoDecision::Approve, 10_000)
             .present(&req, cancel)
             .await
             .unwrap_err();
         assert_eq!(err, ApproverError::Cancelled);
 
         let req = request(Duration::from_millis(50));
-        let err = approver(InsecureDecision::Approve, 10_000)
+        let err = approver(AutoDecision::Approve, 10_000)
             .present(&req, CancellationToken::new())
             .await
             .unwrap_err();

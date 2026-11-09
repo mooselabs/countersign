@@ -7,7 +7,7 @@
 //! ```
 //!
 //! A request either asks for a grant (`use` or `reveal` on some secrets) or
-//! carries a store [`Mutation`] that applies once approved. Grants live only
+//! carries store [`Mutation`]s that apply once approved. Grants live only
 //! in memory; a `cnd` restart drops them. Time comes from the injected
 //! [`Clock`], so tests are deterministic.
 //!
@@ -144,8 +144,9 @@ pub enum RequestKind {
         /// Lifetime from approval.
         ttl: Duration,
     },
-    /// A store change, held until approved.
-    Mutation(Mutation),
+    /// Store changes, held until approved and applied together
+    /// ([`crate::store::Store::apply_all`]).
+    Mutation(Vec<Mutation>),
 }
 
 impl RequestKind {
@@ -153,20 +154,20 @@ impl RequestKind {
     pub fn names(&self) -> Vec<String> {
         match self {
             RequestKind::Grant { names, .. } => names.clone(),
-            RequestKind::Mutation(m) => vec![m.name().to_owned()],
+            RequestKind::Mutation(ms) => ms.iter().map(|m| m.name().to_owned()).collect(),
         }
     }
 
     /// The approval kind: `use`, `reveal` or `mutate`.
-    pub fn approval_kind(&self) -> crate::config::Kind {
+    pub fn approval_kind(&self) -> countersign_proto::ApprovalKind {
         match self {
             RequestKind::Grant {
                 mode: Mode::Use, ..
-            } => crate::config::Kind::Use,
+            } => countersign_proto::ApprovalKind::Use,
             RequestKind::Grant {
                 mode: Mode::Reveal, ..
-            } => crate::config::Kind::Reveal,
-            RequestKind::Mutation(_) => crate::config::Kind::Mutate,
+            } => countersign_proto::ApprovalKind::Reveal,
+            RequestKind::Mutation(_) => countersign_proto::ApprovalKind::Mutate,
         }
     }
 }
@@ -374,15 +375,26 @@ impl Grants {
     }
 
     /// Creates a mutation request. Check it against the store first
-    /// ([`crate::store::Store::check`]). Human sessions may make these.
+    /// ([`crate::store::Store::check_all`]). Human sessions may make these.
     pub fn request_mutation(
         &mut self,
         session: &Session,
-        mutation: Mutation,
+        mutations: Vec<Mutation>,
         reason: &str,
         digest: impl FnOnce(&PendingRequest) -> [u8; 32],
     ) -> Result<&PendingRequest, GrantError> {
-        self.create(&session.id, RequestKind::Mutation(mutation), reason, digest)
+        if mutations.is_empty() {
+            return Err(GrantError::new(
+                ErrorCode::BadRequest,
+                "a store change names at least one secret",
+            ));
+        }
+        self.create(
+            &session.id,
+            RequestKind::Mutation(mutations),
+            reason,
+            digest,
+        )
     }
 
     fn create(
@@ -551,6 +563,14 @@ impl Grants {
             RequestKind::Mutation(_) => None,
         };
         Ok(Approved { request, grant })
+    }
+
+    /// Ends a pending request without a decision: no grant and no deny
+    /// cooldown; its code reads as expired. For a request whose approver
+    /// timed out ahead of [`Grants::sweep`], or one `cnd` could not record
+    /// (its `request.create` audit write failed).
+    pub fn expire(&mut self, request_id: &str) -> Result<PendingRequest, GrantError> {
+        self.take(request_id, Ended::Expired)
     }
 
     /// Denies a pending request. Its secrets go into deny cooldown for the
