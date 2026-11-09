@@ -29,9 +29,9 @@ cannot alter. That is the [trusted-display problem](#the-trusted-display-problem
 and it decides the recommended default.
 
 What an approver never has to establish is the integrity of what was
-approved. `cnd` builds the canonical request, computes its digest, and either
-makes the polkit call itself or verifies a FIDO2 signature over its own digest.
-No client can change what a successful approval applies to.
+approved. `cnd` builds the canonical request, computes its digest, and makes
+the polkit call itself (in Phase 2 it also verifies FIDO2 signatures over its
+own digest). No client can change what a successful approval applies to.
 
 ## Approval kinds
 
@@ -41,33 +41,28 @@ Each request has a kind, and config chooses an approver chain per kind:
 | --- | --- | --- |
 | `use` | `cn request` (default mode) | A value is injected into a child process for up to `max_ttl`. |
 | `reveal` | `cn request --mode reveal` | A raw value goes wherever the caller's stdout goes, permanently. |
-| `mutate` | `cn add`, `set`, `edit`, `rm`, `import`, `unlock --enroll` | Store contents or prose change for every later session. |
-| `export` | `cn export` | The whole store, decrypted, goes to an age recipient. |
+| `mutate` | `cn add`, `set`, `edit`, `rm`, `import` | Store contents or prose change for every later session. |
+| `export` | `cn export` (Phase 2) | The whole store, decrypted, goes to an age recipient. |
 
 ## The interface
 
-`countersign-approve` defines two traits, because approvers differ in who
-drives the interaction, and wraps them in one enum that the chain evaluator
-uses. Sketch (not final API):
+`countersign-approve` runs approvers; the chain and approver config types
+belong to `countersign_core::config`, and `ApprovalKind` and the digest to
+`countersign_proto`. Phase 1 has daemon-driven approvers only. In outline:
 
 ```rust
-/// Everything an approver is given. Built once per request by cnd.
+/// Everything an approver is given. Built once per request by cnd; fields
+/// are read through accessors.
 pub struct ApprovalRequest {
-    /// RFC 8785 (JCS) bytes of the canonical request (design.md section 6).
-    pub canonical: Vec<u8>,
-    /// SHA-256 of `canonical`. Used verbatim as the FIDO2 clientDataHash.
-    pub digest: [u8; 32],
-    /// "3QF8-ZK2M": first 8 Crockford base32 chars of `digest`, for humans.
-    pub digest_short: String,
-    pub code: String,                 // "K7M-Q2X"
-    pub kind: ApprovalKind,           // Use | Reveal | Mutate | Export
-    /// Escaped, length-limited strings for display. Agent-supplied fields
-    /// (reason, cwd, labels) are marked as such. Never values.
-    pub display: DisplayView,
-    /// Resolved by cnd: session id, anchor (pid, starttime, comm), uid,
-    /// and the uid's logind graphical session if there is one.
-    pub session: SessionRef,
-    pub expires_at: SystemTime,
+    request_id: String,       // "r_...", from the canonical request
+    canonical: Vec<u8>,       // RFC 8785 (JCS) bytes of the canonical request (design.md section 6)
+    digest: [u8; 32],         // SHA-256 of `canonical`, computed here so the two cannot disagree
+    digest_short: String,     // "3QF8-ZK2M", the same function cn uses
+    code: String,             // "K7M-Q2X"
+    kind: ApprovalKind,       // Use | Reveal | Mutate | Export
+    display: DisplayView,     // sanitised, length-limited strings; never values
+    session: SessionRef,      // uid, anchor pid, start time and comm, logind session if known
+    expires_at: SystemTime,
 }
 
 pub enum Outcome {
@@ -76,70 +71,54 @@ pub enum Outcome {
 }
 
 pub enum ApproverError {
-    /// Cannot run here: no polkit agent for the session, no key enrolled,
-    /// no graphical session. Lets an `any_of` chain try the next member.
+    /// Cannot run here: polkitd not on the bus, no authentication agent for
+    /// the subject, no graphical session, not Wayland under require_wayland.
     Unavailable(String),
-    /// The human did not answer before the deadline.
+    /// The request expired, or the dialog's own timeout ran out.
     Timeout,
-    /// A response arrived and failed verification (bad signature, UP flag
-    /// clear, counter went backwards). Audited as `request.approve_fail`.
+    /// cnd withdrew the request, or another any_of member decided.
+    Cancelled,
+    /// A response arrived and failed verification. No Phase 1 adapter
+    /// returns it.
     Invalid(String),
-    /// Bug or system fault. Fails closed.
+    /// Bug, misconfiguration or system fault. Fails closed.
     Internal(String),
 }
 
-/// Recorded in the audit log with the `request.approve` / `request.deny` record.
+/// Recorded in the audit log with the request.approve / request.deny record.
 pub struct Evidence {
-    pub approver: String,           // configured instance name: "polkit", "desk-key"
-    pub adapter: &'static str,      // "polkit" | "fido2" | "command"
+    pub approver: String,           // configured instance name: "polkit"
+    pub adapter: &'static str,      // "polkit"
     pub at: SystemTime,
     pub detail: serde_json::Value,  // adapter-specific; never values
 }
 
-/// cnd runs the whole interaction (polkit, command).
+/// cnd runs the whole interaction (polkit; later command).
 pub trait DaemonApprover: Send + Sync {
-    fn info(&self) -> ApproverInfo;   // name, adapter, strength notes for `cn doctor`
+    fn info(&self) -> ApproverInfo;   // name, adapter, trusted_display, notes
     fn present<'a>(
         &'a self,
         req: &'a ApprovalRequest,
-        cancel: CancellationToken,    // fired when another chain member decided
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<Outcome, ApproverError>>;
 }
 
-/// cnd issues a challenge, `cn approve` answers it, cnd verifies (fido2).
-pub trait ClientApprover: Send + Sync {
-    fn info(&self) -> ApproverInfo;
-    /// What `cn approve` needs: rp id, allowed credential ids, uv policy.
-    /// The challenge itself is always `req.digest`.
-    fn challenge(&self, req: &ApprovalRequest) -> Result<ClientChallenge, ApproverError>;
-    /// Verify the client's response against enrolled credentials.
-    fn verify(
-        &self,
-        req: &ApprovalRequest,
-        resp: &ClientResponse,
-    ) -> Result<Outcome, ApproverError>;
-}
-
-pub enum Approver {
-    Daemon(Box<dyn DaemonApprover>),
-    Client(Box<dyn ClientApprover>),
-}
-
-/// Parsed from config.
-pub enum Chain {
-    One(String),          // approver instance name
-    AllOf(Vec<Chain>),
-    AnyOf(Vec<Chain>),
-}
+/// Runs a chain (countersign_core::config::Chain: One, AllOf, AnyOf) against
+/// the configured instances and reports every member's result.
+pub async fn evaluate(
+    chain: &Chain,
+    registry: &Registry,
+    req: &ApprovalRequest,
+    cancel: &CancellationToken,
+) -> ChainReport; // { result: Result<Decision, ApproverError>, members }
 ```
 
-In Phase 1 only `DaemonApprover` is implemented. `ClientApprover` and the
-`Approver::Client` variant arrive with `fido2` in Phase 2. `present` returns a
-boxed `Send` future; it honours the cancellation token and `expires_at`, and
-dropping the future or cancelling it withdraws the prompt (for polkit,
-`CancelCheckAuthorization`). `ApprovalRequest.session` carries the subject
-data `cnd` resolved: the developer's uid, the anchor's pid and start time, and
-the logind session id when there is one.
+`present` honours the cancellation token and `expires_at`, and dropping the
+future or cancelling it withdraws the prompt (for polkit,
+`CancelCheckAuthorization`). `ApproverInfo.trusted_display` is false for the
+polkit process subject and true for the session subject; `config.load`
+records it. Phase 2 adds a `ClientApprover` trait for `fido2`, where `cnd`
+issues a challenge, `cn approve` answers it and `cnd` verifies it.
 
 Rules every adapter follows:
 
@@ -148,16 +127,16 @@ Rules every adapter follows:
 - An adapter never receives a secret value. Even a `mutate` request carries
   only the value's length class and source.
 - `Evidence.detail` must be enough for a later reader to tell what happened,
-  and where possible to re-check it (FIDO2 stores the signature).
+  and where possible to re-check it (FIDO2 will store the signature).
 - `present` must honour `cancel` and `expires_at`. An adapter that cannot
   cancel (a running command) is killed.
 
 ## Daemon-driven and client-driven
 
-| | Daemon-driven | Client-driven |
+| | Daemon-driven | Client-driven (Phase 2) |
 | --- | --- | --- |
-| Adapters | `polkit`, `command` | `fido2` |
-| Who starts it | `cnd`, as soon as the request is created (or when `cn approve` re-triggers it) | The human, by running `/usr/bin/cn approve CODE` |
+| Adapters | `polkit`; `command` in Phase 2 | `fido2` |
+| Who starts it | `cnd`, as soon as the request is created | The human, by running `/usr/bin/cn approve CODE` |
 | Where the request is displayed | A surface outside the developer's uid's control: the compositor's polkit dialog, a phone | `cn`'s output in the terminal, inside the agent's environment |
 | Where the decision is made | polkitd / the command | The security key, then `cnd` verifies the assertion |
 | What the agent can do | Nothing beyond creating requests (rate-limited) | Run `cn approve` itself (reaches the touch prompt and stops), or tamper with what the terminal shows |
@@ -170,7 +149,8 @@ only daemon-driven adapter with a trusted display in v1.
 ## Chaining
 
 Config gives each kind a chain. A chain is an approver name, or `all_of` /
-`any_of` over chains, nested at most three levels.
+`any_of` over chains, nested at most three levels. Approver instance names
+use lower-case letters, digits and `-`. A Phase 2 example:
 
 ```toml
 [approval]
@@ -185,22 +165,33 @@ export = { all_of = ["polkit", "desk-key"] }
 - Every member must approve. Members run in listed order, one at a time, so
   the human is never asked for two things at once.
 - The first `Denied` denies the request; later members are not asked.
-- `Timeout` or `Unavailable` leaves that member unsatisfied and the request
-  pending until `pending_expiry`; the human can retry with `cn approve`.
-- `Invalid` is audited as `request.approve_fail` and counts toward the per-session
-  approval-attempt limit; the member stays unsatisfied.
-- `Internal` denies (fail closed).
+- Any error (`Unavailable`, `Timeout`, `Invalid`, `Internal`) ends the chain
+  with that error; later members are not asked.
 
 ### `any_of`
 
-- Daemon-driven members start when the request is created; client-driven
-  members accept a `cn approve` at any time while the request is pending.
-- The first decisive outcome wins. `Approved` creates the grant and cancels
-  the others (`CancelCheckAuthorization` for polkit, SIGTERM for a command).
-  `Denied` from any member denies the request: an explicit no is never
-  overridden by trying another approver.
-- `Unavailable` members are skipped. If every member is unavailable the
-  request fails with `approver_unavailable`.
+- Every member starts when the request is created.
+- The first approval or denial decides and cancels the others, and the chain
+  waits up to 5 seconds for them to withdraw their prompts. A `Denied` from
+  any member denies the request: an explicit no is never overridden by
+  trying another approver.
+- `Internal` from any member ends the chain with that error (fail closed).
+- `Unavailable`, `Timeout` and `Invalid` members are skipped. If no member
+  decides, the chain ends with the first error that is not `Unavailable`, or
+  with `Unavailable` when every member was unavailable.
+
+### How `cnd` ends the request
+
+| Chain result | Request | Audit |
+| --- | --- | --- |
+| Approved | approved: the grant becomes active, or the store change commits | `request.approve` per approving member |
+| Denied | denied; the secrets go into deny cooldown for the session | `request.deny` per denying member |
+| `Timeout` | expired | `request.expire` |
+| `Cancelled` | as `cnd` set it when it cancelled (`cn deny`, expiry, the anchor's exit) | |
+| `Unavailable`, `Invalid`, `Internal` | denied by `cnd`, with the reason; no deny cooldown | `request.deny` with approver `cnd` and `evidence.error` |
+
+Phase 1 has no way to raise a dialog again for the same request. After a
+timeout or an unavailable approver, the agent requests again.
 
 ### Strength of a chain
 
@@ -208,8 +199,7 @@ An `any_of` chain is as weak as its weakest member, for presence and for
 intent. If `use = { any_of = ["polkit", "desk-key"] }`, an approval can always
 come from `desk-key` through `cn approve`, whose display is the terminal, even
 while a polkit dialog is open. A chain's display strength is the strength of
-the strongest display that *every* approving path must pass through. `cn
-doctor` prints, for each kind, the weakest path through its chain.
+the strongest display that *every* approving path must pass through.
 
 An `any_of` also invites downgrade: if the agent can make the stronger member
 `Unavailable` (for example by running in a session with no polkit agent), the
@@ -234,6 +224,10 @@ make the human see request A while approving request B.
 
 ### How a terminal display is subverted
 
+In Phase 1 the terminal is only a cross-check: `cn approve` prints the
+request, and the approval is the dialog. This section matters for the Phase 2
+`fido2` path, where the terminal is the approver's display.
+
 `!` commands in Claude Code run in the same shell setup as the agent's Bash
 tool: same uid, same environment, the same shell snapshot the harness sources
 before each command. Any of these lets an agent show request A while the touch
@@ -251,8 +245,8 @@ signs request B:
 
 The substitute shows A's details and A's short digest, but asks `cnd` for B's
 challenge and has the key sign B's digest. `cnd` verifies a correct signature
-over B and grants B. `cn` being statically linked, non-dumpable and refusing a
-tracer stops only `LD_PRELOAD` and ptrace tricks against the genuine binary.
+over B and grants B. `cn` being non-dumpable and `cn approve` refusing a
+tracer stop only ptrace tricks against the genuine binary.
 Nothing in the terminal can prove it is genuine to the human reading it.
 
 This attack needs a deliberately malicious agent that plans ahead. A careless
@@ -266,10 +260,10 @@ as a fallback and not as the default.
 | `cnd` passes the session anchor as a `unix-process` subject (the Phase 1 default, decision 15); a same-uid agent registers its own per-process authentication agent for it (as `pkttyagent --process` does) and receives the prompt instead of gnome-shell. | The prompt still runs the human's factor through PAM: a hijacking agent can draw its own prompt, but it gets an approval only if the human types their password into it or touches the key. It spoofs the display; it does not bypass approval. A careless or confused agent does not do this. With `subject = "session"`, once polkit-org/polkit#699 is fixed, one authentication agent per session is allowed and gnome-shell holds it. |
 | The agent draws a lookalike dialog. | A lookalike collects nothing: with `pam_u2f`, the touch only completes the real PAM conversation run by `polkit-agent-helper-1`. On GNOME Wayland, client windows cannot cover the shell's modal dialog, so the real one is visible. |
 | The agent ptraces gnome-shell. | gnome-shell is not a descendant of the agent; Yama `ptrace_scope=1` refuses. |
-| The agent synthesizes a click or keystrokes in the dialog. | Not possible on Wayland. On X11 it is; `cn doctor` warns, and the polkit adapter can be set to refuse non-Wayland sessions (`require_wayland = true`). |
-| The agent installs a GNOME Shell extension that rewrites the dialog. | Takes effect after the next login or shell restart. Lock user extensions off through the system dconf database (below), or accept the residual risk; `cn doctor` warns when user extensions are enabled. |
+| The agent synthesizes a click or keystrokes in the dialog. | Not possible on Wayland. On X11 it is. `cn doctor` warns in an X11 session, and the polkit adapter refuses unless the uid's logind graphical session is Wayland (`require_wayland = true`, the default). |
+| The agent installs a GNOME Shell extension that rewrites the dialog. | Takes effect after the next login or shell restart. Lock user extensions off through the system dconf database (below), or accept the residual risk. |
 | The agent spams requests until one is approved by habit. | Per-session limits on pending requests and request rate; cooldown after a deny; the dialog names the session and shows the agent's reason as the agent's. |
-| A polkit rule or a `*_keep` default makes later checks pass without a prompt. | `cnd` self-tests at start: a non-interactive check of each action must return "challenge", never "authorized". If not, the polkit approver is disabled and `cnd` logs why. |
+| A polkit rule or a `*_keep` default makes later checks pass without a prompt. | Writing either needs root. Phase 1 does not detect it: `cnd` logs polkitd's version at start but does not test the actions, and `cn doctor` does not read the policy or the rules. Check the installed policy and `/etc/polkit-1/rules.d/` yourself. |
 
 ### Cross-checking codes and digests
 
@@ -390,10 +384,11 @@ org.freedesktop.PolicyKit1.Authority.CheckAuthorization(
                        "digest": "3QF8-ZK2M",
                        "secrets": "clickhouse-password",
                        "ttl": "30m",
-                       "session": "agent claude (pid 41210) in ~/projects/moose/liskov-agent-orchestrator",
-                       "reason": "row counts for the weekly cost report via ..."},
+                       "session": "agent claude (pid 41210, label orchestrator) in ~/projects/moose/liskov-agent-orchestrator",
+                       "reason": "row counts for the weekly cost report via ...",
+                       "operation": "none"},
     flags           = 0x1,           # AllowUserInteraction
-    cancellation_id = "r_9w1k...")   # the request id
+    cancellation_id = "countersign-r_9w1k...-1")
   -> (is_authorized: b, is_challenge: b, details: a{ss})
 ```
 
@@ -401,7 +396,7 @@ The dialog then reads:
 
 ```text
 countersign request K7M-Q2X, digest 3QF8-ZK2M: USE clickhouse-password for 30m.
-agent claude (pid 41210) in ~/projects/moose/liskov-agent-orchestrator.
+agent claude (pid 41210, label orchestrator) in ~/projects/moose/liskov-agent-orchestrator.
 Agent's reason: row counts for the weekly cost report via ...
 ```
 
@@ -412,36 +407,61 @@ Agent's reason: row counts for the weekly cost report via ...
     subject with its `pid`, `start-time` (field 22 of `/proc/PID/stat`) and
     `uid`. The anchor must be the developer's own process: the spike found
     that a subject process not owned by the developer returns `(false,
-    false)`. polkitd finds the authentication agent through the process's
-    login session. The limit is the hijack described in
+    false)`. polkitd asks the authentication agent of the process's login
+    session, or, for a process outside any login session (a terminal
+    started by GNOME runs in the user manager's), of the uid's graphical
+    session. The limit is the hijack described in
     [How the polkit display is subverted](#how-the-polkit-display-is-subverted-and-what-stops-it).
   - `"session"`: the uid's logind graphical session (the `Display` property
-    of `org.freedesktop.login1.User`), required to be local, active, on a
-    seat and, with `require_wayland = true`, of type `wayland`. This is the
-    stronger subject, but polkitd 127 and 128 abort on it
+    of `org.freedesktop.login1.User`) as a `unix-session` subject. This is
+    the stronger subject, but polkitd 127 and 128 abort on it
     ([polkit-org/polkit#699](https://github.com/polkit-org/polkit/issues/699)),
     so it is for a polkit with that fixed.
-- **Details.** The adapter always sets every key its action's message uses:
-  `code`, `digest`, `secrets`, `ttl`, `session` and `reason` for `approve`
-  and `reveal`; `code`, `digest`, `operation` and `session` for `mutate`.
-  An empty value is sent as "none", so the dialog never shows a raw `$(key)`.
-  `session` reads like `agent claude (pid 41210) in ~/projects/x`. Every value
-  is sanitised: control characters, ANSI escapes, newlines and Unicode bidi
-  overrides are removed. Each is length-limited: reason 300 characters, the
-  cwd inside `session` 120 with the middle elided, the secret list 10 names
-  then "and N more". Keys beginning `polkit.` are reserved by polkit and are
-  never set. Only an action owner may pass details at all (spike finding 3),
-  so an agent cannot write this text.
-- **Result.** `is_authorized = true` -> `Approved`. `details["polkit.dismissed"]
-  = "true"` (the human pressed Cancel) -> `Denied` (dismissed), or ignored
-  when the approver has `on_dismiss = "ignore"` (useful in an `any_of` in
-  Phase 2). `is_challenge = true` with no interaction -> `Unavailable` (no
-  authentication agent for the session). Otherwise -> `Denied`.
-- **Cancellation.** When the request expires, is denied by `cn deny`, or
-  another `any_of` member approves, `cnd` calls `CancelCheckAuthorization` with
-  the request id and the dialog closes. `cnd` must enforce expiry itself: with
-  a key-touch factor, GNOME retries the touch about every 30 seconds for as
-  long as the dialog is open (spike U3), so without the cancel the dialog
+- **`require_wayland`** (default `true`). Before each check the adapter
+  reads the type of the uid's logind graphical session, the session polkit
+  shows the dialog in, and refuses (`Unavailable`) unless it is `wayland`.
+  It does not look at the anchor's own session: terminal apps on GNOME run
+  in the user manager's session, which has no type. No graphical session, or
+  no answer from logind, is also `Unavailable`.
+- **Details.** The adapter always sets every key the messages use: `code`,
+  `digest`, `secrets`, `ttl`, `session`, `reason` and `operation`. An empty
+  value is sent as "none", so the dialog never shows a raw `$(key)`.
+  `session` reads like `agent claude (pid 41210, label x) in ~/projects/x`;
+  the label and cwd in it are agent-supplied. For a store change made from a
+  terminal outside any session, it names that terminal's shell. Keys
+  beginning `polkit.` are reserved by polkit and are never set. Only an
+  action owner may pass details at all (spike finding 3), so an agent cannot
+  write this text.
+- **Sanitising.** Every value is cleaned before it is sent: terminal escape
+  sequences (CSI, OSC, DCS and the rest, 7-bit and C1 forms) are removed
+  whole, and an unterminated OSC or DCS string hides the rest of its field;
+  control and format characters are removed (bidi overrides and isolates,
+  zero-width characters, tag characters), as are private-use characters,
+  noncharacters and variation selectors; line breaks and runs of spaces
+  become one space; combining marks are cut to two per base character. Then
+  each field is length-limited, counting characters: reason 300, operation
+  300, each secret name 64, the cwd 120 with the middle elided (the home
+  directory shown as `~`), the label 40, the anchor's `comm` 32, and the
+  secret list 10 names then "and N more".
+- **Result.** `is_authorized = true` -> `Approved`.
+  `details["polkit.dismissed"] = "true"` (the human pressed Cancel) ->
+  `Denied`, or `Unavailable` when the approver has `on_dismiss = "ignore"`
+  (for an `any_of` in Phase 2). `is_challenge = true` -> `Unavailable` (no
+  authentication agent for the subject). Otherwise -> `Denied`. An answer
+  that arrives after the request expired counts as `Timeout`. polkitd not
+  on the bus is `Unavailable`; polkitd refusing `cnd` as a caller (the policy
+  is missing or names another owner) is `Internal`.
+- **Timeout.** One dialog stays open at most `timeout` (default `"2m"`),
+  even when the request would live longer; then the adapter withdraws it and
+  returns `Timeout`, and the request expires. With the defaults a request is
+  answered within two minutes or not at all.
+- **Cancellation.** When the request expires, is denied by `cn deny`, its
+  anchor exits, or another `any_of` member decides, `cnd` calls
+  `CancelCheckAuthorization` and the dialog closes. Each call has its own
+  cancellation id, `countersign-<request id>-<n>`, because polkitd refuses a
+  second check in flight with the same id. `cnd` must enforce expiry itself:
+  with a key-touch factor, GNOME retries the touch about every 30 seconds for
+  as long as the dialog is open (spike U3), so without the cancel the dialog
   would stay up.
 - **Evidence.** `{action_id, subject, is_authorized, dismissed,
   duration_ms}`. polkit gives no signature; the evidence is "polkitd said
@@ -516,7 +536,7 @@ against an enrolled public key.
 
 ### Enrollment
 
-`cn approver enroll --name desk-key` (see [cli.md](cli.md#cn-approver-enroll-phase-2)):
+`/usr/bin/cn approver enroll --name desk-key [--uv required|preferred|discouraged] [--out FILE]`:
 
 1. `cn` gets an enrollment nonce from `cnd`.
 2. `authenticatorMakeCredential` with:
@@ -532,7 +552,9 @@ against an enrolled public key.
 3. `cn` writes `desk-key.approver.toml`: name, credential id, COSE public key,
    algorithm, AAGUID, uv policy, attestation statement (format, signature,
    certificate chain), the enrollment nonce, and the time.
-4. Root installs it into `/etc/countersign/approvers.d/` and reloads `cnd`.
+4. Root installs it into `/etc/countersign/approvers.d/` and reloads `cnd`
+   (`sudo install -o root -g root -m 0644 desk-key.approver.toml
+   /etc/countersign/approvers.d/`, then `sudo systemctl reload countersign`).
 5. On load, `cnd` verifies the attestation signature and chain against the
    configured roots (default: the Yubico FIDO root CA) and, optionally, an
    AAGUID allowlist. A software authenticator, including one a shadowed `cn`
@@ -596,12 +618,32 @@ land in the transcript. So:
 
 ### Daemon-side option
 
-With the udev rule in [design.md](design.md#daemon-side-fido2-phase-2-optional),
-`cnd` can talk to the key itself (`side = "daemon"`), and `cn approve` only
+With a udev rule that gives the `countersign` group the key, `cnd` can talk to
+the key itself (`side = "daemon"`), and `cn approve` only
 tells `cnd` which request to sign. That keeps the assertion out of the
 developer's uid but does not change the display problem: the human still
 learns what they are approving from `cn`'s output. It is mainly useful for
 `cn unlock`, where it keeps the `hmac-secret` output out of the uid.
+
+```text
+# /usr/lib/udev/rules.d/70-countersign.rules
+SUBSYSTEM=="hidraw", ENV{ID_FIDO_TOKEN}=="1", GROUP="countersign", MODE="0660", TAG+="uaccess"
+```
+
+The unit then sets `PrivateDevices=no` and `DeviceAllow=char-hidraw rw`.
+`TAG+="uaccess"` keeps the seat user's access, so `cn approve` still works.
+
+### Store unlock
+
+A `fido2` key slot wraps the data key with `KEK = HKDF(hmac-secret(salt),
+"countersign/kek/v1")`. A `cnd` whose only usable slot is `fido2` starts
+sealed and answers `store_sealed` until `/usr/bin/cn unlock`: `cn` gets the
+slot's credential id and salt from `cnd`, asks the key for its `hmac-secret`
+output (touch required), and sends it to `cnd`, which unwraps the data key.
+With `[unlock] fido2_side = "daemon"`, `cnd` talks to the key itself and
+`cn unlock` only triggers it. `cn unlock --enroll` adds a `fido2` slot for the
+inserted key, under a `mutate` approval. The audit log records `unlock`,
+`store.unseal` and `keyslot.add`.
 
 ### Library choice (open)
 
@@ -717,9 +759,9 @@ subject = "process"
   authentication agent for the anchor (the process-subject limit).
 - The approval is a YubiKey touch, the gesture the owner wants. It works from
   any terminal and any agent, because `cnd` raises the dialog itself.
-- `reveal`, `mutate` and `export` get their own actions and messages, so the
-  dialog says plainly when a value would enter the transcript or the store
-  would change.
+- `use`, `reveal` and `mutate` have their own actions and messages
+  (`export` uses `mutate`), so the dialog says plainly when a value would
+  enter the transcript or the store would change.
 
 Setup, in order:
 
@@ -783,10 +825,11 @@ export = { all_of = ["polkit", "desk-key"] }
    by the spike: the owner annotation works across uids with a process
    subject; a session subject aborts polkitd 127/128 (polkit#699), hence
    decision 15.
-3. **Resolving the graphical session** (`subject = "session"` only). Using
-   the uid's logind `Display` session works for a solo desktop. It is wrong if the developer has two
-   graphical sessions, or approves from a remote desktop. Should the
-   approver refuse when the uid has more than one graphical session?
+3. **Resolving the graphical session** (`subject = "session"`, and the
+   `require_wayland` check). Using the uid's logind `Display` session works
+   for a solo desktop. It is wrong if the developer has two graphical
+   sessions, or approves from a remote desktop. Should the approver refuse
+   when the uid has more than one graphical session?
 4. **Where `command` adapters run.** Forking them from `cnd` gives them the
    `countersign` uid (store and audit access) and the unit's
    `RestrictAddressFamilies=AF_UNIX`, which blocks any network push. Proposed:
@@ -794,9 +837,10 @@ export = { all_of = ["polkit", "desk-key"] }
    `Accept=yes`, whose instances run as `DynamicUser=yes` with network allowed;
    `cnd` connects over AF_UNIX and passes the JSON. Needs a decision.
 5. **Dismissal semantics.** A dismissed polkit dialog is a deny by default.
-   With `on_dismiss = "ignore"` a human can dismiss and approve another way.
-   Is a deny the right default, given that the agent then gets exit 5 and is
-   told not to retry?
+   With `on_dismiss = "ignore"` a dismissal is `Unavailable`: in an `any_of`
+   the human can approve another way; with polkit alone the request ends
+   denied by `cnd`. Is a deny the right default, given that the agent then
+   gets exit 5 and is told not to retry?
 6. **Attestation for keys without a usable chain.** Some authenticators ship
    with self or no attestation. `attestation = "none"` re-opens enrollment of
    a software key by a shadowed `cn`. Should `cnd` then require that the record

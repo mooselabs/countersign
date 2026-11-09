@@ -76,10 +76,26 @@ or to change the factor.
 9. If there is no store yet, runs `cnd init` as the `countersign` user with
    that credential. It creates the store and the audit log and prints a
    **recovery phrase once**. Write it on paper and keep it away from the
-   machine. It is not saved anywhere. This is the last step, so the phrase
-   stays on screen.
+   machine. It is not saved anywhere. It also prints the audit log's
+   checkpoint public key; keep a copy off the machine too
+   ([docs/audit.md](../docs/audit.md#off-box-export)). This is the last step,
+   so both stay on screen.
 
 Then log out and back in (for the group), and run the smoke test below.
+
+### Changing the config
+
+Edit `/etc/countersign/config.toml` as root, then:
+
+```console
+$ sudo systemctl reload countersign.service
+```
+
+`cnd` re-reads the file and records it in the audit log (`config.load`). A
+config that does not load leaves the previous one in force; the reason is in
+`journalctl -u countersign.service`. `cnd` refuses a config that is not
+root-owned or is writable by group or others. Grants already given keep their
+TTL; new limits apply to new requests.
 
 ## Approval factors
 
@@ -123,8 +139,8 @@ that way back.
 With a touch factor, touch the key only while the countersign dialog is on
 screen: a touch approves whatever request is pending. If you do not touch it,
 GNOME retries every 30 seconds or so and the key keeps blinking; `cnd` closes
-the dialog itself when the request expires (`pending_expiry`, 5 minutes by
-default).
+the dialog itself after two minutes (`[approvers.polkit] timeout`), and the
+request expires.
 
 ## Recovery
 
@@ -135,7 +151,14 @@ or motherboard, a reinstall, or a store restored onto another machine.
    mode 0700.
 2. Run `sudo packaging/install.sh`. It sees a store without a master key
    credential, creates a new credential and prints the recovery command.
-3. From a terminal you opened yourself, run that command and type the phrase:
+3. Stop the daemon: `cnd recover` takes no lock against a running `cnd`.
+
+   ```console
+   $ sudo systemctl stop countersign.socket countersign.service
+   ```
+
+4. From a terminal you opened yourself, run the recovery command and type the
+   phrase:
 
    ```console
    $ sudo systemd-run --wait --pipe --collect -p User=countersign -p Group=countersign \
@@ -144,9 +167,11 @@ or motherboard, a reinstall, or a store restored onto another machine.
        /usr/libexec/countersign/cnd recover
    ```
 
-   `cnd recover` reads the phrase from stdin, opens the store with it, and
-   wraps the store's key again with the new master key.
-4. `sudo systemctl restart countersign.service`, then `/usr/bin/cn doctor`.
+   `cnd recover` reads the phrase from stdin (case, dashes and spaces do not
+   matter), opens the store with it, and wraps the store's key again with the
+   new master key. The store, the audit log and its checkpoint key stay the
+   same.
+5. `sudo systemctl start countersign.socket`, then `/usr/bin/cn doctor`.
 
 Without the phrase, a store whose master key is lost cannot be opened.
 
@@ -174,14 +199,17 @@ yourself. It uses a dummy value; nothing here touches a real secret. Each
 dialog must start with `countersign request` and show the same code and
 digest that the terminal printed.
 
-1. Health check. Every line should be `ok`:
+1. Health check. Every line should be `ok`, except `session`, which warns
+   outside an agent session:
 
    ```console
    $ /usr/bin/cn doctor
    ```
 
 2. Add a dummy secret. A dialog opens: check that its code and digest match
-   the terminal, then approve it with your factor.
+   the terminal and that it reads `ADD secret smoke-test: install smoke test
+   (value 16 to 63 bytes, from stdin, high entropy)`, then approve it with
+   your factor.
 
    ```console
    $ printf %s 'smoke-0123456789abcdef' | /usr/bin/cn add smoke-test \
@@ -211,12 +239,12 @@ digest that the terminal printed.
    ```
 
 6. Revoke, then let a request expire. Do nothing when the dialog opens. After
-   5 minutes the dialog closes by itself and the command reports the request
-   expired:
+   2 minutes the dialog closes by itself and the command reports the request
+   expired (exit 7):
 
    ```console
    $ cn revoke --all
-   $ cn request smoke-test --reason "expiry test" --wait 6m
+   $ cn request smoke-test --reason "expiry test" --wait 3m; echo "exit $?"
    ```
 
 7. Cancel a dialog. Press Cancel; the command exits 5 (denied):
@@ -242,5 +270,4 @@ and `journalctl -u countersign.service -b`.
 
 ## Not done yet
 
-- An RPM spec (roadmap Phase 1 item 6, second half). Until then this script
-  is the only install path.
+- An RPM spec. Until then this script is the only install path.

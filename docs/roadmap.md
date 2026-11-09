@@ -14,30 +14,53 @@ ends with something the owner uses daily, not a demo.
   codes.
 - Resolve the blocking open questions below before Phase 1 code.
 
-## Phase 1: replaces `.secret-*` files on one machine (in progress)
+## Phase 1: replaces `.secret-*` files on one machine (implemented, under review)
 
 Done when the owner has deleted every `.secret-*` file from the liskov
 workspace and its scripts use `cn run`. Decisions 14 to 19 set its scope.
+The code is written and tested end to end against the `insecure-auto`
+approver and a fake polkit authority; it is being reviewed before it holds
+real secrets.
 
-1. `cnd` skeleton: socket activation, peer credentials through
-   `SO_PEERPIDFD` (Linux 6.5+), handshake, sessions (launcher registration
-   first, then matchers), in-memory grants.
+1. `cnd`: socket activation, peer credentials through `SO_PEERPIDFD`
+   (Linux 6.5+), handshake, sessions (launcher registration first, then
+   matchers, and a pseudo-session for a human's terminal), in-memory grants,
+   config reload on SIGHUP (`Type=notify-reload`, systemd 253+).
 2. Store: data model, XChaCha20-Poly1305 file, `systemd-creds` key slot,
    recovery phrase slot, atomic writes; `cnd init` and `cnd recover`.
-3. Audit writer: hash-chained JSONL, `cn audit`, `cn audit verify`.
+3. Audit writer: hash-chained JSONL with signed checkpoints, `cn audit`,
+   `cn audit verify`.
 4. Approver: `polkit` only, for every kind, with the session anchor as a
    `unix-process` subject and request expiry enforced by `cnd`. An
    `insecure-auto` approver behind the debug-only `insecure-test` feature for
    end-to-end tests.
-5. `cn`: `list`, `show`, `request`, `approve` (prints the request for
+5. `cn`: `list`, `show`, `request`, `approve` (shows the request for
    cross-checking; the approval itself is the dialog), `deny`, `grants`,
-   `revoke`, `run`, `hide`, `add`, `set`, `edit`, `rm`, `import`, `session`,
-   `session exec`, `doctor`, with `--json`.
+   `revoke`, `run`, `hide`, `reveal`, `add`, `set`, `edit`, `rm`, `import`,
+   `session`, `session exec`, `audit`, `audit verify`, `doctor`, with
+   `--json`.
 6. Packaging: an install script for openSUSE (sysusers, tmpfiles, units,
-   polkit policy, master key, approval factor with `pam_u2f`), then an RPM
-   spec. See [packaging/README.md](../packaging/README.md).
+   polkit policy, master key, approval factor with `pam_u2f`). See
+   [packaging/README.md](../packaging/README.md).
 7. Agent integration: the AGENTS.md snippet, a Claude Code skill and the
    migration guide, in [`integrations/`](../integrations/).
+
+Not in Phase 1. Config keys for these are accepted with a warning, and the
+commands exit 2 with `not_in_this_version`:
+
+- `[approval] list_requires_approval`; `[[audit.sink]]`; `[audit] retention`
+  and pruning; `[audit] checkpoint_command`; `cn audit checkpoints` and
+  `cn audit pubkey` (copy checkpoints with `cn audit --event checkpoint
+  --json`).
+- `cn export` and `cn import --from` (age backups).
+- Raising a dialog again after it timed out or was dismissed.
+- A polkit self-test at start, and the `cn doctor` checks for `PATH`
+  shadowing, file permissions, the polkit policy and PAM stack, GNOME Shell
+  extensions, the store and the audit chain.
+- Keeping each secret's last use across a `cnd` restart.
+- A lock that stops `cnd recover` while the daemon runs (stop the service
+  first).
+- An RPM spec.
 
 ## Phase 2: unattended and stricter
 
