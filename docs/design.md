@@ -69,8 +69,9 @@ kernel attests (peer credentials, pidfd).
 [`packaging/install.sh`](../packaging/install.sh) installs all of it. It runs
 as root, so the owner runs it through
 [`packaging/trusted-build.sh`](../packaging/trusted-build.sh), which clones a
-named commit into a root-owned tree and builds it there with the
-distribution's toolchain; `install.sh` refuses a tree or binaries another
+named commit into a root-owned tree (from a git bundle the developer makes
+while the repository is private, else from GitHub; the commit hash decides
+what is built) and builds it there with the distribution's toolchain; `install.sh` refuses a tree or binaries another
 user can change unless `--allow-user-tree` (decision 20). See
 [packaging/README.md](../packaging/README.md).
 

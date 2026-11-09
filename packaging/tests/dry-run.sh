@@ -285,6 +285,8 @@ expect "test root without --dry-run: refused" not ok
 commit=0123456789abcdef0123456789abcdef01234567
 tree=/usr/local/src/countersign/$commit
 clean_env='env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/usr/local/src/countersign/.home CARGO_HOME=/usr/local/src/countersign/.home/cargo LANG=C.UTF-8 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0'
+git_clone="$clean_env /usr/bin/git -c transfer.fsckObjects=true -c fetch.fsckObjects=true -c init.defaultBranch=main clone --quiet --no-checkout"
+clone_tmp=/usr/local/src/countersign/.clone.XXXXXX
 
 # tb_root [RUSTC_VERSION]: a fake root with git, cargo and rustc.
 tb_root() {
@@ -305,18 +307,74 @@ plan trusted-build.sh --commit "$commit" --factor touch --user nobody
 expect "trusted-build: exit 0" ok
 expect "trusted-build: checks itself" has "this script can be changed by root only"
 expect "trusted-build: root-owned dirs" has "would run: install -d -o root -g root -m 0755 /usr/local/src/countersign /usr/local/src/countersign/.home"
-expect "trusted-build: fresh clone" has "would clone https://github.com/mooselabs/countersign into $tree, check out $commit"
+expect "trusted-build: fresh clone from GitHub, objects checked" has "would run: $git_clone -- https://github.com/mooselabs/countersign $clone_tmp/src"
+expect "trusted-build: checks out the commit" has "would run: $clean_env /usr/bin/git -C $clone_tmp/src -c advice.detachedHead=false checkout --quiet --detach $commit"
+expect "trusted-build: moves the clone into place" has "would run: mv -- $clone_tmp/src $tree"
+expect "trusted-build: checks HEAD and fsck" has "then check that HEAD is $commit and git fsck passes"
+expect "trusted-build: no bundle" not has "bundle"
 expect "trusted-build: toolchain version" has "rustc 1.99.0 (/usr/bin/rustc)"
 expect "trusted-build: rust-version" has "rust-version 1.85: ok"
-expect "trusted-build: clean locked build" has "would run: $clean_env /usr/bin/cargo build --locked --release"
+expect "trusted-build: fetches the locked crates" has "would run: $clean_env /usr/bin/cargo fetch --locked"
+expect "trusted-build: clean locked offline build" has "would run: $clean_env /usr/bin/cargo build --locked --offline --release"
 expect "trusted-build: installs from its tree" has "would run: $tree/packaging/install.sh --factor touch --user nobody --bin-dir $tree/target/release"
 expect "trusted-build: changed nothing" test "$before" = "$(snapshot)"
 expect "trusted-build: ran no system tool" test ! -s "$calls"
 
+# --bundle: a file the developer made with git bundle create. The dry run
+# reads nothing from it; a real run copies it to a root-owned file first.
+bundle=$tmp/countersign.bundle
+printf '# v2 git bundle\n' >"$bundle"
+tb_root
+before=$(snapshot)
+plan trusted-build.sh --commit "$commit" --bundle "$bundle" --factor touch
+expect "trusted-build --bundle: exit 0" ok
+expect "trusted-build --bundle: names it" has "bundle: $bundle"
+expect "trusted-build --bundle: source line" has "== source: the bundle $bundle at $commit"
+expect "trusted-build --bundle: copies it to a root-owned file first" has "would run: cp -P -- $bundle $clone_tmp/countersign.bundle"
+expect "trusted-build --bundle: clones the copy, objects checked" has "would run: $git_clone -- $clone_tmp/countersign.bundle $clone_tmp/src"
+expect "trusted-build --bundle: not from GitHub" not has "github.com"
+expect "trusted-build --bundle: checks out the commit" has "checkout --quiet --detach $commit"
+expect "trusted-build --bundle: checks HEAD and fsck" has "then check that HEAD is $commit and git fsck passes"
+expect "trusted-build --bundle: builds" has "/usr/bin/cargo build --locked --offline --release"
+expect "trusted-build --bundle: installs" has "would run: $tree/packaging/install.sh --factor touch --bin-dir $tree/target/release"
+expect "trusted-build --bundle: changed nothing" test "$before" = "$(snapshot)"
+expect "trusted-build --bundle: ran no system tool" test ! -s "$calls"
+plan trusted-build.sh --commit "$commit" --bundle="$bundle"
+expect "trusted-build --bundle=FILE: same copy" has "would run: cp -P -- $bundle $clone_tmp/countersign.bundle"
+
+ln -s "$bundle" "$tmp/bundle-link"
+plan trusted-build.sh --commit "$commit" --bundle "$tmp/bundle-link"
+expect "trusted-build --bundle symlink: refused" not ok
+expect "trusted-build --bundle symlink: says why" has "$tmp/bundle-link is a symbolic link"
+plan trusted-build.sh --commit "$commit" --bundle "$tmp/no-such.bundle"
+expect "trusted-build --bundle missing: refused" not ok
+expect "trusted-build --bundle missing: says how to make one" has "bundle create /tmp/countersign.bundle main"
+plan trusted-build.sh --commit "$commit" --bundle "$tmp"
+expect "trusted-build --bundle directory: refused" not ok
+expect "trusted-build --bundle: ran no system tool" test ! -s "$calls"
+
+# The first run comes from a root-owned bootstrap copy, such as
+# /root/countersign-bootstrap (root 0700), not from /usr/local/src.
+boot=$tmp/root/countersign-bootstrap
+mkdir -p "$boot/packaging"
+chmod 0700 "$tmp/root"
+cp -r "$pkg/lib" "$pkg/trusted-build.sh" "$boot/packaging/"
+cp "$pkg/../Cargo.toml" "$boot/"
+status=0
+out=$(CALLS=$calls COUNTERSIGN_INSTALL_ROOT=$root PATH="$stubs:$PATH" \
+    bash "$boot/packaging/trusted-build.sh" --dry-run --commit "$commit" --bundle "$bundle" </dev/null 2>&1) || status=$?
+expect "trusted-build from a bootstrap copy: exit 0" ok
+expect "trusted-build from a bootstrap copy: checks itself" has "this script can be changed by root only"
+expect "trusted-build from a bootstrap copy: builds in /usr/local/src" has "would run: mv -- $clone_tmp/src $tree"
+
 mkdir -p "$root$tree"
 plan trusted-build.sh --commit "$commit"
 expect "trusted-build, tree exists: checks it" has "would check $tree: root-owned throughout, HEAD at $commit, no changes"
-expect "trusted-build, tree exists: no clone" not has "would clone"
+expect "trusted-build, tree exists: no clone" not has " clone "
+
+plan trusted-build.sh --commit "$commit" --bundle "$bundle"
+expect "trusted-build --bundle, tree exists: not read" has "$tree exists, so the bundle is not read"
+expect "trusted-build --bundle, tree exists: no copy" not has "cp -P"
 
 FAKE_ROOT_OWNED='' plan trusted-build.sh --commit "$commit"
 expect "trusted-build from a user-owned tree: refused" not ok

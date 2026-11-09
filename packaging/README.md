@@ -28,40 +28,100 @@ through it. In your own checkout that is anything running as you, agents
 included, and also your `~/.cargo` toolchain and any `rustc` wrapper. So
 `install.sh` refuses a source tree or binaries that a user other than root
 can change, and the way to install is `trusted-build.sh`: as root, it clones
-a commit you name from GitHub into `/usr/local/src/countersign/<commit>`
-(root-owned), builds it there with the distribution's Rust toolchain
-(`/usr/bin/cargo`, an empty environment, no user config, `--locked
---release`), and runs that tree's `install.sh`.
+a commit you name into `/usr/local/src/countersign/<commit>` (root-owned),
+builds it there with the distribution's Rust toolchain (`/usr/bin/cargo`, an
+empty environment, no user config, `--locked`), and runs that tree's
+`install.sh`.
 
-Push the commit you want installed first. Then, from a terminal you opened
-yourself (not a Claude Code `!` command: those have no terminal, and the
-recovery phrase would land in the transcript):
+### Where the source comes from
+
+The repository is private for now, and root has no GitHub credentials, so
+root cannot clone it from GitHub. Instead you make a **git bundle** as
+yourself and root clones from it (`--bundle FILE`). A bundle is plain data:
+the commits and files, with no repository config and no hooks, so reading it
+runs nothing of yours. `trusted-build.sh` copies it to a root-owned file
+first (and refuses a symbolic link), then clones that copy with git's object
+checks on, checks out the commit, and checks that `HEAD` is that commit and
+that `git fsck` passes.
+
+Your checkout and the bundle can be changed by an agent running as you.
+What makes the build safe is **the commit hash**: git checks every object it
+reads against its hash, so the tree root builds is exactly the commit you
+named, whatever the bundle holds. So take the hash from somewhere an agent
+cannot change: the commit's page on github.com in your browser
+(`https://github.com/mooselabs/countersign/commit/<hash>`), or `git log` in a
+clone on a machine no agent can reach. Push the commit first.
+
+Once the repository is public, leave out `--bundle`: `trusted-build.sh` then
+clones `https://github.com/mooselabs/countersign` anonymously.
+
+Root needs the network for one step: `cargo fetch --locked` downloads the
+locked dependencies from crates.io, and cargo checks each one against its
+checksum in `Cargo.lock`. The build after it runs with `--offline`.
+
+### First install
+
+`trusted-build.sh` refuses to run from a place another user can change, your
+checkout included, so the first run needs a root-owned copy of the script
+itself. These steps make one in `/root/countersign-bootstrap` (`/root` is
+root's, mode 0700). Run them from a terminal you opened yourself (not a
+Claude Code `!` command: those have no terminal, and the recovery phrase
+would land in the transcript). The shell lines are bash; in fish, write
+`set c <hash>` for `c=<hash>`.
+
+As yourself:
 
 ```console
-$ sudo zypper install rust cargo git     # the distribution's toolchain, once
-$ c=0123...                               # the full hash of the pushed commit
-$ sudo install -d -m 0755 /usr/local/src/countersign
-$ sudo env -i PATH=/usr/bin:/bin git clone -q --no-checkout \
-    https://github.com/mooselabs/countersign /usr/local/src/countersign/$c
-$ sudo env -i PATH=/usr/bin:/bin git -C /usr/local/src/countersign/$c checkout -q --detach $c
-$ sudo /usr/local/src/countersign/$c/packaging/trusted-build.sh --commit $c --factor touch --dry-run
-$ sudo /usr/local/src/countersign/$c/packaging/trusted-build.sh --commit $c --factor touch
+$ sudo zypper install rust cargo git     # the distribution's toolchain (rust 1.99), once
+$ git -C ~/projects/moose/countersign bundle create /tmp/countersign.bundle main
+$ git -C ~/projects/moose/countersign rev-parse main
+$ c=<the full hash from the commit's page on github.com>
 ```
 
-The `git clone` and `checkout` lines make the first root-owned tree by hand,
-because `trusted-build.sh` refuses to run from a place another user can
-change, your checkout included. It finds that tree, checks it (root-owned
-throughout, `HEAD` at the commit, no changes) and builds in it. To upgrade
-later, run the `trusted-build.sh` of an installed tree with the new commit;
-it clones the new commit fresh:
+Compare the hash `rev-parse` printed with the one on github.com; they must
+match. Use the github.com one. Then as root, through `sudo`:
 
 ```console
-$ sudo /usr/local/src/countersign/<old>/packaging/trusted-build.sh --commit <new> --factor touch
+$ sudo env -i PATH=/usr/bin:/bin git -c transfer.fsckObjects=true -c fetch.fsckObjects=true \
+    clone -q --no-checkout /tmp/countersign.bundle /root/countersign-bootstrap
+$ sudo env -i PATH=/usr/bin:/bin git -C /root/countersign-bootstrap checkout -q --detach $c
+$ sudo env -i PATH=/usr/bin:/bin git -C /root/countersign-bootstrap rev-parse HEAD    # must print $c
+$ sudo env -i PATH=/usr/bin:/bin git -C /root/countersign-bootstrap fsck --full --strict --no-dangling
+$ sudo /root/countersign-bootstrap/packaging/trusted-build.sh --commit $c \
+    --bundle /tmp/countersign.bundle --factor touch --dry-run
+$ sudo /root/countersign-bootstrap/packaging/trusted-build.sh --commit $c \
+    --bundle /tmp/countersign.bundle --factor touch
+$ sudo rm -rf /root/countersign-bootstrap
 ```
 
-`trusted-build.sh` takes `--commit` (required), `--dry-run`, and passes
-`--factor`, `--user` and `--force` on to `install.sh`. Old trees under
-`/usr/local/src/countersign` can be removed with `sudo rm -rf`.
+The bootstrap copy only runs `trusted-build.sh`. That script clones the
+bundle again into `/usr/local/src/countersign/$c`, builds there and installs
+from there; that tree is the one to use from now on, for upgrades and for
+uninstall. The bootstrap copy can go once the install is done.
+
+### Upgrade
+
+Make a new bundle and run the `trusted-build.sh` of the installed tree with
+the new commit. It clones the new commit fresh:
+
+```console
+$ git -C ~/projects/moose/countersign bundle create /tmp/countersign.bundle main
+$ sudo /usr/local/src/countersign/<old>/packaging/trusted-build.sh --commit <new> \
+    --bundle /tmp/countersign.bundle --factor touch
+```
+
+The bundle must contain the commit: make it from a branch or tag that does
+(`git bundle create` refuses a bare commit hash).
+
+### Options
+
+`trusted-build.sh` takes `--commit` (required), `--bundle FILE`,
+`--dry-run`, and passes `--factor`, `--user` and `--force` on to
+`install.sh`. If `/usr/local/src/countersign/<commit>` already exists it does
+not clone again: it checks that tree (root-owned throughout, no changes,
+`HEAD` at the commit, `git fsck` passes) and builds in it. Old trees under
+`/usr/local/src/countersign` can be removed with `sudo rm -rf`, except the
+one you installed from, which `uninstall.sh` runs from.
 
 | `install.sh` option | Meaning |
 | --- | --- |
@@ -244,8 +304,10 @@ Without the phrase, a store whose master key is lost cannot be opened.
 
 ## Uninstall
 
-Run the copy in the root-owned tree, not one in your checkout: it runs as
-root too. Like `install.sh`, it refuses to run when it, the files next to it
+Run the copy in the root-owned tree `trusted-build.sh` installed from,
+`/usr/local/src/countersign/<commit>`, not one in your checkout: it runs as
+root too. (The bootstrap copy in `/root` is not needed for this.) Like
+`install.sh`, it refuses to run when it, the files next to it
 or the example config it compares against could be changed by a user other
 than root; `--allow-user-tree` accepts that, with a warning.
 

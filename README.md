@@ -99,17 +99,27 @@ Linux 6.5 or later with systemd and polkit. `install.sh` runs as root, so it
 must not come from a tree an agent can change: install through
 `packaging/trusted-build.sh`, which clones a commit you name into a
 root-owned tree, builds it there with the distribution's Rust toolchain, and
-runs that tree's `install.sh`. From a terminal you opened yourself:
+runs that tree's `install.sh`. While the repository is private, root clones
+from a git bundle you make as yourself; the commit hash, which you take from
+the commit's page on github.com, decides what is built. Root needs the
+network to fetch the locked crates. From a terminal you opened yourself
+(bash; in fish, `set c <hash>`):
 
 ```sh
 sudo zypper install rust cargo git     # the distribution's toolchain, once (openSUSE)
-c=0123...                               # the full hash of a pushed commit
-sudo install -d -m 0755 /usr/local/src/countersign
-sudo env -i PATH=/usr/bin:/bin git clone -q --no-checkout \
-    https://github.com/mooselabs/countersign /usr/local/src/countersign/$c
-sudo env -i PATH=/usr/bin:/bin git -C /usr/local/src/countersign/$c checkout -q --detach $c
-sudo /usr/local/src/countersign/$c/packaging/trusted-build.sh --commit $c --factor touch --dry-run
-sudo /usr/local/src/countersign/$c/packaging/trusted-build.sh --commit $c --factor touch
+git -C ~/projects/moose/countersign bundle create /tmp/countersign.bundle main
+git -C ~/projects/moose/countersign rev-parse main   # must match github.com
+c=<the full hash from the commit's page on github.com>
+sudo env -i PATH=/usr/bin:/bin git -c transfer.fsckObjects=true -c fetch.fsckObjects=true \
+    clone -q --no-checkout /tmp/countersign.bundle /root/countersign-bootstrap
+sudo env -i PATH=/usr/bin:/bin git -C /root/countersign-bootstrap checkout -q --detach $c
+sudo env -i PATH=/usr/bin:/bin git -C /root/countersign-bootstrap rev-parse HEAD    # must print $c
+sudo env -i PATH=/usr/bin:/bin git -C /root/countersign-bootstrap fsck --full --strict --no-dangling
+sudo /root/countersign-bootstrap/packaging/trusted-build.sh --commit $c \
+    --bundle /tmp/countersign.bundle --factor touch --dry-run
+sudo /root/countersign-bootstrap/packaging/trusted-build.sh --commit $c \
+    --bundle /tmp/countersign.bundle --factor touch
+sudo rm -rf /root/countersign-bootstrap
 ```
 
 `--factor` is `password` (the default), `touch` or `touch+password`.

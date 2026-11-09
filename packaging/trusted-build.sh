@@ -1,27 +1,42 @@
 #!/bin/bash
-# Build countersign as root from a commit on GitHub, with the distribution's
+# Build countersign as root from a commit you name, with the distribution's
 # Rust toolchain, in a root-owned tree, then install it with that tree's
 # packaging/install.sh. Nothing a non-root user can write takes part: not a
 # developer's checkout, not ~/.cargo, not a rustc wrapper, not user config.
 # See packaging/README.md, "Install".
 #
-#   sudo /usr/local/src/countersign/<commit>/packaging/trusted-build.sh \
-#       --commit <40-hex commit> [--factor F] [--user NAME] [--force] [--dry-run]
+#   sudo <root-owned tree>/packaging/trusted-build.sh --commit <40-hex commit> \
+#       [--bundle FILE] [--factor F] [--user NAME] [--force] [--dry-run]
 #
-#   --commit    the full commit hash to build. Push it to GitHub first.
+#   --commit    the full commit hash to build. Check it out of band: on the
+#               commit's page on github.com, or with git log on a machine no
+#               agent can reach
+#   --bundle    clone from FILE, a git bundle you made as yourself with
+#               git bundle create /tmp/countersign.bundle main
+#               (the bundle must contain the commit). Use it while the
+#               repository is private. Without it the script clones
+#               https://github.com/mooselabs/countersign anonymously
 #   --dry-run   print the plan; clones, builds and installs nothing, needs no
 #               root
 #   --factor, --user, --force
 #               passed to install.sh (see install.sh --help)
 #
-# The tree is /usr/local/src/countersign/<commit>: cloned fresh from
-# https://github.com/mooselabs/countersign if it is missing, else checked
-# (root-owned throughout, HEAD at the commit, no changes) and built again.
+# The tree is /usr/local/src/countersign/<commit>: cloned fresh if it is
+# missing, else checked (root-owned throughout, no changes) and built again.
+# Either way HEAD must be the commit and git fsck must pass. A bundle is plain
+# data (no repository config, no hooks); it is copied to a root-owned file
+# before git reads it, and a symbolic link is refused. git checks every object
+# it reads against its hash, so the commit hash alone decides what is built,
+# whoever could change the bundle.
+#
 # This script refuses to run from a place a user other than root can change,
 # so run it from such a tree (the README shows how to make the first one).
 #
-# Build scripts and proc macros of the locked dependencies run as root during
-# the build, as they would in any root build of a package.
+# Root needs the network for one step: cargo fetch downloads the locked
+# dependencies from crates.io and checks each against its Cargo.lock
+# checksum. The build itself runs offline. Build scripts and proc macros of
+# the locked dependencies run as root during the build, as they would in any
+# root build of a package.
 set -euo pipefail
 
 here=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -34,6 +49,7 @@ R=${COUNTERSIGN_INSTALL_ROOT:-}
 url=https://github.com/mooselabs/countersign
 base=/usr/local/src/countersign
 commit=
+bundle=
 dry=0
 pass=()
 
@@ -45,6 +61,8 @@ while [ $# -gt 0 ]; do
     case $1 in
     --commit) commit=${2:?--commit needs a value}; shift 2 ;;
     --commit=*) commit=${1#*=}; shift ;;
+    --bundle) bundle=${2:?--bundle needs a value}; shift 2 ;;
+    --bundle=*) bundle=${1#*=}; shift ;;
     --factor | --user) pass+=("$1" "${2:?$1 needs a value}"); shift 2 ;;
     --factor=* | --user=*) pass+=("$1"); shift ;;
     --force) pass+=("$1"); shift ;;
@@ -84,7 +102,7 @@ get_toolchain="sudo zypper install rust cargo"
 
 # --- checks -----------------------------------------------------------------
 
-[[ $commit =~ ^[0-9a-f]{40}$ ]] || die "--commit needs the full 40-character commit hash (git rev-parse HEAD after pushing), got '$commit'"
+[[ $commit =~ ^[0-9a-f]{40}$ ]] || die "--commit needs the full 40-character commit hash (from the commit's page on github.com), got '$commit'"
 if [ "$dry" = 0 ]; then
     [ -z "$R" ] || die "COUNTERSIGN_INSTALL_ROOT is for tests and works only with --dry-run"
     [ "$(id -u)" = 0 ] || die "run as root (or add --dry-run to see the plan)"
@@ -102,6 +120,14 @@ done
 [ -z "$why" ] ||
     die "refusing to run from a place a user other than root can change: $why. Run the copy in a root-owned tree; packaging/README.md, \"Install\", shows how to make the first one"
 note "this script can be changed by root only"
+
+make_bundle="git -C <your checkout> bundle create /tmp/countersign.bundle main"
+if [ -n "$bundle" ]; then
+    # Checked again on the copy, which is what git reads.
+    [ ! -L "$bundle" ] || die "$bundle is a symbolic link. Give the bundle file itself"
+    [ -f "$bundle" ] || die "$bundle is not a file. Make one as yourself: $make_bundle"
+    note "bundle: $bundle"
+fi
 
 # The nearest existing directory at or above $base must be root's alone.
 d=$base
@@ -151,23 +177,45 @@ check_rust_version() {
 
 # --- source -----------------------------------------------------------------
 
-step "source: $url at $commit"
+if [ -n "$bundle" ]; then from="the bundle $bundle"; else from=$url; fi
+step "source: $from at $commit"
 run install -d -o root -g root -m 0755 "$base" "$home"
+# Object checks on clone; git fsck checks the result again below.
+git_clone=("${clean_env[@]}" "$git" -c transfer.fsckObjects=true -c fetch.fsckObjects=true
+    -c init.defaultBranch=main clone --quiet --no-checkout)
 if [ ! -e "$R$tree" ]; then
     if [ "$dry" = 1 ]; then
-        note "would clone $url into $tree, check out $commit and check that HEAD is $commit"
+        tmp=$base/.clone.XXXXXX
     else
         tmp=$(mktemp -d "$base/.clone.XXXXXX")
         trap 'rm -rf "$tmp"' EXIT
         chmod 0755 "$tmp"
-        run "${clean_env[@]}" "$git" clone --quiet --no-checkout "$url" "$tmp/src"
-        run "${clean_env[@]}" "$git" -C "$tmp/src" -c advice.detachedHead=false checkout --quiet --detach "$commit"
-        mv "$tmp/src" "$tree"
+    fi
+    if [ -n "$bundle" ]; then
+        # cp -P copies a symbolic link as a link and opens a file with
+        # O_NOFOLLOW, so the copy is checked, not the user's path.
+        src=$tmp/countersign.bundle
+        run cp -P -- "$bundle" "$src"
+        [ "$dry" = 1 ] || { [ -f "$src" ] && [ ! -L "$src" ]; } ||
+            die "$bundle was not a plain file when it was copied"
+        run "${git_clone[@]}" -- "$src" "$tmp/src" ||
+            die "cannot clone $bundle. Make it again as yourself: $make_bundle"
+    else
+        run "${git_clone[@]}" -- "$url" "$tmp/src" ||
+            die "cannot clone $url. While the repository is private, make a bundle as yourself ($make_bundle) and pass --bundle /tmp/countersign.bundle"
+    fi
+    run "${clean_env[@]}" "$git" -C "$tmp/src" -c advice.detachedHead=false checkout --quiet --detach "$commit" ||
+        die "$commit is not in ${from}. Check the hash, or make the bundle from a branch that contains it"
+    run mv -- "$tmp/src" "$tree"
+    if [ "$dry" = 1 ]; then
+        note "then check that HEAD is $commit and git fsck passes"
+    else
         rm -rf "$tmp"
         trap - EXIT
     fi
 elif [ "$dry" = 1 ]; then
-    note "would check $tree: root-owned throughout, HEAD at $commit, no changes"
+    note "would check $tree: root-owned throughout, HEAD at $commit, no changes, git fsck passes"
+    [ -z "$bundle" ] || note "$tree exists, so the bundle is not read"
 else
     # Only root can have written here; check anyway that nothing else did.
     why=$(untrusted_reason "$tree")
@@ -177,11 +225,14 @@ else
     changes=$("${clean_env[@]}" "$git" -C "$tree" status --porcelain --untracked-files=all)
     [ -z "$changes" ] || die "$tree has changes ($git -C $tree status). Remove $tree and run again"
     note "$tree is root's alone and unchanged"
+    [ -z "$bundle" ] || note "$tree exists, so the bundle is not read"
 fi
 if [ "$dry" = 0 ]; then
     head=$("${clean_env[@]}" "$git" -C "$tree" rev-parse HEAD)
     [ "$head" = "$commit" ] || die "$tree is at $head, not $commit. Remove $tree and run again"
     note "HEAD is $commit"
+    run "${clean_env[@]}" "$git" -C "$tree" fsck --full --strict --no-dangling --no-progress ||
+        die "git fsck failed in $tree. Remove $tree and run again"
     check_rust_version "$tree/Cargo.toml"
 else
     note "(dry run: rust-version read from this script's tree; a real run reads the commit's)"
@@ -197,7 +248,10 @@ if [ "$dry" = 1 ]; then
 fi
 (
     [ "$dry" = 1 ] || cd "$tree"
-    run "${clean_env[@]}" "$cargo" build --locked --release
+    # The only step that needs the network: crates.io, each crate checked
+    # against its Cargo.lock checksum.
+    run "${clean_env[@]}" "$cargo" fetch --locked
+    run "${clean_env[@]}" "$cargo" build --locked --offline --release
 )
 if [ "$dry" = 0 ]; then
     for bin in cn cnd; do
