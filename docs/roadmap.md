@@ -44,7 +44,9 @@ new software.
    `session`, `session exec`, `audit`, `audit verify`, `doctor`, with
    `--json`.
 6. Packaging: an install script for openSUSE (sysusers, tmpfiles, units,
-   polkit policy, master key, approval factor with `pam_u2f`). See
+   polkit policy, master key, approval factor with `pam_u2f`), a trusted
+   build from source, and a release workflow with a one-line installer for
+   prebuilt x86_64 binaries (decision 22). See
    [packaging/README.md](../packaging/README.md).
 7. Agent integration: the AGENTS.md snippet, a Claude Code skill and the
    migration guide, in [`integrations/`](../integrations/).

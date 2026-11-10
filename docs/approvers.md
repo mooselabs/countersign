@@ -814,7 +814,8 @@ subject = "process"
 
 Setup, in order:
 
-1. Install through `packaging/trusted-build.sh --factor touch`, from a
+1. Install with `--factor touch`, from a release with the one-line
+   installer or from source with `packaging/trusted-build.sh`, from a
    terminal you opened yourself ([packaging/README.md](../packaging/README.md#install)).
 2. Optionally lock user GNOME Shell extensions off ([above](#locking-out-user-gnome-shell-extensions-optional)).
 3. `/usr/bin/cn doctor` from a terminal you opened yourself.

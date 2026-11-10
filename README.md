@@ -95,39 +95,53 @@ Containing that needs the agent in a sandbox or under a separate user.
 
 ## Install
 
-Linux 6.5 or later with systemd and polkit. `install.sh` runs as root, so it
-must not come from a tree an agent can change: install through
-`packaging/trusted-build.sh`, which clones a commit you name into a
-root-owned tree, builds it there with the distribution's Rust toolchain, and
-runs that tree's `install.sh`. While the repository is private, root clones
-from a git bundle you make as yourself; the commit hash, which you take from
-the commit's page on github.com, decides what is built. Root needs the
-network to fetch the locked crates. From a terminal you opened yourself
-(bash; in fish, `set c <hash>`):
+Linux 6.5 or later on x86_64, with systemd and polkit. From a terminal you
+opened yourself (not a Claude Code `!` command: the recovery phrase would
+land in the transcript), as yourself:
+
+```sh
+curl -fsSL https://github.com/mooselabs/countersign/releases/latest/download/install.sh | bash -s -- --dry-run
+curl -fsSL https://github.com/mooselabs/countersign/releases/latest/download/install.sh | bash
+```
+
+The first line shows the plan and changes nothing. The second downloads the
+latest release's binaries, which GitHub Actions built, as root with `sudo`,
+checks them against the release's `SHA256SUMS` and, if `gh` is logged in,
+their build provenance, and runs the release's `install.sh`. For a
+security key instead of your password, end the line with
+`| bash -s -- --factor touch` (or `touch+password`). Run it again to
+upgrade. It trusts GitHub, the release
+workflow, TLS and the shell you paste it into.
+
+**From source.** `packaging/trusted-build.sh` trusts only a commit hash you
+check on github.com and the distribution's Rust toolchain: as root it clones
+that commit into a root-owned tree, builds it there and runs that tree's
+`install.sh`. Root needs the network to clone and to fetch the locked
+crates. In bash (in fish, `set c <hash>`):
 
 ```sh
 sudo zypper install rust cargo git     # the distribution's toolchain, once (openSUSE)
-git -C ~/projects/moose/countersign bundle create /tmp/countersign.bundle main
-git -C ~/projects/moose/countersign rev-parse main   # must match github.com
 c=<the full hash from the commit's page on github.com>
 sudo env -i PATH=/usr/bin:/bin git -c transfer.fsckObjects=true -c fetch.fsckObjects=true \
-    clone -q --no-checkout /tmp/countersign.bundle /root/countersign-bootstrap
+    clone -q --no-checkout https://github.com/mooselabs/countersign /root/countersign-bootstrap
 sudo env -i PATH=/usr/bin:/bin git -C /root/countersign-bootstrap checkout -q --detach $c
 sudo env -i PATH=/usr/bin:/bin git -C /root/countersign-bootstrap rev-parse HEAD    # must print $c
 sudo env -i PATH=/usr/bin:/bin git -C /root/countersign-bootstrap fsck --full --strict --no-dangling
-sudo /root/countersign-bootstrap/packaging/trusted-build.sh --commit $c \
-    --bundle /tmp/countersign.bundle --factor touch --dry-run
-sudo /root/countersign-bootstrap/packaging/trusted-build.sh --commit $c \
-    --bundle /tmp/countersign.bundle --factor touch
+sudo /root/countersign-bootstrap/packaging/trusted-build.sh --commit $c --factor touch --dry-run
+sudo /root/countersign-bootstrap/packaging/trusted-build.sh --commit $c --factor touch
 sudo rm -rf /root/countersign-bootstrap
 ```
 
+`trusted-build.sh --bundle FILE` builds from a git bundle you make instead
+of cloning GitHub.
+
 `--factor` is `password` (the default), `touch` or `touch+password`.
-[packaging/README.md](packaging/README.md) explains each step, what the
-script changes (for the touch factors, the polkit PAM stack for you only;
-other users, root included, keep the distribution's), the recovery phrase,
-upgrading, uninstalling, and a smoke test to run afterwards. To set up
-agents, see [`integrations/`](integrations/) and
+[packaging/README.md](packaging/README.md) explains both ways, what each
+checks and trusts, what the install changes (for the touch factors, the
+polkit PAM stack for you only; other users, root included, keep the
+distribution's), the recovery phrase, upgrading, uninstalling, and a smoke
+test to run afterwards. To set up agents, see
+[`integrations/`](integrations/) and
 [agent-integration.md](docs/agent-integration.md).
 
 ## Building and testing
@@ -135,6 +149,7 @@ agents, see [`integrations/`](integrations/) and
 ```sh
 cargo test --all-targets --all-features
 bash packaging/tests/dry-run.sh
+bash packaging/tests/get.sh
 ```
 
 ## License

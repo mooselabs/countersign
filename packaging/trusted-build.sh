@@ -13,9 +13,9 @@
 #               agent can reach
 #   --bundle    clone from FILE, a git bundle you made as yourself with
 #               git bundle create /tmp/countersign.bundle main
-#               (the bundle must contain the commit). Use it while the
-#               repository is private. Without it the script clones
-#               https://github.com/mooselabs/countersign anonymously
+#               (the bundle must contain the commit), for example for a
+#               commit root cannot fetch from GitHub. Without it the script
+#               clones https://github.com/mooselabs/countersign anonymously
 #   --dry-run   print the plan; clones, builds and installs nothing, needs no
 #               root
 #   --factor, --user, --force
@@ -202,7 +202,7 @@ if [ ! -e "$R$tree" ]; then
             die "cannot clone $bundle. Make it again as yourself: $make_bundle"
     else
         run "${git_clone[@]}" -- "$url" "$tmp/src" ||
-            die "cannot clone $url. While the repository is private, make a bundle as yourself ($make_bundle) and pass --bundle /tmp/countersign.bundle"
+            die "cannot clone $url. Check the network, or make a bundle as yourself ($make_bundle) and pass --bundle /tmp/countersign.bundle"
     fi
     run "${clean_env[@]}" "$git" -C "$tmp/src" -c advice.detachedHead=false checkout --quiet --detach "$commit" ||
         die "$commit is not in ${from}. Check the hash, or make the bundle from a branch that contains it"

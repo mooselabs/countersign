@@ -272,7 +272,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "countersign-approve"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "countersign-core",
  "countersign-proto",
@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "countersign-cli"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "base64",
  "clap",
@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "countersign-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "argon2",
  "base64",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "countersign-daemon"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "base64",
  "clap",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "countersign-hide"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "thiserror",
@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "countersign-proto"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "base64",
  "serde",

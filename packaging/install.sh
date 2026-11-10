@@ -1,9 +1,10 @@
 #!/bin/bash
 # Install countersign on this machine. See packaging/README.md.
 #
-# Usually run by packaging/trusted-build.sh, which builds a commit in a
-# root-owned tree and runs that tree's install.sh. Run directly, from a
-# terminal you opened yourself:
+# Usually run by the release installer (packaging/get.sh), from a release
+# tarball it checked and extracted as root, or by packaging/trusted-build.sh,
+# which builds a commit in a root-owned tree and runs that tree's
+# install.sh. Run directly, from a terminal you opened yourself:
 #   sudo packaging/install.sh [--factor password|touch|touch+password]
 #                             [--user NAME] [--bin-dir DIR] [--dry-run] [--force]
 #                             [--allow-user-tree]
@@ -16,7 +17,8 @@
 #               developer only; every other user, root included, keeps the
 #               distribution's stack.
 #   --user      the developer who uses countersign (default: $SUDO_USER)
-#   --bin-dir   where cn and cnd were built (default: target/release)
+#   --bin-dir   where cn and cnd are (default: bin/ in a release tarball,
+#               else target/release)
 #   --dry-run   print every action and change nothing; needs no root
 #   --force     replace an existing /etc/countersign/config.toml (kept as
 #               config.toml.bak), a /etc/pam.d/polkit-1 countersign did not
@@ -43,7 +45,9 @@ R=${COUNTERSIGN_INSTALL_ROOT:-}
 
 factor=password
 user=${SUDO_USER:-}
-bin_dir=$repo/target/release
+# A release tarball has the binaries in bin/; a checkout builds them in
+# target/release.
+if [ -e "$repo/bin/cnd" ]; then bin_dir=$repo/bin; else bin_dir=$repo/target/release; fi
 dry=0
 force=0
 allow_user_tree=0
@@ -227,7 +231,7 @@ done
 if [ -z "$untrusted" ]; then
     note "source and binaries can be changed by root only"
 elif [ "$allow_user_tree" = 0 ]; then
-    die "refusing to install from files a user other than root can change: $untrusted. Anything running as that user, an agent included, could have changed what this script installs or runs as root. Build and install with packaging/trusted-build.sh (packaging/README.md, \"Install\"), or pass --allow-user-tree to accept that"
+    die "refusing to install from files a user other than root can change: $untrusted. Anything running as that user, an agent included, could have changed what this script installs or runs as root. Install from a release with the one-line installer, or build and install with packaging/trusted-build.sh (packaging/README.md, \"Install\"), or pass --allow-user-tree to accept that"
 else
     say ""
     say "  WARNING: --allow-user-tree: $untrusted."

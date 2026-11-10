@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The release workflow runs these checks before it builds.
+  workflow_call:
 
 permissions:
   contents: read
@@ -12,9 +14,12 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
+        with:
+          toolchain: stable
           components: rustfmt, clippy
       # The approve crate's tests start a private dbus-daemon with a fake
       # polkit authority; they never talk to the runner's system bus.
@@ -37,21 +42,26 @@ jobs:
   packaging:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: shellcheck
         run: |
           shellcheck --version | head -n 2
           shellcheck packaging/*.sh packaging/lib/*.sh packaging/tests/*.sh
       - name: install.sh and uninstall.sh dry-run plans
         run: bash packaging/tests/dry-run.sh
+      - name: release tarball and the one-line installer
+        run: bash packaging/tests/get.sh
 
   dco:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Every commit carries a Signed-off-by line
         run: |
           missing=$(git log --format='%H %(trailers:key=Signed-off-by,valueonly,separator=%x2C)' \

@@ -67,12 +67,15 @@ kernel attests (peer credentials, pidfd).
 | `/run/countersign/cnd.sock` | countersign:countersign-users 0660 | IPC socket. |
 
 [`packaging/install.sh`](../packaging/install.sh) installs all of it. It runs
-as root, so the owner runs it through
-[`packaging/trusted-build.sh`](../packaging/trusted-build.sh), which clones a
-named commit into a root-owned tree (from a git bundle the developer makes
-while the repository is private, else from GitHub; the commit hash decides
-what is built) and builds it there with the distribution's toolchain; `install.sh` refuses a tree or binaries another
-user can change unless `--allow-user-tree` (decision 20). See
+as root, so it must come from a root-owned tree; `install.sh` refuses a tree
+or binaries another user can change unless `--allow-user-tree` (decision
+20). There are two ways to get one (decision 22): the one-line release
+installer ([`packaging/get.sh`](../packaging/get.sh)) downloads a release
+tarball as root, checks its SHA-256 and build provenance, and runs its
+`install.sh`; [`packaging/trusted-build.sh`](../packaging/trusted-build.sh)
+clones a named commit into a root-owned tree (from GitHub, or from a git
+bundle the developer makes; the commit hash decides what is built) and
+builds it there with the distribution's toolchain. See
 [packaging/README.md](../packaging/README.md).
 
 ### Fixed user, not DynamicUser

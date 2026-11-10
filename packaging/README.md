@@ -19,6 +19,9 @@ correctness review; see [docs/roadmap.md](../docs/roadmap.md).
   been tested). The approval dialog is drawn there.
 - For the touch factors: a FIDO security key (a YubiKey) and `pam_u2f`. On
   openSUSE the script installs `pam_u2f` with zypper; elsewhere install it first.
+- For a release: x86_64, `curl`, `tar`, `gzip`, `sha256sum` and `sudo`, and
+  `gh`, logged in, to check the build provenance. For a build from source:
+  `git` and the distribution's Rust toolchain.
 
 ## Install
 
@@ -27,91 +30,200 @@ correctness review; see [docs/roadmap.md](../docs/roadmap.md).
 through it. In your own checkout that is anything running as you, agents
 included, and also your `~/.cargo` toolchain and any `rustc` wrapper. So
 `install.sh` refuses a source tree or binaries that a user other than root
-can change, and the way to install is `trusted-build.sh`: as root, it clones
-a commit you name into `/usr/local/src/countersign/<commit>` (root-owned),
-builds it there with the distribution's Rust toolchain (`/usr/bin/cargo`, an
-empty environment, no user config, `--locked`), and runs that tree's
-`install.sh`.
+can change. There are two ways to give it a root-owned tree:
 
-### Where the source comes from
+- **From a release**, with the one-line installer: it downloads the
+  binaries GitHub Actions built for a release tag, checks them, and runs
+  the release's `install.sh`. Quick, and it needs no Rust toolchain.
+- **From source**, with `trusted-build.sh`: as root, it clones a commit you
+  name and builds it with the distribution's Rust toolchain. Slower, and it
+  trusts less (below).
 
-The repository is private for now, and root has no GitHub credentials, so
-root cannot clone it from GitHub. Instead you make a **git bundle** as
-yourself and root clones from it (`--bundle FILE`). A bundle is plain data:
-the commits and files, with no repository config and no hooks, so reading it
-runs nothing of yours. `trusted-build.sh` copies it to a root-owned file
-first (and refuses a symbolic link), then clones that copy with git's object
-checks on, checks out the commit, and checks that `HEAD` is that commit and
-that `git fsck` passes.
+Either way, run it from a terminal you opened yourself, not a Claude Code
+`!` command: those have no terminal, and the recovery phrase would land in
+the transcript. Both are safe to run again, to upgrade or to change the
+factor.
 
-Your checkout and the bundle can be changed by an agent running as you.
-What makes the build safe is **the commit hash**: git checks every object it
-reads against its hash, so the tree root builds is exactly the commit you
-named, whatever the bundle holds. So take the hash from somewhere an agent
-cannot change: the commit's page on github.com in your browser
+### From a release
+
+As yourself, not as root (it uses `sudo` for the root steps):
+
+```console
+$ curl -fsSL https://github.com/mooselabs/countersign/releases/latest/download/install.sh | bash -s -- --dry-run
+$ curl -fsSL https://github.com/mooselabs/countersign/releases/latest/download/install.sh | bash -s -- --factor touch
+```
+
+The first line downloads and checks the release as you, without `sudo`, and
+prints `install.sh`'s plan. The second installs. Leave out `--factor touch`
+for the default factor, `password`.
+
+The installer (`packaging/get.sh` in the repository, published with each
+release as `install.sh`) is one function called on its last line, so a
+download cut short runs nothing. It:
+
+1. Checks Linux on x86_64, kernel 6.5 or later, systemd as init, `curl`,
+   `tar`, `gzip`, `sha256sum` and `sudo`, that it is not running as root,
+   and, for a real run, that there is a terminal (`/dev/tty`).
+2. Finds the release: `--version vX.Y.Z`, or the latest, from where
+   `https://github.com/mooselabs/countersign/releases/latest` redirects (no
+   GitHub API).
+3. Downloads `SHA256SUMS` and `countersign-<version>-x86_64-linux.tar.gz`
+   with `sudo curl` into a directory `sudo mktemp -d` made (root, 0700), so
+   nothing running as you can change them once they are down.
+4. Checks the tarball's SHA-256, as root, against its one line in
+   `SHA256SUMS`.
+5. Checks the build provenance, if `gh` is installed and logged in:
+   `gh attestation verify` with `--repo mooselabs/countersign`,
+   `--signer-workflow mooselabs/countersign/.github/workflows/release.yml`,
+   `--source-ref refs/tags/<tag>` and `--deny-self-hosted-runners`, on a
+   copy you can read. A failure stops the install. Without `gh` it says in
+   one line that provenance was not checked and how to check it by hand;
+   `--require-attestation` makes that an error.
+6. Checks that the tarball holds only files and directories under
+   `countersign-<version>/`, extracts it as root with `--no-same-owner`,
+   and refuses a file that is setuid, setgid or writable by group or
+   others.
+7. Moves the tree to `/usr/local/src/countersign/v<version>` (root-owned,
+   replacing an older copy of the same version) and runs its
+   `packaging/install.sh` with `sudo`, `--user` you, `--bin-dir` the tree's
+   `bin/`, and stdin from your terminal. That tree is the one to uninstall
+   from.
+
+If countersign is already installed, this is an upgrade: without
+`--factor` it keeps the factor installed now (read from
+`/etc/pam.d/polkit-1`), and `install.sh` keeps the store, the master key and
+a config you changed. It never runs `cnd init` over a store.
+
+| Option | Meaning |
+| --- | --- |
+| `--version vX.Y.Z` | The release to install. Default: the latest. |
+| `--factor password\|touch\|touch+password` | Passed to `install.sh`. Default: the factor already installed, else `password`. |
+| `--force` | Passed to `install.sh` (see its options below). |
+| `--dry-run` | Download and check as you, without `sudo`, into a directory of yours, then run `install.sh --dry-run` (with `--allow-user-tree`, since you extracted it). Installs nothing. |
+| `--require-attestation` | Fail when the provenance cannot be checked. |
+| `--base-url URL` | For tests only: take the release files from `URL` (`file://`, `https://`, or `http://` to localhost), a directory laid out like one release's downloads. Needs `--version`. |
+
+**What it trusts.** The one-liner trusts GitHub (it serves the script, the
+release files and the attestations, and runs the build), the release
+workflow (`.github/workflows/release.yml`, the actions it pins, the
+`stable` Rust toolchain it downloads, and the crates `Cargo.lock` pins),
+TLS (curl's certificate store), and the shell you paste it into: whatever
+`curl`, `bash` and `sudo` resolve to there runs, and an agent that can
+change your shell's startup files or `PATH` can change that. The
+attestation shows that the tarball was built by the release workflow of
+`mooselabs/countersign` from the tag's commit; it does not show that the
+workflow or the code is sound. Without `gh`, `SHA256SUMS` comes from the
+same place as the tarball, so it catches a broken download, not a changed
+one.
+
+`trusted-build.sh` trusts less: a commit hash you check yourself on
+github.com, and the distribution's Rust toolchain. GitHub, TLS and the
+release workflow cannot change what it builds; git checks every object
+against the hash, and cargo checks every crate against `Cargo.lock`. It still
+runs through `sudo` in your shell, like the one-liner.
+
+To check a release by hand, as yourself:
+
+```console
+$ v=0.1.0
+$ curl -fsSLO https://github.com/mooselabs/countersign/releases/download/v$v/countersign-$v-x86_64-linux.tar.gz
+$ curl -fsSLO https://github.com/mooselabs/countersign/releases/download/v$v/SHA256SUMS
+$ sha256sum --check --ignore-missing SHA256SUMS
+$ gh attestation verify countersign-$v-x86_64-linux.tar.gz --repo mooselabs/countersign \
+    --signer-workflow mooselabs/countersign/.github/workflows/release.yml --source-ref refs/tags/v$v
+```
+
+The tarball has `bin/cn`, `bin/cnd`, `packaging/` (`install.sh`,
+`uninstall.sh` and the files they install), `examples/config.toml`,
+`CHANGELOG.md`, `LICENSE`, `NOTICE` and `README.md`, under one top
+directory. Its `install.sh` finds the binaries in `bin/` by itself. The
+release workflow builds on Ubuntu 22.04 (glibc 2.35), checks that `cn` and
+`cnd` link only glibc, and makes the tarball with
+`packaging/make-release-tarball.sh`, which gives the same bytes for the
+same inputs.
+
+### From source: trusted-build.sh
+
+As root, `trusted-build.sh` clones a commit you name into
+`/usr/local/src/countersign/<commit>` (root-owned), builds it there with the
+distribution's Rust toolchain (`/usr/bin/cargo`, an empty environment, no
+user config, `--locked`), and runs that tree's `install.sh`.
+
+#### Where the source comes from
+
+By default root clones `https://github.com/mooselabs/countersign`
+anonymously. What makes the build safe is **the commit hash**: git checks
+every object it reads against its hash, so the tree root builds is exactly
+the commit you named, whoever served it. So take the hash from somewhere an
+agent cannot change: the commit's page on github.com in your browser
 (`https://github.com/mooselabs/countersign/commit/<hash>`), or `git log` in a
-clone on a machine no agent can reach. Push the commit first.
+clone on a machine no agent can reach.
 
-Once the repository is public, leave out `--bundle`: `trusted-build.sh` then
-clones `https://github.com/mooselabs/countersign` anonymously.
+With `--bundle FILE`, root clones from a **git bundle** you made as
+yourself instead, for example for a commit root cannot fetch from GitHub. A
+bundle is plain data: the commits and files, with no repository config and
+no hooks, so reading it runs nothing of yours. `trusted-build.sh` copies it
+to a root-owned file first (and refuses a symbolic link), then clones that
+copy with git's object checks on, checks out the commit, and checks that
+`HEAD` is that commit and that `git fsck` passes. Your checkout and the
+bundle can be changed by an agent running as you; the commit hash still
+decides what is built.
 
 Root needs the network for one step: `cargo fetch --locked` downloads the
 locked dependencies from crates.io, and cargo checks each one against its
 checksum in `Cargo.lock`. The build after it runs with `--offline`.
 
-### First install
+#### First install
 
 `trusted-build.sh` refuses to run from a place another user can change, your
 checkout included, so the first run needs a root-owned copy of the script
 itself. These steps make one in `/root/countersign-bootstrap` (`/root` is
-root's, mode 0700). Run them from a terminal you opened yourself (not a
-Claude Code `!` command: those have no terminal, and the recovery phrase
-would land in the transcript). The shell lines are bash; in fish, write
-`set c <hash>` for `c=<hash>`.
-
-As yourself:
+root's, mode 0700). The shell lines are bash; in fish, write `set c <hash>`
+for `c=<hash>`.
 
 ```console
 $ sudo zypper install rust cargo git     # the distribution's toolchain (rust 1.99), once
-$ git -C ~/projects/moose/countersign bundle create /tmp/countersign.bundle main
-$ git -C ~/projects/moose/countersign rev-parse main
 $ c=<the full hash from the commit's page on github.com>
-```
-
-Compare the hash `rev-parse` printed with the one on github.com; they must
-match. Use the github.com one. Then as root, through `sudo`:
-
-```console
 $ sudo env -i PATH=/usr/bin:/bin git -c transfer.fsckObjects=true -c fetch.fsckObjects=true \
-    clone -q --no-checkout /tmp/countersign.bundle /root/countersign-bootstrap
+    clone -q --no-checkout https://github.com/mooselabs/countersign /root/countersign-bootstrap
 $ sudo env -i PATH=/usr/bin:/bin git -C /root/countersign-bootstrap checkout -q --detach $c
 $ sudo env -i PATH=/usr/bin:/bin git -C /root/countersign-bootstrap rev-parse HEAD    # must print $c
 $ sudo env -i PATH=/usr/bin:/bin git -C /root/countersign-bootstrap fsck --full --strict --no-dangling
-$ sudo /root/countersign-bootstrap/packaging/trusted-build.sh --commit $c \
-    --bundle /tmp/countersign.bundle --factor touch --dry-run
-$ sudo /root/countersign-bootstrap/packaging/trusted-build.sh --commit $c \
-    --bundle /tmp/countersign.bundle --factor touch
+$ sudo /root/countersign-bootstrap/packaging/trusted-build.sh --commit $c --factor touch --dry-run
+$ sudo /root/countersign-bootstrap/packaging/trusted-build.sh --commit $c --factor touch
 $ sudo rm -rf /root/countersign-bootstrap
 ```
 
-The bootstrap copy only runs `trusted-build.sh`. That script clones the
-bundle again into `/usr/local/src/countersign/$c`, builds there and installs
-from there; that tree is the one to use from now on, for upgrades and for
-uninstall. The bootstrap copy can go once the install is done.
-
-### Upgrade
-
-Make a new bundle and run the `trusted-build.sh` of the installed tree with
-the new commit. It clones the new commit fresh:
+From a bundle, make it first and use it in both places:
 
 ```console
 $ git -C ~/projects/moose/countersign bundle create /tmp/countersign.bundle main
-$ sudo /usr/local/src/countersign/<old>/packaging/trusted-build.sh --commit <new> \
+$ sudo env -i PATH=/usr/bin:/bin git -c transfer.fsckObjects=true -c fetch.fsckObjects=true \
+    clone -q --no-checkout /tmp/countersign.bundle /root/countersign-bootstrap
+$ ...
+$ sudo /root/countersign-bootstrap/packaging/trusted-build.sh --commit $c \
     --bundle /tmp/countersign.bundle --factor touch
 ```
 
 The bundle must contain the commit: make it from a branch or tag that does
 (`git bundle create` refuses a bare commit hash).
+
+The bootstrap copy only runs `trusted-build.sh`. That script clones again
+into `/usr/local/src/countersign/$c`, builds there and installs from there;
+that tree is the one to use from now on, for upgrades and for uninstall.
+The bootstrap copy can go once the install is done.
+
+#### Upgrade
+
+Run the `trusted-build.sh` of the installed tree with the new commit (and
+`--bundle` if you use one). It clones the new commit fresh:
+
+```console
+$ sudo /usr/local/src/countersign/<old>/packaging/trusted-build.sh --commit <new> --factor touch
+```
+
+You can switch between the two ways at any time; each install replaces the
+binaries and keeps the store. Uninstall from the tree of the last install.
 
 ### Options
 
@@ -127,7 +239,7 @@ one you installed from, which `uninstall.sh` runs from.
 | --- | --- |
 | `--factor password\|touch\|touch+password` | What the polkit dialog asks for. Default `password`. See below. |
 | `--user NAME` | The developer who uses countersign. Default: the user who ran `sudo`. |
-| `--bin-dir DIR` | Where `cn` and `cnd` were built. Default `target/release`. `trusted-build.sh` sets it. |
+| `--bin-dir DIR` | Where `cn` and `cnd` are. Default: `bin/` in a release tarball, else `target/release`. The one-liner and `trusted-build.sh` set it. |
 | `--dry-run` | Print every action and change nothing. Needs no root. |
 | `--force` | Replace an existing `/etc/countersign/config.toml` (kept as `config.toml.bak`), a `/etc/pam.d/polkit-1` that countersign did not write (kept as `polkit-1.countersign-bak`), and an existing key enrolment. |
 | `--allow-user-tree` | Install from a tree or binaries another user can change, for example your checkout after `cargo build --release --locked`. It prints why that is unsafe. While your user can run `sudo` without a password, an agent running as you can become root anyway, and this check protects nothing until that is removed. |
@@ -275,9 +387,9 @@ or motherboard, a reinstall, or a store restored onto another machine.
 
 1. Restore `/var/lib/countersign` from your backup, owned by `countersign`,
    mode 0700.
-2. Install as above, through `trusted-build.sh`. `install.sh` sees a store
-   without a master key credential, creates a new credential and prints the
-   recovery command.
+2. Install as above, from a release or with `trusted-build.sh`.
+   `install.sh` sees a store without a master key credential, creates a new
+   credential and prints the recovery command.
 3. Stop the daemon: `cnd recover` takes no lock against a running `cnd`.
 
    ```console
@@ -304,17 +416,19 @@ Without the phrase, a store whose master key is lost cannot be opened.
 
 ## Uninstall
 
-Run the copy in the root-owned tree `trusted-build.sh` installed from,
-`/usr/local/src/countersign/<commit>`, not one in your checkout: it runs as
-root too. (The bootstrap copy in `/root` is not needed for this.) Like
+Run the copy in the root-owned tree you last installed from,
+`/usr/local/src/countersign/v<version>` for a release or
+`/usr/local/src/countersign/<commit>` for `trusted-build.sh`, not one in
+your checkout: it runs as root too. (The bootstrap copy in `/root` is not
+needed for this.) Like
 `install.sh`, it refuses to run when it, the files next to it
 or the example config it compares against could be changed by a user other
 than root; `--allow-user-tree` accepts that, with a warning.
 
 ```console
-$ sudo /usr/local/src/countersign/<commit>/packaging/uninstall.sh --dry-run
-$ sudo /usr/local/src/countersign/<commit>/packaging/uninstall.sh            # keeps the store and the master key
-$ sudo /usr/local/src/countersign/<commit>/packaging/uninstall.sh --purge    # deletes them too
+$ sudo /usr/local/src/countersign/<tree>/packaging/uninstall.sh --dry-run
+$ sudo /usr/local/src/countersign/<tree>/packaging/uninstall.sh            # keeps the store and the master key
+$ sudo /usr/local/src/countersign/<tree>/packaging/uninstall.sh --purge    # deletes them too
 ```
 
 It stops and removes the units, the binaries, the polkit policy, the
@@ -407,4 +521,6 @@ and `journalctl -u countersign.service -b`.
 
 ## Not done yet
 
-- An RPM spec. Until then this script is the only install path.
+- An RPM spec. Until then the release installer and `trusted-build.sh` are
+  the install paths.
+- Release binaries for other architectures than x86_64.

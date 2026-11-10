@@ -1,7 +1,7 @@
 #!/bin/bash
 # Remove countersign from this machine. See packaging/README.md.
 #
-#   sudo /usr/local/src/countersign/<commit>/packaging/uninstall.sh \
+#   sudo /usr/local/src/countersign/<tree>/packaging/uninstall.sh \
 #       [--purge] [--user NAME] [--dry-run] [--allow-user-tree]
 #
 # Removes the binaries, units, polkit policy, the touch-factor PAM stack (your
@@ -24,7 +24,9 @@
 #              changed by a user other than root (a developer's checkout).
 #              Without it, uninstall.sh refuses: it runs as root, so whoever
 #              can change those files can run code as root. Run the copy in
-#              the root-owned tree trusted-build.sh made instead.
+#              the root-owned tree you installed from instead (a release's
+#              /usr/local/src/countersign/v<version>, or the one
+#              trusted-build.sh made).
 #
 # pam_u2f stays installed; it does nothing unless a PAM stack uses it.
 set -euo pipefail
@@ -116,7 +118,7 @@ done
 if [ -z "$untrusted" ]; then
     note "this script can be changed by root only"
 elif [ "$allow_user_tree" = 0 ]; then
-    die "refusing to run from files a user other than root can change: $untrusted. Anything running as that user, an agent included, could have changed what this script runs as root. Run the uninstall.sh in the root-owned tree packaging/trusted-build.sh made (packaging/README.md, \"Uninstall\"), or pass --allow-user-tree to accept that"
+    die "refusing to run from files a user other than root can change: $untrusted. Anything running as that user, an agent included, could have changed what this script runs as root. Run the uninstall.sh in the root-owned tree you installed from: a release's /usr/local/src/countersign/v<version>, or the one packaging/trusted-build.sh made (packaging/README.md, \"Uninstall\"), or pass --allow-user-tree to accept that"
 else
     say ""
     say "  WARNING: --allow-user-tree: $untrusted."
