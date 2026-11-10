@@ -64,7 +64,7 @@ developer (the shell that ran `pkexec`) works, so the final script uses that.
 | T5 developer uid passes details | refused: only trusted callers | refused: only trusted callers |
 | T6 owner, no details | polkitd aborts | challenge |
 
-The T2 dialog ([screenshot](t2-dialog.png)):
+The T2 dialog, as GNOME drew it:
 
 > **Authentication Required**
 > countersign: approve request K7M-Q2X, digest 3QF8-ZK2M: use
